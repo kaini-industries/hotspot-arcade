@@ -1,3 +1,14 @@
+## 1.7
+
+- New players enter a six-digit join code shown on the Flipper dashboard; returning
+  browsers can reconnect without typing it again.
+- Phone reconnects now resume the same player, score, and live game for 120 seconds.
+  Offline seats stay visible in the roster, challenge acceptance uses unique ids, and
+  stopping/restarting the portal freezes game clocks instead of resetting the session.
+- Drawing rotates fairly through players and every loaded pack, rejects malformed strokes,
+  and the live phone language can change without reconnecting.
+- Firmware v18.
+
 ## 1.6
 
 - New game: Chess, the fifteenth. Full FIDE rules refereed on the board: castling, en
@@ -5,7 +16,7 @@
   automatic ones (fivefold, 75-move, dead position), with a 5-minute blitz clock per
   side — a flag fall loses unless no mate was possible. The final position stays on the
   result screen, and the phone keeps its screen awake during games.
-- Firmware v17.
+- Firmware v18.
 
 ## 1.5
 

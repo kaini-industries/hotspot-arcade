@@ -38,6 +38,7 @@ import { PACK_DIRS, LANGS, resolvePacks, parseGenericPack } from "../web/trivia-
   assert.ok(pk.items.length >= 4, "the pt-BR trivia pack parsed some questions");
   e.contentPack(1, pk.name);
   for (const it of pk.items) e.contentItem(JSON.stringify(it));
+  e.contentCommit();
   e.selectGame(1);
   e.join(1, "ANA"); e.join(2, "BO");
   e.input(1, { t: "ready", ready: true });
@@ -59,6 +60,10 @@ import { PACK_DIRS, LANGS, resolvePacks, parseGenericPack } from "../web/trivia-
   const w = e.join(1, "ANA").find((o) => o.to === "ws" && o.msg && o.msg.t === "welcome");
   assert.ok(w, "a welcome is sent on join");
   assert.equal(w.msg.lang, "pt-br", "welcome carries the host UI language");
+  let cfg = e.setLang("de");
+  const broadcast = cfg.find((o) => o.to === "all" && o.msg && o.msg.t === "config");
+  assert.equal(broadcast.msg.lang, "de", "a live language change is broadcast to every phone");
+  assert.deepEqual(e.setLang("de"), [], "setting the current language again is a no-op");
 
   const e2 = await newEngine();
   e2.reset();

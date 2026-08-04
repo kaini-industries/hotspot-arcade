@@ -20,6 +20,8 @@ const ROOT = dirname(fileURLToPath(import.meta.url));
 const PAGE = join(ROOT, "dist", "index.html");
 const PORT = process.env.PORT || 8080;
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const MOCK_SESSION = createHash("sha256").update("hotspot-arcade-mock-session").digest("hex").slice(0, 32);
+const knownIdentities = new Set();
 
 const server = createServer((req, res) => {
   try {
@@ -64,7 +66,9 @@ function handle(socket) {
   const clearTimers = () => { timers.forEach(clearTimeout); timers = []; if (loopId) { clearInterval(loopId); loopId = 0; } };
 
   const send = (obj) => frame(socket, obj);
-  const players = () => [1, 2, 3].map((p) => ({ pid: p, nick: nicks[p], avatar: avatars[p], score: scores[p] }));
+  const players = () => [1, 2, 3].map((p) => ({
+    pid: p, nick: nicks[p], avatar: avatars[p], score: scores[p], online: true,
+  }));
   const lobby = (game) => send({ t: "lobby", game, players: players(), me: ME });
   const sc = () => players();
 
@@ -153,7 +157,8 @@ function handle(socket) {
     const Q = QUESTIONS[tv.qi];
     send({
       t: "trivia", phase: "question", i: tv.qi, n: QUESTIONS.length, q: Q.q, o: Q.o,
-      dur: QDUR, deadline: tv.deadline, mine: (ME in tv.answers) ? tv.answers[ME] : -1,
+      duration_ms: QDUR, remaining_ms: Math.max(0, tv.deadline - Date.now()),
+      mine: (ME in tv.answers) ? tv.answers[ME] : -1,
       answered: Object.keys(tv.answers).length, total: 3, topic: tv.topicName, board: tvBoard(),
     });
   }
@@ -202,7 +207,7 @@ function handle(socket) {
     duel = null;
     lobby(GAME_OF[kind]);
     at(300, () => send({ t: "duel", kind, phase: "lobby", you: ME, me: 1,
-      opp: nicks[CATHY], challenges: [{ from: CATHY, to: ME }] }));
+      opp: nicks[CATHY], challenges: [{ id: 1, from: CATHY, to: ME }] }));
   }
 
   function newDuel(kind, first) {
@@ -341,9 +346,9 @@ function handle(socket) {
   }
 
   // ---- draw & guess ---------------------------------------------------------
-  // Two rounds with a per-round countdown (deadline + dur), then a final board
+  // Two rounds with a per-round relative countdown, then a final board
   // and `again` restart. Round 1 you draw; round 2 you guess.
-  const DRAW_DUR = 20;   // seconds per round (dur is sent in seconds)
+  const DRAW_DUR = 20;   // seconds per round
   let draw = null;
   function drawScore(p, pts) { scores[p] += pts; }
   function drawBoard() {
@@ -358,18 +363,18 @@ function handle(socket) {
   function drawRound() {
     if (!draw) return;
     draw.done = false;
-    const deadline = Date.now() + DRAW_DUR * 1000;
+    const remaining_ms = DRAW_DUR * 1000, duration_ms = remaining_ms;
     if (draw.round === 1) {
       // You draw. A bot "guesses" correctly partway through the window.
       draw.secret = "BANANA";
       send({ t: "draw", phase: "draw", role: "drawer", word: draw.secret,
-        round: draw.round, rounds: draw.rounds, drawer: ME, deadline, dur: DRAW_DUR, scores: sc() });
+        round: draw.round, rounds: draw.rounds, drawer: ME, remaining_ms, duration_ms, scores: sc() });
       at(7000, () => { if (draw && draw.round === 1 && !draw.done) { drawScore(CATHY, 50); drawReveal(CATHY); } });
     } else {
       // You guess. The bot scribbles; a wrong bot guess lands in chat.
       draw.secret = "ROCKET";
       send({ t: "draw", phase: "draw", role: "guesser", len: draw.secret.length,
-        round: draw.round, rounds: draw.rounds, drawer: nicks[BOT], deadline, dur: DRAW_DUR, scores: sc() });
+        round: draw.round, rounds: draw.rounds, drawer: nicks[BOT], remaining_ms, duration_ms, scores: sc() });
       at(600, () => send({ t: "ink", clear: true }));
       for (let i = 0; i < 8; i++)
         at(1000 + i * 150, ((k) => () => send({ t: "ink", x0: 0.5, y0: 0.2 + k * 0.06, x1: 0.5, y1: 0.26 + k * 0.06 }))(i));
@@ -395,7 +400,7 @@ function handle(socket) {
   function runPong() {
     pong = null;
     lobby("pong");
-    at(300, () => send({ t: "pong", phase: "lobby", challenges: [{ from: CATHY, to: ME }] }));
+    at(300, () => send({ t: "pong", phase: "lobby", challenges: [{ id: 1, from: CATHY, to: ME }] }));
   }
   function startPong() {
     pong = { p1: 0.5, p2: 0.5, s1: 0, s2: 0, bx: 0.5, by: 0.5, vx: 0.012, vy: 0.008, dir: 0 };
@@ -447,9 +452,23 @@ function handle(socket) {
     const cur = curStage();
 
     if (m.t === "hello") {
+      if(!/^[0-9a-f]{32}$/.test(m.resume || "")) {
+        send({ t: "reject", code: "bad_protocol" });
+        return;
+      }
+      const identity = createHash("sha256").update(m.resume).digest("hex").slice(0, 32);
+      const resumed = knownIdentities.has(identity);
+      if(!resumed && m.code !== "123456") {
+        send({ t: "reject", code: m.code ? "bad_code" : "auth_required" });
+        return;
+      }
+      knownIdentities.add(identity);
       clearTimers();               // avoid overlapping rotations on a re-hello
       nicks[ME] = m.nick || "You";
-      send({ t: "welcome", pid: ME, nick: nicks[ME] });
+      send({
+        t: "welcome", proto: 2, session: MOCK_SESSION, pid: ME,
+        nick: nicks[ME], avatar: avatars[ME], lang: "", resumed, paused: false,
+      });
       lobby("none");
       if (process.env.LOBBY) {
         // Sit in the app lobby so lobby chat can be tested; a couple of bots

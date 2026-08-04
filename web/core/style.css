@@ -115,6 +115,7 @@ h3{margin:0; font-weight:600}
 .btn:active{background:var(--orange-dim); transform:translateY(1px); box-shadow:0 0 0 2px var(--orange-bright)}
 .btn.big{width:100%; font-size:18px; min-height:56px}
 .btn:disabled{background:var(--surface-2); color:var(--text-mute); cursor:default; box-shadow:none; transform:none}
+.screen [aria-disabled="true"]{pointer-events:none; opacity:.5; cursor:not-allowed}
 .btn.ghost{background:transparent; color:var(--text); border-color:var(--line)}
 .btn.ghost:active{background:transparent; border-color:var(--orange); box-shadow:none}
 .btn.sm{min-height:40px; font-size:13px; padding:0 12px}
@@ -157,6 +158,8 @@ h3{margin:0; font-weight:600}
   background:var(--surface-2); border:2px solid var(--line); border-radius:var(--radius); padding:8px 12px;
 }
 .players li.self{border-left:4px solid var(--orange)}
+.players li.offline{opacity:.55}
+.players li.offline .ps,.players li.offline .rdy{color:var(--text-mute); background:none; padding:0}
 .players .pn{flex:1; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
 .players .ps{color:var(--orange); font-weight:700; font-variant-numeric:tabular-nums}
 .players li.self .ps{background:var(--orange); color:var(--on-orange); padding:2px 8px; border-radius:2px}

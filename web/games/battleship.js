@@ -14,6 +14,19 @@
   var prevMine = null;                  // last fleet grid, to detect incoming hits
   var prevYourTurn = false;             // to cue when the turn flips to you
   var rematchTimer = null;
+  var statePaused = false;
+
+  function inputPaused() { return statePaused || !!A.serverPause; }
+  function syncPauseUi() {
+    var paused = inputPaused();
+    A.setGamePaused("bs", paused);
+    $("bs-place-grid").setAttribute("aria-disabled", paused ? "true" : "false");
+    $("bs-track-grid").setAttribute("aria-disabled", paused ? "true" : "false");
+    $("bs-rotate").disabled = paused;
+    $("bs-random").disabled = paused;
+    $("bs-ready").disabled = paused || !ships || !allPlaced();
+    $("bs-rematch").disabled = paused;
+  }
 
   function sub(name) {
     ["lobby", "place", "fire", "over"].forEach(function (id) {
@@ -86,7 +99,11 @@
       var b = document.createElement("button");
       b.className = "bs-ship" + (i === sel ? " sel" : "") + (s.placed ? " placed" : "");
       b.textContent = t(NAMES[i]) + " (" + s.len + ")";
-      b.onclick = function () { sel = i; renderPlace(lastPlaceMsg); };
+      b.disabled = inputPaused();
+      b.onclick = function () {
+        if (inputPaused()) return;
+        sel = i; renderPlace(lastPlaceMsg);
+      };
       tray.appendChild(b);
     });
   }
@@ -104,12 +121,14 @@
       $("bs-wait").classList.add("hide");
       $("bs-place-hint").textContent = m.oppReady ? t("bs.opp_ready") : t("bs.tap_ship");
     }
-    $("bs-ready").disabled = !allPlaced();
+    if (inputPaused()) $("bs-place-hint").textContent = t(A.serverPause ? "net.host_paused" : "net.opp_reconnect");
+    $("bs-ready").disabled = inputPaused() || !allPlaced();
     var occ = {};
     ships.forEach(function (s, i) { if (s.placed) cellsOf(s).forEach(function (idx) { occ[idx] = i; }); });
     grid($("bs-place-grid"), function (i) {
       return i in occ ? "ship" + (occ[i] === sel ? " sel" : "") : "";
-    }, m.ready ? null : function (i) {
+    }, (m.ready || inputPaused()) ? null : function (i) {
+      if (inputPaused()) return;
       if (i in occ) { sel = occ[i]; A.vibe(6); renderPlace(m); return; } // tap a ship to select it
       var s = ships[sel];
       var old = { r: s.r, c: s.c, placed: s.placed };
@@ -126,14 +145,16 @@
   /* ---- firing ---- */
   function renderFire(m) {
     sub("fire");
+    var yourTurn = !!m.yourTurn && !inputPaused();
     var t = $("bs-turn");
-    t.textContent = m.yourTurn ? t("bs.your_turn_fire") : t("common.opp_turn", { nick: esc(m.opp) || t("common.opponent") });
-    t.className = "turn" + (m.yourTurn ? " you" : "");
+    t.textContent = inputPaused() ? t(A.serverPause ? "net.host_paused" : "net.opp_reconnect") :
+      (yourTurn ? t("bs.your_turn_fire") : t("common.opp_turn", { nick: esc(m.opp) || t("common.opponent") }));
+    t.className = "turn" + (yourTurn ? " you" : "");
     $("bs-ships").textContent = t("common.you") + " " + m.myShips + " | " + t("common.them") + " " + m.oppShips;
     var TR = ["", "miss", "hit", "sunk"];
     var track = $("bs-track-grid");
-    track.classList.toggle("waiting", !m.yourTurn); // dim + no taps when it's not your turn
-    track.classList.toggle("myturn", m.yourTurn);   // orange border when it's your turn to fire
+    track.classList.toggle("waiting", !yourTurn); // dim + no taps when it's not your turn
+    track.classList.toggle("myturn", yourTurn);   // orange border when it's your turn to fire
     // Your shot just resolved (a track cell went from un-shot to a result): play a
     // distinct sound for miss / hit / sunk. track only changes on your own shots.
     if (prevTrack) {
@@ -150,7 +171,8 @@
       var cls = TR[m.track[i]];
       if (prevTrack && prevTrack[i] === 0 && m.track[i] !== 0) cls += " pop"; // this shot just landed
       return cls;
-    }, m.yourTurn ? function (i) {
+    }, yourTurn ? function (i) {
+      if (inputPaused()) return;
       if (m.track[i] !== 0) return;      // already fired here
       A.vibe(10);                        // tap feedback; the hit/miss sound plays on the result
       send({ t: "fire", n: i });
@@ -166,8 +188,8 @@
     prevMine = m.mine.slice();
     // Cue when the turn flips to you (a hit keeps the opponent firing, so this only
     // fires when they miss and it's genuinely your shot).
-    if (m.yourTurn && !prevYourTurn) { A.sfx("tick"); A.vibe(30); }
-    prevYourTurn = m.yourTurn;
+    if (yourTurn && !prevYourTurn) { A.sfx("tick"); A.vibe(30); }
+    prevYourTurn = yourTurn;
     grid($("bs-fleet-grid"), function (i) { return MI[m.mine[i]]; }, null);
   }
 
@@ -191,6 +213,8 @@
   A.handlers.bs = function (m) {
     route("bs");
     if (A.view !== "bs") return;
+    statePaused = (m.phase === "place" || m.phase === "fire") && !!m.paused;
+    A.pauseNotice(statePaused);
     if (rematchTimer && m.phase !== "over") { clearTimeout(rematchTimer); rematchTimer = null; }
     if (m.phase !== "fire") { prevTrack = null; prevMine = null; prevYourTurn = false; } // reset cues across phases
     $("bs-leave").classList.toggle("hide", m.phase === "lobby");
@@ -205,11 +229,19 @@
     } else if (m.phase === "over") {
       renderOver(m);
     }
+    syncPauseUi();
     prevPhase = m.phase;
   };
 
+  A.pauseHooks.push(function (hostPaused) {
+    if (A.view !== "bs") return;
+    syncPauseUi();
+    if (!hostPaused) A.pauseNotice(statePaused);
+  });
+
   document.addEventListener("DOMContentLoaded", function () {
     $("bs-rotate").addEventListener("click", function () {
+      if (inputPaused() || !ships) return;
       var s = ships[sel];
       s.d ^= 1;
       if (s.placed && !fits(s, sel)) s.d ^= 1;   // revert if the rotation doesn't fit
@@ -217,11 +249,12 @@
       renderPlace(lastPlaceMsg);
     });
     $("bs-random").addEventListener("click", function () {
+      if (inputPaused() || !ships) return;
       randomize(); sel = 0; A.sfx("drop"); A.vibe(15);
       renderPlace(lastPlaceMsg);
     });
     $("bs-ready").addEventListener("click", function () {
-      if (!allPlaced()) return;
+      if (inputPaused() || !ships || !allPlaced()) return;
       var str = ships.map(function (s) { return s.r + "," + s.c + "," + s.d; }).join(";");
       A.sfx("buzz"); A.vibe(20);
       send({ t: "place", ships: str });
@@ -229,6 +262,7 @@
     $("bs-leave").addEventListener("click", function () { send({ t: "leaveGame" }); });
     $("bs-back").addEventListener("click", function () { send({ t: "leaveGame" }); });
     $("bs-rematch").addEventListener("click", function () {
+      if (inputPaused()) return;
       A.sfx("buzz"); send({ t: "rematch" });
       if (rematchTimer) clearTimeout(rematchTimer);
       rematchTimer = setTimeout(function () {

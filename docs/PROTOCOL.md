@@ -50,17 +50,18 @@ All control messages are framed so the link can resync after noise:
 | 0x11 | FILE_BEGIN   | `flags(1)` `pathlen(1)` `path` `mimelen(1)` `mime` `total(4 LE)` — then `total` **raw** bytes follow (see 1.3). `flags` bit0 = gzip. |
 | 0x12 | SET_AP       | `ssid` (UTF-8, <=32B) |
 | 0x13 | START        | (none) — bring up AP + DNS + HTTP + WS |
-| 0x14 | STOP         | (none) |
+| 0x14 | STOP         | (none) — stop transport and freeze logical game time; roster/game state is retained for the next `START` |
 | 0x15 | RESET        | (none) — ESP reboots |
-| 0x16 | SELECT_GAME  | `gameid(1)` — 0 lobby, 1 trivia, 2 connect4 |
-| 0x17 | QUESTION     | JSON: `{"i":<n>,"q":"..","o":["a","b","c","d"],"c":<0-3>,"dur":<sec>}` (trivia) |
-| 0x18 | REVEAL       | (none) — close the current question, broadcast the correct answer |
+| 0x16 | SELECT_GAME  | `gameid(1)` — 0 lobby; game ids 1..15 are defined in `ha_proto.h` |
+| 0x17 | QUESTION     | Reserved legacy host-driven trivia command. Protocol v18 ignores it. |
+| 0x18 | REVEAL       | Reserved legacy host-driven trivia command. Protocol v18 ignores it. |
 | 0x19 | ROUND_END    | (none) — back to lobby for the active game |
-| 0x1A | CONFIG       | JSON: `{"max":8,"lang":"pt-br"}` — station cap and the host's phone-UI language (`""`/absent = English). The ESP stores `lang` and echoes it back in each `welcome`. |
+| 0x1A | CONFIG       | JSON: `{"max":8,"lang":"pt-br","code":"123456"}` — station/WebSocket cleanup cap, phone-UI language, and optional six-digit admission code. The ESP echoes/broadcasts only `lang`; it never sends or logs the code. |
 | 0x1B | RESET_SCORES | (none) — zero the ESP live score mirror |
-| 0x1C | CONTENT_CLEAR | (none) — drop all packs, for every game |
-| 0x1D | CONTENT_PACK | game byte + pack name — begin a pack for that game |
-| 0x1E | CONTENT_ITEM | JSON object of the file's own keys — append one item to the current pack |
+| 0x1C | CONTENT_CLEAR | (none) — begin a staged replacement; the current content remains live |
+| 0x1D | CONTENT_PACK | game byte + pack name — begin a pack in the staging bank |
+| 0x1E | CONTENT_ITEM | JSON object of the file's own keys — append one item to the staged pack |
+| 0x1F | CONTENT_COMMIT | `pack_count(2 LE)` `item_count(2 LE)` — publish the staged bank only when both accepted counts match exactly |
 
 > Content is opaque to the Flipper. It parses only `Key: value` blocks and ships them
 > verbatim; every game's interpretation of those keys lives in the ESP firmware, so a new
@@ -71,18 +72,41 @@ All control messages are framed so the link can resync after noise:
 > Content **language** is resolved entirely on the Flipper: for the host's chosen `lang`
 > it streams `packs/<game>/<lang>/` (falling back to the English packs at `packs/<game>/`
 > per game), so the wire opcodes above are language-agnostic. Item text is UTF-8.
+> A live locale replacement is one transaction: `CONTENT_CLEAR`, `CONFIG`, every
+> `CONTENT_PACK`/`CONTENT_ITEM`, then the four-byte `CONTENT_COMMIT`. Firmware stages
+> `lang` while the transaction is open, returns the selected game to its lobby, broadcasts
+> the new `config`, then emits one authoritative state. A malformed item, allocation
+> failure, missing frame, count mismatch, or malformed commit discards staging and keeps
+> both the previous bank and locale. The host waits for `STATUS content_ok`; `content_error`
+> is failure and must not be reported as a successful language change.
 
 **ESP -> Flipper**
 
 | Type | Name         | Payload |
 |------|--------------|---------|
-| 0x80 | STATUS       | token: `boot` `files_ok` `ap_ok` `up ip=..` `stopped` `err ..` |
-| 0x81 | JOIN         | `pid(1)` `nick` — a player joined |
+| 0x80 | STATUS       | token including `boot`, `cleared`, `fok`, `ap_ok`, `ap_set`, `content_ok`, `content_error`, `up ip=..`, `stopped`, or `config_error` |
+| 0x81 | JOIN         | `pid(1)` `identity(16)` `nick` — stable identity is the first 128 bits of SHA-256 over the browser-only resume token |
 | 0x82 | LEAVE        | `pid(1)` |
 | 0x83 | SCORE        | `pid(1)` `delta(2 LE, signed)` `reason` — authoritative-persist on Flipper |
-| 0x84 | ROUND_RESULT | JSON, game-specific (trivia: `{"correct":[pid..]}`, c4: `{"win":pid,"lose":pid}` or `{"draw":[a,b]}`) |
-| 0x85 | EVENT        | JSON for host display, e.g. `{"answers":3,"total":5}` or `{"c4":"A vs B started"}` |
+| 0x84 | ROUND_RESULT | Reserved legacy v17 JSON result. Protocol v18 producers do not send it. |
+| 0x85 | EVENT        | Typed bounded event: `version(1)` `kind(1)` `game(1)` `actor_pid(1)` `target_pid(1)` `value(2 LE, signed)` `text(0..96 UTF-8 bytes)` |
 | 0x86 | PING         | identity beacon ~every 2s: `magic(4)` + `version(2 LE)`. `magic` = `48 41 52 43` ("HARC"); the Flipper only treats a magic-matched PING as "our board present", and flags `version < HA_FW_VERSION` as an outdated board to update. |
+
+`EVENT.version` is currently `1`. Unknown versions or kinds are rejected by consumers;
+the frame remains bounded and game-independent:
+
+| Kind | Name | Field use |
+|------|------|-----------|
+| 1 | `MATCH_STARTED` | `game`, `actor_pid`, and `target_pid` identify the pairing |
+| 2 | `CHAT` | `actor_pid` sent `text` |
+| 3 | `ROLE` | `actor_pid` received or performed the role described by `text` |
+| 4 | `ROUND_WIN` | `actor_pid` beat `target_pid`; optional `value`/`text` qualify the result |
+| 5 | `ROUND_DRAW` | `actor_pid` and `target_pid` drew; optional `value`/`text` qualify it |
+| 6 | `ROUND_COMPLETE` | `value` is the completed round number; actor/target are optional |
+| 7 | `GAME_FINAL` | The selected `game` reached its final state |
+
+Text is trimmed only at a complete UTF-8 code-point boundary. All game awards travel
+separately as `SCORE`; a consumer must never infer score deltas from display events.
 
 ### 1.3 Raw-bulk escape (asset upload)
 
@@ -97,18 +121,26 @@ generalized to named files. Bulk bytes need no escaping because the length is kn
 ```
 Flipper                         ESP
   |-- CLEAR_FILES -------------->|
-  |-- FILE_BEGIN + bytes (xN) -->|   (index.html.gz, app.js.gz, app.css.gz, ...)
+  |-- FILE_BEGIN + bytes (xN) -->|   (web bundle)
+  |-- CONTENT_CLEAR ------------>|
+  |-- CONFIG ------------------->|   (lang + six-digit join code)
+  |-- CONTENT_PACK/ITEM (xN) --->|
+  |-- CONTENT_COMMIT ----------->|   (accepted pack/item counts)
+  |<---------- STATUS content_ok-|
   |-- SET_AP ------------------->|
   |-- START -------------------->|
   |<------------- STATUS ap_ok --|
   |<------------- STATUS up ip=..|   AP live, phones can join
 ```
-Then live: JOIN/LEAVE/SCORE/EVENT/ROUND_RESULT flow up; SELECT_GAME/QUESTION/
-REVEAL/ROUND_END flow down as the host drives rounds. PING beacons throughout.
+The content transaction is sent before `SET_AP`; its `content_ok` acknowledgement is
+required. Then live: JOIN/LEAVE/SCORE/typed EVENT flow up; CONFIG/SELECT_GAME/ROUND_END
+flow down. PING beacons throughout. `STOP`
+does not end player identities: it freezes game time, closes transport, and `START`
+gives detached seats a fresh reconnect window. `RESET`/reboot is the hard reset.
 
 ---
 
-## 2. WebSocket JSON (Phone <-> ESP32)
+## 2. WebSocket JSON v2 (Phone <-> ESP32)
 
 - Endpoint: `ws://192.168.4.1/ws`. One socket per phone.
 - All messages are a single JSON object with a `t` (type) field. Small; one frame.
@@ -118,12 +150,12 @@ REVEAL/ROUND_END flow down as the host drives rounds. PING beacons throughout.
 
 | `t`        | Fields | Meaning |
 |------------|--------|---------|
-| `hello`    | `nick` | Join / re-join with a nickname (from localStorage) |
+| `hello`    | `proto:2`, `resume`, `nick`, `avatar`, optional `code` | The browser creates and persists a 128-bit lowercase-hex `resume` token using `crypto.getRandomValues`. Unknown identities need the six-digit host code; a known identity may omit it. |
 | `answer`   | `c` (0-3) | Trivia: buzz an answer for the current question |
 | `challenge`| `to` (pid) | Connect4: challenge a player in the lobby |
-| `accept`   | `from` (pid) | Connect4: accept a pending challenge |
+| `accept`   | `id` (challenge id) | Accept exactly one pending challenge; sender pid alone is not an identity. |
 | `cancel`   | | Connect4: withdraw my challenge / decline |
-| `move`     | `col` (0-6) | Connect4: drop a disc in a column |
+| `move`     | `n` | Game-specific move index (or Chess `from`/`to` fields) |
 | `leaveGame`| | Connect4: forfeit/exit the current match |
 | `ping`     | | keepalive |
 
@@ -131,23 +163,53 @@ REVEAL/ROUND_END flow down as the host drives rounds. PING beacons throughout.
 
 | `t`      | Fields | Meaning |
 |----------|--------|---------|
-| `welcome`| `pid`, `nick`, `lang` | Assigned player id after `hello`; `lang` is the host's phone-UI language (`""` = English), which the client uses to pick its message catalog |
-| `lobby`  | `game` ("none"/"trivia"/"connect4"), `players` (`[{pid,nick,score}]`), `me` (pid) | Lobby snapshot; sent on change |
-| `trivia` | `phase` ("idle"/"question"/"reveal"), `i`, `q`, `o` (opts), `dur`, `deadline` (ms epoch-ish, server `millis`), `mine` (my choice or -1), `counts` ([n0..n3]), `correct` (reveal only), `scores` | Full trivia view for this client |
-| `c4`     | `phase` ("lobby"/"playing"/"over"), lobby: `challenges` (`[{from,to}]`); playing: `mid`, `board` (42 ints: 0 empty/1/2), `turn` (pid), `me` (1 or 2), `opp` (nick), `you` (pid); over: `result` ("win"/"lose"/"draw") | Full connect4 view for this client |
+| `welcome`| `proto:2`, `session`, `pid`, `nick`, `avatar`, `lang`, `resumed`, `paused` | Seat identity after `hello`; `session` is a 128-bit lowercase-hex server session id. `resumed` means an exact engine-seat resume, not merely a host-known identity. The browser token is never echoed. |
+| `reject` | `code` (`auth_required`/`bad_code`/`throttled`/`full`/`bad_protocol`), optional `retry_ms`/`proto` | The hello was not accepted and allocated no seat. |
+| `error`  | `code` (`challenge_capacity`/`match_capacity`) | A bounded challenge or match table is full; no match was created. |
+| `config` | `lang` | Live host configuration change; clients re-render localized UI without reconnecting. |
+| `server_pause` | `reason`, `ssid`, `reconnect_ms` | Planned transport downtime. The client freezes local timers and gameplay, keeps reconnecting, and displays the host-selected SSID/window. Re-sent after every hello while paused. |
+| `server_resume` | | Explicitly unfreezes the client. A socket that had not yet received `welcome` retries `hello`. |
+| `lobby`  | `game`, `players` (`[{pid,nick,avatar,score,online,busy}]`), `me` | Lobby snapshot. Detached-but-reserved players remain listed with `online:false` and cannot be challenged. |
+| `trivia` | `phase` ("idle"/"question"/"reveal"), `i`, `q`, `o` (opts), `remaining_ms`, `duration_ms`, `mine` (my choice or -1), `counts` ([n0..n3]), `correct` (reveal only), `scores` | Full trivia view for this client |
+| `duel`   | `phase` ("lobby"/"playing"/"over"), lobby `challenges:[{id,from,to}]`; playing/over fields are game-specific | Full shared duel view for this client. Pong, Battleship, and Chess use the same challenge objects in their own lobby messages. |
 | `toast`  | `msg` | Transient message to show |
 | `pong`   | | keepalive reply |
 
-Server `millis` is used for `deadline`; the client shows a countdown from
-`deadline - now_estimate`, so exact clock sync is not required (the server is the
-referee for scoring; the client bar is cosmetic).
+Timed state exposes only relative `remaining_ms` and `duration_ms`. Raw ESP deadlines
+and uptime never cross the WebSocket protocol. Internally the engine uses a logical
+clock that freezes while transport is stopped and rollover-safe signed comparisons;
+the server remains authoritative.
 
-### 2.3 Scoring split
+### 2.3 Resume and disconnect lifecycle
 
-The ESP scores the live session (speed+correctness for trivia, win/draw for c4)
-and (a) keeps a **live mirror** it broadcasts to phones in `players[].score`, and
-(b) reports each delta to the Flipper via UART `SCORE` for the host display and
-persistent leaderboard. Both stay consistent because every delta is reported.
+- The browser creates its random 128-bit `resume` token. The engine derives
+  `SHA-256(resume)[0..15]` and stores/reports only that identity digest; raw tokens remain
+  browser-only. An unknown digest must present the current host join code.
+- A socket disconnect marks that player `online:false` but retains pid, score, readiness,
+  and live match state for **120 seconds**. It does not emit UART `LEAVE` or forfeit yet.
+- A v2 `hello` with the exact token within the grace window rebinds the seat. If two
+  sockets claim it, the newest binding wins and input from the old socket no longer maps
+  to a player.
+- At 120 seconds the seat is finalized: live matches receive the normal leave/forfeit,
+  per-player game arrays are cleared, and UART `LEAVE` is emitted. A permanent host
+  ledger may still recognize the digest later and allocate a fresh pid/game score.
+- Outstanding challenges are deliberately shorter lived than seats: either endpoint
+  disconnecting, leaving, changing games, or entering a match removes them. Accept uses
+  the challenge `id`, and an exhausted match pool returns `error{code:"match_capacity"}`.
+- Planned transport pause is different: logical time, quorum reconciliation, challenges,
+  match state, and expiry are frozen. Reserved or restored host-known identities may bind
+  while paused; genuinely new admission waits for `server_resume`. When the host resumes,
+  presence is reconciled once. A still-missing 1v1 opponent or role-critical player then
+  enters ordinary transient grace; unrelated party quorum excludes offline players.
+
+### 2.4 Scoring split
+
+The ESP owns the score for the currently selected phone game. Selecting another game
+or starting that game's replay resets this browser-facing score without emitting a
+negative award. Every positive or negative award is also emitted exactly once through
+UART `SCORE`, keyed by the current pid; the host resolves that pid to the stable identity
+from `JOIN` and adds the delta to its cumulative session ledger. Content/locale replacement
+preserves both values while returning only the active round to its lobby.
 
 ---
 
@@ -157,10 +219,10 @@ New game ids (UART `SELECT_GAME` / lobby `game`): `3` tictactoe, `4` dots,
 `5` draw, `6` pong. Lobby `game` string adds: `"tictactoe"`, `"dots"`, `"draw"`,
 `"pong"`.
 
-### 3.1 Duels (connect4, tictactoe, dots) — unified
+### 3.1 Duels (connect4, tictactoe, dots, reversi) — unified
 
-All three are 1v1 and share the same lobby flow. Client intents:
-`challenge{to}`, `accept{from}`, `cancel`, `move{n}`, `rematch`, `leaveGame`.
+All four are 1v1 and share the same lobby flow. Client intents:
+`challenge{to}`, `accept{id}`, `cancel`, `move{n}`, `rematch`, `leaveGame`.
 `move.n` is a grid index whose meaning depends on `kind` (below). `rematch` in an
 `over` match restarts the same pairing (first move alternates) if the opponent is
 still present.
@@ -168,7 +230,7 @@ still present.
 Server -> client message `t:"duel"`, common fields: `kind`
 ("c4"/"ttt"/"dots"), `phase` ("lobby"/"playing"/"over"), `you` (pid), `me`
 (1 or 2), `opp` (nick), `turn` (pid), `result` ("win"/"lose"/"draw", over only),
-`challenges` (`[{from,to}]`, lobby only).
+`challenges` (`[{id,from,to}]`, lobby only).
 
 - **c4** (`kind:"c4"`): `cols:7`, `rows:6`, `need:4`, `gravity:true`, `board`
   (42 ints, row-major, row 0 top, 0/1/2). `move.n` = column 0..6.
@@ -182,16 +244,20 @@ Server -> client message `t:"duel"`, common fields: `kind`
 
 ### 3.2 Drawing + guessing (`draw`)
 
-Host selects the game; the ESP runs rounds off its built-in word list, rotating
-the drawer. Server -> client `t:"draw"`:
+Host selects the game; the ESP runs short rounds from all non-empty streamed Draw packs,
+rotating both the pack and the drawer. The per-pack word order is shuffled and does not
+repeat until that pack is exhausted. Server -> client `t:"draw"`:
 - `phase:"draw"`, `role:"drawer"`: `word`, `round`, `drawer` (pid), `scores`.
 - `phase:"draw"`, `role:"guesser"`: `len` (word length), `round`, `drawer`
   (nick), `scores`.
 - `phase:"reveal"`: `word`, `winner` (pid or null), `scores`.
 - `phase:"idle"`: `scores`.
 
-Ink: the drawer sends line segments `stroke{x0,y0,x1,y1}` (normalized 0..1) and
-`clear{}`; the server relays to guessers as `ink{x0,y0,x1,y1}` / `ink{clear:true}`.
+Ink: the drawer sends line segments `stroke{x0,y0,x1,y1}` (normalized finite 0..1) and
+`clear{}`. All four coordinates must be present and valid or the whole stroke is dropped;
+the server relays canonical numbers to guessers as `ink{x0,y0,x1,y1}` /
+`ink{clear:true}`. Drawers advance fairly across replays, and non-empty content packs are
+used round-robin (`draw.pack` names the active pack).
 Guessing: a guesser sends `guess{text}`; a correct guess (case-insensitive) scores
 and ends the round; a wrong guess is broadcast as `chat{nick,text}`.
 
@@ -203,11 +269,12 @@ ESP ticks the ball + paddles and broadcasts. Server -> client `t:"pong"`:
 (1/2), `opp`, `ball{x,y}` (0..1), `p1`, `p2` (paddle y, 0..1), `s1`, `s2`
 (scores); over: `result`. Client input: `paddle{dir}` with `dir` -1/0/1.
 
-### 3.4 Trivia depth (additive)
+### 3.4 Host events
 
-The in-question `EVENT` (ESP -> Flipper) gains a `counts` array so the host screen
-can show live per-option bars: `{"answers":n,"total":m,"counts":[c0,c1,c2,c3]}`.
-The final podium is Flipper-side (from its roster scores); no new message.
+Protocol v18 replaces game-shaped result JSON with the fixed `EVENT` envelope in section
+1.2. Kinds cover match start, chat, role assignment, round win/draw/completion, and game
+final. Consumers format those fields against their own bounded roster mirror; unknown
+kinds/versions are ignored safely.
 
 ### 3.5 Notes
 
@@ -250,13 +317,13 @@ Three self-organizing games share a lobby -> countdown -> round -> reveal ->
 final flow. Common client intents: `ready{ready:bool}` (ready-up in the lobby),
 `again` (replay from the final screen). Common server phases: `"lobby"`
 (`players:[{pid,nick,avatar,ready}]`), `"countdown"` (`sec`), and `"final"`.
-Durations are sent in **seconds**; deadlines in ms (server `millis`).
+Timed phases send relative `remaining_ms` and `duration_ms`, both in milliseconds.
 
 - **Would You Rather** (`t:"wyr"`): `"vote"`/`"reveal"` carry `round`, `rounds`,
   `a`, `b` (the two options), `myvote` (0/1/-1), `counts` ([a,b]). Vote with the
   existing `answer{c:0|1}` intent. No scoring — it's a poll.
 - **Word Scramble** (`t:"scramble"`): `"play"` carries `round`, `rounds`, `scram`
-  (shuffled letters), `len`, `solved` (bool, you), `deadline`, `dur`, `scores`.
+  (shuffled letters), `len`, `solved` (bool, you), `remaining_ms`, `duration_ms`, `scores`.
   Guess with the existing `guess{text}` intent; first correct scores most
   (200/120/80/40). `"reveal"` carries `word`; `"final"` a `board` podium.
 - **Reaction Duel** (`t:"react"`): `"armed"` carries `round`, `rounds`, `light`
@@ -331,7 +398,7 @@ Server `{t:"spectrum",phase,...}`:
 - `"lobby"`: `you`, `players`, `packs` (name/votes), `myvote`.
 - `"countdown"`: `sec`.
 - `"play"` with `stage` `"clue"` | `"guess"` | `"reveal"`: `round`, `rounds`, `left`,
-  `right`, `psychic` (nick), `iam` (am I the psychic), `deadline`/`dur` for the timer bar.
+  `right`, `psychic` (nick), `iam` (am I the psychic), `remaining_ms`/`duration_ms` for the timer bar.
   - `target` (0..100) is sent **only to the psychic** during clue/guess, and to everyone on
     reveal — an un-revealed target never reaches a guesser.
   - `clue` appears once the psychic has submitted; `myguess` is the guesser's own locked value.
@@ -358,7 +425,7 @@ Server `{t:"kmk",phase,...}`:
 - `"lobby"`: `you`, `players`, `packs` (name/votes), `myvote`.
 - `"countdown"`: `sec`.
 - `"play"` with `stage` `"choose"` | `"guess"` | `"reveal"`: `round`, `rounds`, `chooser`
-  (nick), `iam` (am I the chooser), `people` (the three names), `deadline`/`dur` for the timer.
+  (nick), `iam` (am I the chooser), `people` (the three names), `remaining_ms`/`duration_ms` for the timer.
   - `answer` (the chooser's Kiss/Marry/Kill labels) is sent **only to the chooser** from the
     guess stage on, and to everyone on reveal — a guesser never sees it early.
   - `mine` is the guesser's own submitted labels.
@@ -369,7 +436,7 @@ Server `{t:"kmk",phase,...}`:
 
 A 1v1 duel (like Pong/Battleship): shares the challenge/lobby flow (`challenge`/`accept`/
 `cancel`, `rematch`, `leaveGame`) but plays full FIDE rules, refereed entirely on the ESP.
-Select with UART `SELECT_GAME` id `15`; lobby `game` string `"chess"`. Firmware **v17**.
+Select with UART `SELECT_GAME` id `15`; lobby `game` string `"chess"`. Firmware **v18**.
 Chess has no content packs — its UI strings are localized client-side from the message
 catalog like every game (the host's `lang`, set via `CONFIG` and echoed in `welcome`); the
 per-language `packs/<game>/<lang>/` streaming that content games use does not apply here.
@@ -390,21 +457,18 @@ Server `{t:"chess",phase,...}`:
 - `"playing"`: `you`, `opp`, `white` (bool, are you playing white), `turn` (pid),
   `yourTurn`, `board` (64 chars, index 0 = a1, row-major to h8: `PNBRQK`/`pnbrqk`/`.`),
   `moves` (`[from*64+to, ...]`, your legal moves, always present but populated only for the player to move), `check`,
-  `last` (`from*64+to` of the last move played, `-1` before the first), `deadline`, `run`,
-  `oms`, `wtm`, `claim3`, `claim50`, `offer` (`0` or the pid with a pending draw offer).
+  `last` (`from*64+to` of the last move played, `-1` before the first), `remaining_ms`,
+  `duration_ms`, `other_remaining_ms`, `wtm`, `claim3`, `claim50`, `offer` (`0` or the pid with a pending draw offer).
 - `"over"`: the same fields minus `moves`/`claim3`/`claim50`, plus `result`
   (`"win"`/`"lose"`/`"draw"`) and `reason` (`mate`/`stalemate`/`resign`/`flag`/`flagdraw`/
-  `material`/`rep3`/`rep5`/`move50`/`move75`/`agree`/`left`). **Quirk:** the server keeps
-  recomputing `deadline` off the current time even after the game ends, so clients must
-  read the clocks from `run`/`oms` (which the server does freeze on finish) rather than
-  animate a countdown from `deadline` here. `offer` is also stale in this phase — it is not
+  `material`/`rep3`/`rep5`/`move50`/`move75`/`agree`/`left`). Clock values are frozen
+  relative snapshots in this phase. `offer` is also stale in this phase — it is not
   cleared when the game ends — so clients should ignore it once `phase` is `"over"`.
 - `"lobby"`: `challenges` only.
 
-Clocks: fixed 5+0 blitz, no increment, server-authoritative. `run` is the milliseconds left
-on the clock of the side to move (`wtm` = white to move) and `oms` is the other side's
-frozen remaining time; `deadline` is the server's `now + run`, so the client animates a
-countdown without needing clock sync (same pattern as the other timed games). A flag fall
+Clocks: fixed 5+0 blitz, no increment, server-authoritative. `remaining_ms` is the time left
+for the side to move (`wtm` = white to move); `other_remaining_ms` is the other side's
+frozen time. The client locally subtracts elapsed time from the relative snapshot. A flag fall
 loses the game for the side whose clock ran out, unless the opponent could not mate by any
 legal sequence (FIDE 6.9), in which case it's a draw (`flagdraw`).
 
@@ -416,4 +480,4 @@ moment either side plays a move.
 
 State is pushed only on events — a move, resign, draw, claim, or a flag fall the ESP
 notices on its own clock tick — never on a periodic heartbeat; clients animate the
-countdown locally between pushes from `deadline`.
+countdown locally between relative snapshots.

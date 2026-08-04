@@ -30,6 +30,7 @@ e.contentItem(JSON.stringify({
   a: "Atlantic", b: "Indian", c: "Pacific", d: "Arctic",
   answer: "C",
 }));
+e.contentCommit();
 
 // Two players, ready up, run out the countdown, and check the question that lands.
 e.selectGame(HA_GAME_TRIVIA);
@@ -68,6 +69,7 @@ e.contentItem(JSON.stringify({
   a: "wrong1", b: "wrong2", c: "right", d: "wrong3",
   answer: "c", // lowercase -- must still resolve to option index 2
 }));
+e.contentCommit();
 
 e.selectGame(HA_GAME_TRIVIA);
 e.join(1, "ana");
@@ -103,6 +105,7 @@ e.contentItem(JSON.stringify({
 }));
 e.contentPack(99, "Some Future Game"); // unhandled game id
 e.contentItem(JSON.stringify({ arbitrary: "shape", nothing: "like trivia" }));
+e.contentCommit();
 
 e.selectGame(HA_GAME_TRIVIA);
 e.join(1, "ana");
@@ -135,6 +138,7 @@ e.contentClear();
 e.contentPack(HA_GAME_TRIVIA, "Broken");
 e.contentItem(JSON.stringify({ q: "Only two options?", a: "x", b: "y" }));
 e.contentItem(JSON.stringify({ note: "no question here at all" }));
+e.contentCommit();
 
 e.selectGame(HA_GAME_TRIVIA);
 e.join(1, "ana");
@@ -163,6 +167,7 @@ assert.equal(brokenQ.msg.q, "", "no question text leaked from a half-built quest
   e.contentPack(HA_GAME_WYR, "Spooky");
   e.contentItem(JSON.stringify({ a: "Be haunted forever", b: "Haunt someone forever" }));
   e.contentItem(JSON.stringify({ a: "only one option" })); // dropped
+  e.contentCommit();
   e.selectGame(HA_GAME_WYR);
   e.join(1, "ana");
   e.join(2, "bo");
@@ -198,6 +203,7 @@ assert.equal(brokenQ.msg.q, "", "no question text leaked from a half-built quest
   e.contentClear();
   e.contentPack(HA_GAME_WYR, "Stale");
   e.contentItem(JSON.stringify({ a: "STALE_OPTION_A", b: "STALE_OPTION_B" }));
+  e.contentCommit();
   e.selectGame(HA_GAME_WYR);
   e.join(1, "ana");
   e.join(2, "bo");
@@ -219,6 +225,7 @@ assert.equal(brokenQ.msg.q, "", "no question text leaked from a half-built quest
   e.contentItem(JSON.stringify({
     q: "irrelevant", a: "1", b: "2", c: "3", d: "4", answer: "A",
   }));
+  e.contentCommit();
 
   // Re-select WYR (still zero packs loaded) and ready both players again,
   // exactly as if a host cleared content mid-session and players re-readied.
@@ -246,6 +253,7 @@ assert.equal(brokenQ.msg.q, "", "no question text leaked from a half-built quest
   e.contentPack(HA_GAME_SCRAMBLE, "Animals");
   e.contentItem(JSON.stringify({ word: "ELEPHANT" }));
   e.contentItem(JSON.stringify({ note: "no word here" })); // dropped
+  e.contentCommit();
   e.selectGame(HA_GAME_SCRAMBLE);
   e.join(1, "ana");
   e.join(2, "bo");
@@ -267,6 +275,7 @@ assert.equal(brokenQ.msg.q, "", "no question text leaked from a half-built quest
   e.contentClear();
   e.contentPack(HA_GAME_DRAW, "Things");
   e.contentItem(JSON.stringify({ word: "ROCKET" }));
+  e.contentCommit();
   e.selectGame(HA_GAME_DRAW);
   e.join(1, "ana");
   e.join(2, "bo");
@@ -287,6 +296,7 @@ assert.equal(brokenQ.msg.q, "", "no question text leaked from a half-built quest
   e.contentItem(JSON.stringify({ a: "Tea", b: "Coffee" }));
   e.contentPack(HA_GAME_WYR, "Spooky");
   e.contentItem(JSON.stringify({ a: "Ghosts", b: "Zombies" }));
+  e.contentCommit();
   e.selectGame(HA_GAME_WYR);
   e.join(1, "ana");
   e.join(2, "bo");
@@ -300,7 +310,67 @@ assert.equal(brokenQ.msg.q, "", "no question text leaked from a half-built quest
   const round = seen.filter((o) => o.to === "ws" && o.msg && o.msg.t === "wyr").pop();
   const txt = JSON.stringify(round.msg);
   assert.ok(txt.includes("Ghosts") || txt.includes("Zombies"), "the voted (Spooky) pack was played");
-  assert.ok(!txt.includes("Tea") && !txt.includes("Coffee"), "the un-voted pack was not played");
+assert.ok(!txt.includes("Tea") && !txt.includes("Coffee"), "the un-voted pack was not played");
+}
+
+// A content update is published atomically. Commit returns the current game to
+// its lobby, orders config before the one authoritative state push, preserves
+// phone score, and leaves the prior bank untouched when sent/accepted counts differ.
+{
+  const tx = await newEngine();
+  tx.reset(); tx.contentClear(); tx.contentPack(HA_GAME_TRIVIA, "Old");
+  tx.contentItem(JSON.stringify({ q: "OLD QUESTION", a: "yes", b: "no", c: "x", d: "y", answer: "A" }));
+  assert.equal(tx.contentCommitExpected(1, 1).ok, true);
+  tx.selectGame(HA_GAME_TRIVIA); tx.join(1, "ANA"); tx.join(2, "BO");
+  tx.input(1, { t: "ready", ready: true }); tx.input(2, { t: "ready", ready: true });
+  let phase = [];
+  for (let ms = 1000; ms <= 4000; ms += 1000) phase = phase.concat(tx.tick(ms));
+  const oldQ = lastToWs(phase, 1, "trivia").msg;
+  const correct = oldQ.o.indexOf("yes");
+  tx.input(1, { t: "answer", c: correct });
+  tx.input(2, { t: "answer", c: (correct + 1) % 4 });
+
+  tx.contentClear();
+  assert.deepEqual(tx.setLang("de"), [], "locale is staged while content replacement is open");
+  tx.contentPack(HA_GAME_TRIVIA, "New");
+  tx.contentItem(JSON.stringify({ q: "NEW QUESTION", a: "a", b: "b", c: "c", d: "d", answer: "B" }));
+  const committed = tx.contentCommitExpected(1, 1);
+  assert.equal(committed.ok, true);
+  const configIndex = committed.out.findIndex((x) => x.msg?.t === "config");
+  const stateIndex = committed.out.findIndex((x) => x.msg?.t === "lobby");
+  assert.ok(configIndex >= 0 && stateIndex > configIndex, "locale config precedes authoritative state");
+  assert.equal(committed.out[configIndex].msg.lang, "de", "locale and replacement bank commit together");
+  assert.ok(lastToWs(committed.out, 1, "lobby").msg.players.find((p) => p.pid === 1).score > 0,
+    "transaction preserves per-game phone score");
+  assert.equal(lastToWs(committed.out, 1, "trivia").msg.phase, "lobby");
+
+  tx.contentClear(); tx.contentPack(HA_GAME_TRIVIA, "Broken Replacement");
+  tx.contentItem(JSON.stringify({ q: "missing options" }));
+  const rejected = tx.contentCommitExpected(1, 1);
+  assert.equal(rejected.ok, false);
+  assert.deepEqual(rejected.out, [], "failed transaction emits no partial state");
+
+  tx.selectGame(HA_GAME_TRIVIA);
+  tx.input(1, { t: "ready", ready: true }); tx.input(2, { t: "ready", ready: true });
+  let afterReject = [];
+  for (let ms = 5000; ms <= 9000; ms += 1000) afterReject = afterReject.concat(tx.tick(ms));
+  assert.equal(lastToWs(afterReject, 1, "trivia").msg.q, "NEW QUESTION",
+    "rejected staging bank cannot replace the last committed content");
+
+  tx.contentClear(); tx.contentPack(HA_GAME_TRIVIA, "Overlong");
+  tx.contentItem(JSON.stringify({
+    q: "Q".repeat(240), a: "a", b: "b", c: "c", d: "d", answer: "A",
+  }));
+  const overlong = tx.contentCommitExpected(1, 1);
+  assert.equal(overlong.ok, false, "truncated content cannot satisfy transaction counts");
+  assert.deepEqual(overlong.out, []);
+
+  tx.contentClear();
+  tx.contentLoseStage();
+  assert.deepEqual(tx.setLang("fr"), [], "staging OOM cannot publish a locale by itself");
+  const oom = tx.contentCommitExpected(0, 0);
+  assert.equal(oom.ok, false, "missing staging engine fails the transaction");
+  assert.deepEqual(oom.out, [], "staging OOM preserves the previous locale and content atomically");
 }
 
 console.log("content: OK");

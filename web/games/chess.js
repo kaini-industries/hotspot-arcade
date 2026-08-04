@@ -16,6 +16,19 @@
   var rematchTimer = null;
   var resignArmed = false;
   var resignTimer = null;
+  var statePaused = false;
+
+  function inputPaused() { return statePaused || !!A.serverPause; }
+  function syncPauseUi() {
+    var paused = inputPaused();
+    A.setGamePaused("chess", paused);
+    $("chess-board").setAttribute("aria-disabled", paused ? "true" : "false");
+    $("chess-resign").disabled = paused;
+    $("chess-claim").disabled = paused;
+    $("chess-draw").disabled = paused || !!(lastMsg && lastMsg.offer === lastMsg.you);
+    var promoBtns = document.querySelectorAll("#chess-promo .ch-promo-btn");
+    for (var i = 0; i < promoBtns.length; i++) promoBtns[i].disabled = paused;
+  }
 
   function sub(name) {
     ["lobby", "play", "over"].forEach(function (id) {
@@ -70,7 +83,7 @@
       cell.textContent = ch === "." ? "" : (GLYPH[ch.toUpperCase()] || "");
       if (rebuild) el.appendChild(cell);
     }
-    el.onclick = m.yourTurn ? function (e) {
+    el.onclick = (m.yourTurn && !inputPaused()) ? function (e) {
       var idx = Array.prototype.indexOf.call(el.children, e.target);
       if (idx < 0) return;
       onCellTap(m, squareAt(idx, m.white));
@@ -78,6 +91,7 @@
   }
 
   function onCellTap(m, sq) {
+    if (inputPaused()) return;
     if (selFrom === -1) {
       if (movesFrom[sq]) { selFrom = sq; A.vibe(8); renderBoard(m); }
       return;
@@ -103,6 +117,7 @@
   }
 
   function sendMove(from, to, promo) {
+    if (inputPaused()) return;
     A.sfx("drop"); A.vibe(15);
     var msg = { t: "move", from: from, to: to };
     if (promo) msg.promo = promo;
@@ -130,12 +145,11 @@
     var mm = Math.floor(s / 60), ss = s % 60;
     return mm + ":" + (ss < 10 ? "0" : "") + ss;
   }
-  // `liveMs` is the running side's current remaining time (computed from the
-  // deadline while ticking); omitted, it falls back to the static m.run, which
-  // is what the over screen must always use (see the module comment on quirks).
+  // `liveMs` is the running side's locally-counted remainder; omitted, use the
+  // server's relative snapshot. No raw ESP clock/deadline crosses the protocol.
   function paintClocks(m, liveMs) {
-    var running = liveMs == null ? m.run : liveMs;
-    var paused = m.oms;
+    var running = liveMs == null ? m.remaining_ms : liveMs;
+    var paused = m.other_remaining_ms;
     var mine = m.wtm === m.white ? running : paused;
     var theirs = m.wtm === m.white ? paused : running;
     var myEl = $("chess-my-clock"), oppEl = $("chess-opp-clock");
@@ -149,24 +163,27 @@
     stopClockTimer();
     clockTimer = setInterval(function () {
       // Only the running side moves; the over screen stops this timer entirely
-      // (see renderOver) so it never fights the frozen m.run/m.oms values.
-      if (!lastMsg || lastMsg.phase !== "playing") return;
-      paintClocks(lastMsg, Math.max(0, lastMsg.deadline - serverNow()));
+      // (see renderOver) so it never fights the frozen relative values.
+      if (!lastMsg || lastMsg.phase !== "playing" || inputPaused()) return;
+      var elapsed = Date.now() - lastMsg.receivedAt;
+      paintClocks(lastMsg, Math.max(0, lastMsg.remaining_ms - elapsed));
     }, 200);
   }
 
   /* ---- phases ---- */
   function renderPlay(m) {
     sub("play");
-    if (m.run >= 1000) noteDeadline(m.deadline, m.run);
+    if (inputPaused()) stopClockTimer();
+    else if (!clockTimer) startClockTimer();
     movesFrom = buildMovesFrom(m.moves);
     if (selFrom !== -1 && !movesFrom[selFrom]) selFrom = -1;
     renderBoard(m);
     paintClocks(m);
 
     var turnEl = $("chess-turn");
-    turnEl.textContent = m.yourTurn ? t("common.your_turn") : t("common.opp_turn", { nick: m.opp || t("common.opponent") });
-    turnEl.className = "turn" + (m.yourTurn ? " you" : "");
+    turnEl.textContent = inputPaused() ? t(A.serverPause ? "net.host_paused" : "net.opp_reconnect") :
+      (m.yourTurn ? t("common.your_turn") : t("common.opp_turn", { nick: m.opp || t("common.opponent") }));
+    turnEl.className = "turn" + (m.yourTurn && !inputPaused() ? " you" : "");
     var myCheck = !!(m.check && m.yourTurn);
     $("chess-check").classList.toggle("hide", !myCheck);
     if (myCheck && !prevMyCheck) A.sfx("check");
@@ -176,6 +193,7 @@
     if (m.offer === m.you) { drawBtn.disabled = true; drawBtn.textContent = t("chess.offer_sent"); }
     else if (m.offer) { drawBtn.disabled = false; drawBtn.textContent = t("chess.accept_draw"); }
     else { drawBtn.disabled = false; drawBtn.textContent = t("chess.offer_draw"); }
+    if (inputPaused()) drawBtn.disabled = true;
     $("chess-claim").classList.toggle("hide", !(m.claim3 || m.claim50));
 
     if (m.yourTurn && !prevYourTurn) { A.sfx("tick"); A.vibe(30); }
@@ -184,10 +202,7 @@
 
   function renderOver(m) {
     sub("over");
-    if (m.run >= 1000) noteDeadline(m.deadline, m.run);
-    // Quirk: the server keeps recomputing `deadline` even after the game ends,
-    // so the over screen must read the frozen `run`/`oms` values statically —
-    // never derive a countdown from `deadline` here.
+    // The over screen reads the frozen relative values and does not start a timer.
     paintClocks(m);
     var r = $("chess-result");
     var RESULT_KEY = { win: "common.win", lose: "common.lose", draw: "common.draw" };
@@ -214,7 +229,10 @@
   A.handlers.chess = function (m) {
     route("chess");
     if (A.view !== "chess") return;
+    statePaused = m.phase === "playing" && !!m.paused;
+    A.pauseNotice(statePaused);
     if (rematchTimer && m.phase !== "over") { clearTimeout(rematchTimer); rematchTimer = null; }
+    m.receivedAt = Date.now();
     lastMsg = m;
     $("chess-leave").classList.toggle("hide", m.phase === "lobby");
     if (m.phase === "lobby") {
@@ -225,7 +243,8 @@
       sub("lobby");
       A.lobbyView($("chess-incoming"), $("chess-players"), m.challenges);
     } else if (m.phase === "playing") {
-      if (prevPhase !== "playing") { startClockTimer(); selFrom = -1; }
+      if (prevPhase !== "playing") selFrom = -1;
+      if (inputPaused()) hidePromo();
       renderPlay(m);
     } else if (m.phase === "over") {
       stopClockTimer();
@@ -234,11 +253,24 @@
       hidePromo();
       renderOver(m);
     }
+    syncPauseUi();
     prevPhase = m.phase;
   };
 
+  A.pauseHooks.push(function (hostPaused) {
+    if (A.view !== "chess") return;
+    if (inputPaused()) { stopClockTimer(); hidePromo(); }
+    else if (!hostPaused && lastMsg && lastMsg.phase === "playing") {
+      lastMsg.receivedAt = Date.now();
+      if (!clockTimer) startClockTimer();
+    }
+    syncPauseUi();
+    if (!hostPaused) A.pauseNotice(statePaused);
+  });
+
   document.addEventListener("DOMContentLoaded", function () {
     $("chess-resign").addEventListener("click", function () {
+      if (inputPaused()) return;
       var btn = $("chess-resign");
       if (!resignArmed) {
         resignArmed = true;
@@ -254,11 +286,18 @@
         A.sfx("buzz"); send({ t: "resign" });
       }
     });
-    $("chess-draw").addEventListener("click", function () { A.sfx("buzz"); send({ t: "draw" }); });
-    $("chess-claim").addEventListener("click", function () { A.sfx("buzz"); send({ t: "claim" }); });
+    $("chess-draw").addEventListener("click", function () {
+      if (inputPaused()) return;
+      A.sfx("buzz"); send({ t: "draw" });
+    });
+    $("chess-claim").addEventListener("click", function () {
+      if (inputPaused()) return;
+      A.sfx("buzz"); send({ t: "claim" });
+    });
     $("chess-leave").addEventListener("click", function () { send({ t: "leaveGame" }); });
     $("chess-back").addEventListener("click", function () { send({ t: "leaveGame" }); });
     $("chess-rematch").addEventListener("click", function () {
+      if (inputPaused()) return;
       A.sfx("buzz"); send({ t: "rematch" });
       if (rematchTimer) clearTimeout(rematchTimer);
       rematchTimer = setTimeout(function () {
@@ -271,7 +310,7 @@
     for (var pi = 0; pi < promoBtns.length; pi++) {
       (function (btn) {
         btn.addEventListener("click", function () {
-          if (!pendingPromo) return;
+          if (inputPaused() || !pendingPromo) return;
           var promo = parseInt(btn.getAttribute("data-promo"), 10);
           sendMove(pendingPromo.from, pendingPromo.to, promo);
           hidePromo(); // re-renders the board (see hidePromo's comment)

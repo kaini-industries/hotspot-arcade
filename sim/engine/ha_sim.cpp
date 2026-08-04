@@ -6,6 +6,7 @@
 // is the fidelity boundary: it carries exactly what the firmware would have sent.
 #include "Arduino.h"
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -16,10 +17,12 @@ uint32_t millis() { return g_millis; }
 // chessTestLoad/chessTestPerft) so the sim can drive positions the normal opening
 // moves can't reach quickly (mate/stalemate/draw setups, perft ground truth).
 #define HA_CHESS_TEST
+#define HA_ENGINE_TEST
 #include "../../esp32/hotspot-arcade-fw/ha_games.h"
 
 static Engine engine;
 static std::vector<std::string> g_outbox;
+static std::vector<std::string> g_knownIdentities;
 static std::string g_drained; // return buffer; must outlive the call
 
 // Escape a C string for embedding as a JSON string value. Only nicknames and score
@@ -56,14 +59,34 @@ void haWsSendWs(uint32_t wsId, const String& msg) {
         "{\"to\":\"ws\",\"id\":" + std::to_string(wsId) + ",\"msg\":" + msg.str() + "}");
 }
 
+void haWsCloseWs(uint32_t wsId) {
+    g_outbox.push_back(
+        "{\"to\":\"ws\",\"id\":" + std::to_string(wsId) + ",\"kind\":\"close\"}");
+}
+
 void haWsBroadcast(const String& msg) {
     g_outbox.push_back("{\"to\":\"all\",\"msg\":" + msg.str() + "}");
 }
 
-void haUartJoin(uint8_t pid, const char* nick) {
+uint8_t haAuthorizeIdentity(
+    uint32_t wsId, const char* identity, const char* code, uint32_t* retryMs) {
+    (void)wsId;
+    if(retryMs) *retryMs = 0;
+    if(std::find(g_knownIdentities.begin(), g_knownIdentities.end(), identity) !=
+       g_knownIdentities.end())
+        return HA_JOIN_AUTH_KNOWN;
+    if(!code || !code[0]) return HA_JOIN_AUTH_REQUIRED;
+    return strcmp(code, "123456") == 0 ? HA_JOIN_AUTH_OK : HA_JOIN_AUTH_BAD_CODE;
+}
+
+void haUartJoinStable(uint8_t pid, const char* identity, const char* nick, const char* avatar) {
+    if(std::find(g_knownIdentities.begin(), g_knownIdentities.end(), identity) ==
+       g_knownIdentities.end())
+        g_knownIdentities.push_back(identity);
     g_outbox.push_back(
         "{\"to\":\"uart\",\"kind\":\"join\",\"pid\":" + std::to_string(pid) +
-        ",\"nick\":\"" + esc(nick) + "\"}");
+        ",\"identity\":\"" + esc(identity) + "\",\"nick\":\"" + esc(nick) +
+        "\",\"avatar\":\"" + esc(avatar) + "\"}");
 }
 
 void haUartLeave(uint8_t pid) {
@@ -77,12 +100,14 @@ void haUartScore(uint8_t pid, int delta, const char* reason) {
         ",\"delta\":" + std::to_string(delta) + ",\"reason\":\"" + esc(reason) + "\"}");
 }
 
-void haUartEvent(const String& json) {
-    g_outbox.push_back("{\"to\":\"uart\",\"kind\":\"event\",\"json\":" + json.str() + "}");
-}
-
-void haUartRoundResult(const String& json) {
-    g_outbox.push_back("{\"to\":\"uart\",\"kind\":\"round\",\"json\":" + json.str() + "}");
+void haUartHostEvent(uint8_t kind, uint8_t game, uint8_t actor, uint8_t target,
+                     int16_t value, const char* text) {
+    g_outbox.push_back(
+        "{\"to\":\"uart\",\"kind\":\"host_event\",\"event\":{\"version\":" +
+        std::to_string(HA_HOST_EVENT_VERSION) + ",\"type\":" + std::to_string(kind) +
+        ",\"game\":" + std::to_string(game) + ",\"actor\":" +
+        std::to_string(actor) + ",\"target\":" + std::to_string(target) +
+        ",\"value\":" + std::to_string(value) + ",\"text\":\"" + esc(text) + "\"}}");
 }
 
 // --- exported C API ------------------------------------------------------------
@@ -90,7 +115,17 @@ extern "C" {
 
 void ha_reset() {
     g_millis = 0;
-    engine.reset();
+    g_knownIdentities.clear();
+    engine.reset(g_millis);
+}
+void ha_reset_at(uint32_t now) {
+    g_millis = now;
+    g_knownIdentities.clear();
+    engine.reset(g_millis);
+}
+void ha_reset_keep_known(uint32_t now) {
+    g_millis = now;
+    engine.reset(g_millis);
 }
 
 void ha_tick(uint32_t now) {
@@ -98,15 +133,31 @@ void ha_tick(uint32_t now) {
     engine.tick(now);
 }
 
-void ha_input(uint32_t wsId, const char* json) { engine.onInput(wsId, json); }
-void ha_disconnect(uint32_t wsId) { engine.onWsDisconnect(wsId); }
+void ha_input(uint32_t wsId, const char* json) { engine.onInput(wsId, json, g_millis); }
+void ha_input_at(uint32_t wsId, const char* json, uint32_t now) {
+    g_millis = now;
+    engine.onInput(wsId, json, g_millis);
+}
+void ha_disconnect(uint32_t wsId) { engine.onWsDisconnect(wsId, g_millis); }
+void ha_pause() { engine.transportPause(g_millis); }
+void ha_resume() { engine.transportResume(g_millis); }
+int ha_time_reached(uint32_t now, uint32_t deadline) { return haTimeReached(now, deadline); }
+uint32_t ha_time_remaining(uint32_t now, uint32_t deadline) {
+    return haTimeRemaining(now, deadline);
+}
 void ha_select_game(int id) { engine.selectGame((uint8_t)id); }
 void ha_trivia_clear() { engine.triviaTopicsClear(); }
 void ha_trivia_add_topic(const char* name) { engine.triviaAddTopic(name); }
 void ha_trivia_add_q(const char* json) { engine.triviaAddQ(json); }
 void ha_content_clear() { engine.contentClear(); }
+void ha_content_lose_stage() { engine.contentTestLoseStage(); }
 void ha_content_pack(int game, const char* name) { engine.contentPack((uint8_t)game, name); }
 void ha_content_item(const char* json) { engine.contentItem(json); }
+void ha_content_commit() { engine.contentCommit(); }
+int ha_content_commit_expected(int packs, int items) {
+    if(packs < 0 || packs > 65535 || items < 0 || items > 65535) return 0;
+    return engine.contentCommit((uint16_t)packs, (uint16_t)items) ? 1 : 0;
+}
 void ha_round_end() { engine.roundEnd(); }
 void ha_reset_scores() { engine.resetScores(); }
 void ha_set_lang(const char* l) { engine.setLang(l); }

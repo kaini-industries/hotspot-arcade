@@ -36,9 +36,8 @@
     var reveal = m.phase === "reveal";
     $("wyr-meta").textContent = t("wyr.meta", { n: m.round, total: m.rounds });
     // Countdown bar: the vote window while asking, the pause before the next prompt
-    // while revealing. Both carry deadline+dur, so the shared timebar drives both.
-    noteDeadline(m.deadline, m.dur);
-    A.timebar("wyr-bar", m.deadline, m.dur, true);
+    // while revealing. Both carry relative timer fields, so no ESP clock leaks.
+    A.timebar("wyr-bar", m.remaining_ms, m.duration_ms, true);
     var counts = m.counts || [0, 0];
     var total = counts[0] + counts[1];
     var mine = (typeof m.myvote === "number") ? m.myvote : -1;

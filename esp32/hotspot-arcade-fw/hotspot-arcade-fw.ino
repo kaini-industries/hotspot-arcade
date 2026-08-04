@@ -19,13 +19,18 @@
 #include "ha_games.h"
 
 #define WS_MSG_MAX 512
+#ifndef AP_MAX_CONN
 #define AP_MAX_CONN 8
+#endif
 
 static DNSServer dnsServer;
 static AsyncWebServer server(80);
 static AsyncWebSocket ws("/ws");
 static IPAddress apIP(192, 168, 4, 1);
 static char apName[33] = "Hotspot Arcade";
+static char joinCode[7] = ""; // optional generic-host admission code; Cardputer always sets one
+static char knownIdentities[32][HA_IDENTITY_BYTES * 2 + 1] = {};
+static uint8_t knownIdentityCount = 0;
 static bool portalRunning = false;
 static uint8_t apMaxConn = AP_MAX_CONN;
 
@@ -67,16 +72,49 @@ void haWsSendWs(uint32_t wsId, const String& msg) {
     if(!wsId) return;
     ws.text(wsId, msg);
 }
+void haWsCloseWs(uint32_t wsId) {
+    if(wsId) ws.close(wsId, 1008, "identity takeover");
+}
 void haWsBroadcast(const String& msg) {
     ws.textAll(msg);
 }
-void haUartJoin(uint8_t pid, const char* nick) {
-    uint8_t buf[1 + HA_NICK_LEN + 1];
+static bool identityKnown(const char* identity) {
+    if(!identity || strlen(identity) != HA_IDENTITY_BYTES * 2) return false;
+    for(uint8_t i = 0; i < knownIdentityCount; i++)
+        if(strcmp(knownIdentities[i], identity) == 0) return true;
+    return false;
+}
+static void rememberIdentity(const char* identity) {
+    if(identityKnown(identity) || knownIdentityCount >= 32) return;
+    strlcpy(knownIdentities[knownIdentityCount++], identity, sizeof(knownIdentities[0]));
+}
+uint8_t haAuthorizeIdentity(
+    uint32_t wsId, const char* identity, const char* code, uint32_t* retryMs) {
+    (void)wsId;
+    if(retryMs) *retryMs = 0;
+    if(identityKnown(identity)) return HA_JOIN_AUTH_KNOWN;
+    if(!joinCode[0]) return HA_JOIN_AUTH_OK; // legacy Flipper hosts may omit admission control
+    if(!code || !code[0]) return HA_JOIN_AUTH_REQUIRED;
+    return strcmp(code, joinCode) == 0 ? HA_JOIN_AUTH_OK : HA_JOIN_AUTH_BAD_CODE;
+}
+
+static uint8_t haHexNibble(char c) {
+    if(c >= '0' && c <= '9') return (uint8_t)(c - '0');
+    if(c >= 'a' && c <= 'f') return (uint8_t)(c - 'a' + 10);
+    return 0;
+}
+
+void haUartJoinStable(uint8_t pid, const char* identity, const char* nick, const char* avatar) {
+    (void)avatar;
+    rememberIdentity(identity);
+    uint8_t buf[1 + 16 + HA_NICK_LEN + 1];
     buf[0] = pid;
+    for(size_t i = 0; i < 16; i++)
+        buf[1 + i] = (uint8_t)((haHexNibble(identity[i * 2]) << 4) | haHexNibble(identity[i * 2 + 1]));
     size_t n = strlen(nick);
     if(n > HA_NICK_LEN) n = HA_NICK_LEN;
-    memcpy(buf + 1, nick, n);
-    uartSend(HA_MSG_JOIN, buf, 1 + n);
+    memcpy(buf + 17, nick, n);
+    uartSend(HA_MSG_JOIN, buf, 17 + n);
 }
 void haUartLeave(uint8_t pid) {
     uartSend(HA_MSG_LEAVE, &pid, 1);
@@ -92,11 +130,20 @@ void haUartScore(uint8_t pid, int delta, const char* reason) {
     memcpy(buf + 3, reason, n);
     uartSend(HA_MSG_SCORE, buf, 3 + n);
 }
-void haUartEvent(const String& json) {
-    uartSend(HA_MSG_EVENT, (const uint8_t*)json.c_str(), json.length());
-}
-void haUartRoundResult(const String& json) {
-    uartSend(HA_MSG_ROUND_RESULT, (const uint8_t*)json.c_str(), json.length());
+void haUartHostEvent(uint8_t kind, uint8_t game, uint8_t actor, uint8_t target,
+                     int16_t value, const char* text) {
+    uint8_t buf[7 + HA_HOST_EVENT_TEXT_MAX];
+    buf[0] = HA_HOST_EVENT_VERSION;
+    buf[1] = kind;
+    buf[2] = game;
+    buf[3] = actor;
+    buf[4] = target;
+    buf[5] = (uint8_t)(value & 0xFF);
+    buf[6] = (uint8_t)(((uint16_t)value >> 8) & 0xFF);
+    size_t n = text ? strlen(text) : 0;
+    if(n > HA_HOST_EVENT_TEXT_MAX) n = HA_HOST_EVENT_TEXT_MAX;
+    if(n) memcpy(buf + 7, text, n);
+    uartSend(HA_MSG_EVENT, buf, 7 + n);
 }
 
 // ---------------- HTTP (captive) ----------------
@@ -138,7 +185,7 @@ static void onWsEvent(
     (void)srv;
     if(type == WS_EVT_DISCONNECT) {
         ENGINE_LOCK();
-        engine.onWsDisconnect(client->id());
+        engine.onWsDisconnect(client->id(), millis());
         ENGINE_UNLOCK();
     } else if(type == WS_EVT_DATA) {
         AwsFrameInfo* info = (AwsFrameInfo*)arg;
@@ -148,7 +195,7 @@ static void onWsEvent(
             memcpy(buf, data, len);
             buf[len] = '\0';
             ENGINE_LOCK();
-            engine.onInput(client->id(), buf);
+            engine.onInput(client->id(), buf, millis());
             ENGINE_UNLOCK();
         }
     }
@@ -169,12 +216,19 @@ static void startPortal() {
     server.addHandler(new ArcadeHandler()).setFilter(ON_AP_FILTER);
     server.begin();
     portalRunning = true;
+    ENGINE_LOCK();
+    engine.transportResume(millis());
+    ENGINE_UNLOCK();
 
     String up = String("up ip=") + WiFi.softAPIP().toString();
     uartStatus(up.c_str());
 }
 
 static void stopPortal() {
+    ENGINE_LOCK();
+    if(portalRunning) engine.announceServerPause("ap_off", apName, 600000);
+    engine.transportPause(millis());
+    ENGINE_UNLOCK();
     if(portalRunning) {
         ws.closeAll();
         server.end();
@@ -182,9 +236,6 @@ static void stopPortal() {
         WiFi.softAPdisconnect(true);
         portalRunning = false;
     }
-    ENGINE_LOCK();
-    engine.reset();
-    ENGINE_UNLOCK();
     uartStatus("stopped");
 }
 
@@ -219,6 +270,22 @@ static void handleFileBegin(const uint8_t* p, size_t len) {
     uint32_t total = (uint32_t)p[i] | ((uint32_t)p[i + 1] << 8) | ((uint32_t)p[i + 2] << 16) |
                      ((uint32_t)p[i + 3] << 24);
     assets.begin(path, mime, flags & 1, total);
+}
+
+static bool parseJoinCodeExact(const char* json, char out[7]) {
+    const char* q = ha_json_find(json, "code");
+    if(!q) return false;
+    if(*q++ != '"') return false;
+    for(size_t i = 0; i < 6; i++) {
+        if(q[i] < '0' || q[i] > '9') return false;
+        out[i] = q[i];
+    }
+    if(q[6] != '"') return false;
+    const char* tail = q + 7;
+    while(*tail == ' ' || *tail == '\t' || *tail == '\r' || *tail == '\n') tail++;
+    if(*tail != ',' && *tail != '}' && *tail != '\0') return false;
+    out[6] = '\0';
+    return true;
 }
 
 static void dispatchFrame() {
@@ -284,20 +351,50 @@ static void dispatchFrame() {
         engine.contentItem((const char*)rxBuf);
         ENGINE_UNLOCK();
         break;
+    case HA_MSG_CONTENT_COMMIT:
+        {
+        if(rxLen != 4) {
+            ENGINE_LOCK();
+            engine.contentAbort();
+            ENGINE_UNLOCK();
+            uartStatus("content_error");
+            break;
+        }
+        uint16_t expectedPacks = (uint16_t)rxBuf[0] | ((uint16_t)rxBuf[1] << 8);
+        uint16_t expectedItems = (uint16_t)rxBuf[2] | ((uint16_t)rxBuf[3] << 8);
+        ENGINE_LOCK();
+        bool ok = engine.contentCommit(expectedPacks, expectedItems);
+        ENGINE_UNLOCK();
+        uartStatus(ok ? "content_ok" : "content_error");
+        }
+        break;
     case HA_MSG_ROUND_END:
         ENGINE_LOCK();
         engine.roundEnd();
         ENGINE_UNLOCK();
         break;
     case HA_MSG_CONFIG: {
+        const char* configJson = (const char*)rxBuf;
+        if(!ha_json_flat_object_valid(configJson)) {
+            uartStatus("config_error");
+            break;
+        }
+        const char* codeValue = ha_json_find(configJson, "code");
+        char code[7];
+        if(codeValue && !parseJoinCodeExact(configJson, code)) {
+            uartStatus("config_error");
+            break;
+        }
         int v;
-        if(ha_json_int((const char*)rxBuf, "max", &v) && v >= 1 && v <= 15) apMaxConn = (uint8_t)v;
+        if(ha_json_int(configJson, "max", &v) && v >= 1 && v <= HA_MAX_PLAYERS)
+            apMaxConn = (uint8_t)v;
         char lang[8];
-        if(ha_json_str((const char*)rxBuf, "lang", lang, sizeof(lang))) {
+        if(ha_json_str(configJson, "lang", lang, sizeof(lang))) {
             ENGINE_LOCK();
             engine.setLang(lang);
             ENGINE_UNLOCK();
         }
+        if(codeValue) strlcpy(joinCode, code, sizeof(joinCode));
         break;
     }
     case HA_MSG_RESET_SCORES:
@@ -385,14 +482,14 @@ void setup() {
     Serial.setRxBufferSize(4096);
     Serial.begin(HA_UART_BAUD);
     delay(100);
-    engine.reset();
+    engine.reset(millis());
     uartStatus("boot");
 }
 
 void loop() {
     if(portalRunning) {
         dnsServer.processNextRequest();
-        ws.cleanupClients();
+        ws.cleanupClients(apMaxConn);
         ENGINE_LOCK();
         engine.tick(millis());
         ENGINE_UNLOCK();

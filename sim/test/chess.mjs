@@ -11,7 +11,7 @@
 // read 0 when chessStart() stamps lastStamp, which is harmless for correctness but
 // would make every subsequent clock computation start from a zero baseline.
 import assert from "node:assert/strict";
-import { newEngine, lastToWs } from "./harness-lib.mjs";
+import { newEngine, lastToWs, challengeId } from "./harness-lib.mjs";
 
 const CHESS = 15; // HA_GAME_CHESS in ha_proto.h
 
@@ -40,9 +40,9 @@ function startGame() {
   e.selectGame(CHESS);
   e.join(1, "ALICE");
   e.join(2, "BOB");
-  e.input(1, { t: "challenge", to: 2 });
+  const challenged = e.input(1, { t: "challenge", to: 2 });
   e.tick(1000);
-  return e.input(2, { t: "accept", from: 1 });
+  return e.input(2, { t: "accept", id: challengeId(challenged, 2) });
 }
 
 function mv(pid, from, to, promo) {
@@ -62,8 +62,8 @@ function mv(pid, from, to, promo) {
   assert.equal(a.msg.moves.length, 20, "white has all 20 opening moves");
   assert.deepEqual(b.msg.moves, [], "it is not black's turn: no moves are sent to them");
   assert.equal(a.msg.board, STARTPOS, "board is the standard starting position");
-  assert.equal(a.msg.run, 300000, "the side to move's clock starts at 5:00");
-  assert.equal(a.msg.oms, 300000, "the opponent's clock also starts at 5:00");
+  assert.equal(a.msg.remaining_ms, 300000, "the side to move's clock starts at 5:00");
+  assert.equal(a.msg.other_remaining_ms, 300000, "the opponent's clock also starts at 5:00");
 }
 
 // ---- 2. Illegal moves are silently rejected (no `chess` push at all) --------------
@@ -110,9 +110,9 @@ function mv(pid, from, to, promo) {
   assert.equal(score.pid, 1);
   assert.equal(score.delta, 300);
   assert.equal(score.reason, "chesswin");
-  const round = out.find((o) => o.to === "uart" && o.kind === "round");
-  assert.equal(round.json.win, 1);
-  assert.equal(round.json.lose, 2);
+  const round = out.find((o) => o.to === "uart" && o.kind === "host_event" && o.event.type === 4);
+  assert.equal(round.event.actor, 1);
+  assert.equal(round.event.target, 2);
 }
 
 // ---- 4. Castling --------------------------------------------------------------------
@@ -234,8 +234,9 @@ function mv(pid, from, to, promo) {
   assert.equal(a.msg.result, "draw");
   assert.equal(a.msg.reason, "stalemate");
   assert.equal(b.msg.result, "draw");
-  const round = out.find((o) => o.to === "uart" && o.kind === "round");
-  assert.deepEqual(round.json.draw, [1, 2]);
+  const round = out.find((o) => o.to === "uart" && o.kind === "host_event" && o.event.type === 5);
+  assert.equal(round.event.actor, 1);
+  assert.equal(round.event.target, 2);
   assert.ok(!out.some((o) => o.to === "uart" && o.kind === "score"), "no score on a draw");
 }
 
@@ -406,11 +407,17 @@ function mv(pid, from, to, promo) {
   assert.equal(score.reason, "chesswin");
 }
 
-// ---- 16. Disconnect forfeit ----------------------------------------------------------------
+// ---- 16. Disconnect reserves the seat, then expires into a forfeit ---------------------------
 {
   startGame();
-  const out = e.disconnect(1);
-  const b = lastToWs(out, 2, "chess");
+  let out = e.disconnect(1);
+  let b = lastToWs(out, 2, "chess");
+  assert.equal(b.msg.phase, "playing", "a transient disconnect does not forfeit immediately");
+  out = e.tick(120999);
+  b = lastToWs(out, 2, "chess");
+  assert.equal(b, undefined, "the seat remains reserved for just under 120 seconds");
+  out = e.tick(121000);
+  b = lastToWs(out, 2, "chess");
   assert.equal(b.msg.phase, "over");
   assert.equal(b.msg.reason, "left");
   assert.equal(b.msg.result, "win");
@@ -427,8 +434,8 @@ function mv(pid, from, to, promo) {
   assert.equal(b.msg.white, true, "colors swap: the previous black (BOB) is now white");
   assert.equal(b.msg.moves.length, 20);
   assert.equal(b.msg.board, STARTPOS);
-  assert.equal(b.msg.run, 300000);
-  assert.equal(b.msg.oms, 300000);
+  assert.equal(b.msg.remaining_ms, 300000);
+  assert.equal(b.msg.other_remaining_ms, 300000);
 }
 
 // ---- 18. Reaction scoping -----------------------------------------------------------------

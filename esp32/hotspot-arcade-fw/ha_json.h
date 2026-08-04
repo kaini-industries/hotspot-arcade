@@ -3,6 +3,7 @@
 // enough. Not a general JSON parser; good for `{"t":"answer","c":2}`-shaped data.
 #pragma once
 #include <Arduino.h>
+#include <limits.h>
 
 // Find `"key"` then the following `:` and return a pointer just past the colon
 // (skipping spaces), or nullptr. Only scans the top level well enough for our
@@ -23,27 +24,162 @@ static inline const char* ha_json_find(const char* s, const char* key) {
     return nullptr;
 }
 
-// Read a string value for `key` into out (NUL-terminated, basic \" \\ unescape).
+static inline size_t ha_json_utf8_width(const unsigned char* p) {
+    unsigned char c = p[0];
+    if(c < 0x80) return c >= 0x20 ? 1 : 0;
+    if(c >= 0xC2 && c <= 0xDF) {
+        if(!p[1]) return 0;
+        return (p[1] & 0xC0) == 0x80 ? 2 : 0;
+    }
+    if(c >= 0xE0 && c <= 0xEF) {
+        if(!p[1] || !p[2]) return 0;
+        unsigned char c1 = p[1], c2 = p[2];
+        if((c2 & 0xC0) != 0x80) return 0;
+        if(c == 0xE0) return (c1 >= 0xA0 && c1 <= 0xBF) ? 3 : 0;
+        if(c == 0xED) return (c1 >= 0x80 && c1 <= 0x9F) ? 3 : 0;
+        return (c1 & 0xC0) == 0x80 ? 3 : 0;
+    }
+    if(c >= 0xF0 && c <= 0xF4) {
+        if(!p[1] || !p[2] || !p[3]) return 0;
+        unsigned char c1 = p[1], c2 = p[2], c3 = p[3];
+        if((c2 & 0xC0) != 0x80 || (c3 & 0xC0) != 0x80) return 0;
+        if(c == 0xF0) return (c1 >= 0x90 && c1 <= 0xBF) ? 4 : 0;
+        if(c == 0xF4) return (c1 >= 0x80 && c1 <= 0x8F) ? 4 : 0;
+        return (c1 & 0xC0) == 0x80 ? 4 : 0;
+    }
+    return 0;
+}
+
+static inline void ha_json_ws(const char*& p) {
+    while(*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+}
+
+static inline bool ha_json_skip_string(const char*& p) {
+    if(*p++ != '"') return false;
+    while(*p && *p != '"') {
+        if(*p == '\\') {
+            p++;
+            if(*p == '"' || *p == '\\' || *p == '/' || *p == 'b' || *p == 'f' ||
+               *p == 'n' || *p == 'r' || *p == 't') {
+                p++;
+                continue;
+            }
+            return false; // \u is intentionally unsupported by the tiny field decoder
+        }
+        size_t width = ha_json_utf8_width((const unsigned char*)p);
+        if(width == 0) return false;
+        p += width;
+    }
+    if(*p != '"') return false;
+    p++;
+    return true;
+}
+
+static inline bool ha_json_skip_number(const char*& p) {
+    if(*p == '-') p++;
+    if(*p == '0') {
+        p++;
+        if(*p >= '0' && *p <= '9') return false;
+    } else {
+        if(*p < '1' || *p > '9') return false;
+        while(*p >= '0' && *p <= '9') p++;
+    }
+    if(*p == '.') {
+        p++;
+        if(*p < '0' || *p > '9') return false;
+        while(*p >= '0' && *p <= '9') p++;
+    }
+    if(*p == 'e' || *p == 'E') {
+        p++;
+        if(*p == '+' || *p == '-') p++;
+        if(*p < '0' || *p > '9') return false;
+        while(*p >= '0' && *p <= '9') p++;
+    }
+    return true;
+}
+
+// Every inbound protocol/content object is intentionally flat. Validate the
+// complete object before field lookup so missing braces, trailing garbage,
+// malformed strings/numbers, nested key smuggling, and partial prefixes cannot
+// be interpreted as an otherwise legitimate intent.
+static inline bool ha_json_flat_object_valid(const char* json) {
+    if(!json) return false;
+    const char* p = json;
+    ha_json_ws(p);
+    if(*p++ != '{') return false;
+    ha_json_ws(p);
+    if(*p == '}') {
+        p++;
+        ha_json_ws(p);
+        return *p == '\0';
+    }
+    for(;;) {
+        if(!ha_json_skip_string(p)) return false;
+        ha_json_ws(p);
+        if(*p++ != ':') return false;
+        ha_json_ws(p);
+        if(*p == '"') {
+            if(!ha_json_skip_string(p)) return false;
+        } else if(*p == '-' || (*p >= '0' && *p <= '9')) {
+            if(!ha_json_skip_number(p)) return false;
+        } else if(strncmp(p, "true", 4) == 0) {
+            p += 4;
+        } else if(strncmp(p, "false", 5) == 0) {
+            p += 5;
+        } else if(strncmp(p, "null", 4) == 0) {
+            p += 4;
+        } else {
+            return false;
+        }
+        ha_json_ws(p);
+        if(*p == ',') {
+            p++;
+            ha_json_ws(p);
+            continue;
+        }
+        if(*p++ != '}') return false;
+        ha_json_ws(p);
+        return *p == '\0';
+    }
+}
+
+// Read a complete string value for `key`. Truncation, unterminated input,
+// invalid escapes/control bytes, malformed UTF-8, and trailing junk all fail;
+// callers never receive a plausible prefix of attacker-controlled input.
 static inline bool ha_json_str(const char* s, const char* key, char* out, size_t n) {
+    if(!out || n == 0) return false;
     out[0] = '\0';
     const char* q = ha_json_find(s, key);
     if(!q || *q != '"') return false;
     q++;
     size_t i = 0;
-    while(*q && *q != '"' && i < n - 1) {
-        if(*q == '\\' && q[1]) {
+    while(*q && *q != '"') {
+        if(*q == '\\') {
+            if(!q[1]) return false;
             q++;
             char c = *q;
-            if(c == 'n')
-                c = '\n';
-            else if(c == 't')
-                c = '\t';
+            if(c == 'n') c = '\n';
+            else if(c == 't') c = '\t';
+            else if(c == 'r') c = '\r';
+            else if(c == 'b') c = '\b';
+            else if(c == 'f') c = '\f';
+            else if(c == '"' || c == '\\' || c == '/') {}
+            else return false;
+            if(i + 1 >= n) { out[0] = '\0'; return false; }
             out[i++] = c;
+            q++;
         } else {
-            out[i++] = *q;
+            size_t width = ha_json_utf8_width((const unsigned char*)q);
+            if(width == 0 || i + width >= n) { out[0] = '\0'; return false; }
+            memcpy(out + i, q, width);
+            i += width;
+            q += width;
         }
-        q++;
     }
+    if(*q != '"') { out[0] = '\0'; return false; }
+    q++;
+    while(*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+    if(*q != ',' && *q != '}' && *q != '\0') { out[0] = '\0'; return false; }
     out[i] = '\0';
     return true;
 }
@@ -58,9 +194,19 @@ static inline bool ha_json_int(const char* s, const char* key, int* out) {
         q++;
     }
     if(*q < '0' || *q > '9') return false;
-    long v = 0;
-    while(*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0');
-    *out = (int)(neg ? -v : v);
+    uint32_t v = 0;
+    const uint32_t limit = neg ? (uint32_t)INT_MAX + 1U : (uint32_t)INT_MAX;
+    while(*q >= '0' && *q <= '9') {
+        uint32_t digit = (uint32_t)(*q++ - '0');
+        if(v > (limit - digit) / 10U) return false;
+        v = v * 10U + digit;
+    }
+    while(*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+    if(*q != ',' && *q != '}') return false;
+    if(neg)
+        *out = v == (uint32_t)INT_MAX + 1U ? INT_MIN : -(int)v;
+    else
+        *out = (int)v;
     return true;
 }
 

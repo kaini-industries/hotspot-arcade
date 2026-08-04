@@ -56,7 +56,7 @@
       status.textContent = t("scr.answer");
       solvedFor = -1;
     } else {
-      noteDeadline(m.deadline, m.dur); A.timebar("scr-bar", m.deadline, m.dur, false);
+      A.timebar("scr-bar", m.remaining_ms, m.duration_ms, false);
       letters.className = "scr-letters";
       letters.textContent = upTiles(m.scram).split("").join(" ");
       var solved = !!m.solved;

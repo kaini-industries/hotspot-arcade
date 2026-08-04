@@ -130,21 +130,23 @@ static void ha_dashboard(HotspotArcadeApp* app) {
     widget_add_string_element(app->widget, 13, 0, AlignLeft, AlignTop, FontPrimary, state);
     widget_add_line_element(app->widget, 0, 14, 127, 14);
 
-    // How players join: the network name, then the address if the captive page
-    // does not pop on its own.
+    // How players join: network, admission code, then the captive-page fallback.
     furi_string_printf(tmp, "Join: %s", furi_string_get_cstr(app->ssid));
     widget_add_string_element(
-        app->widget, 0, 18, AlignLeft, AlignTop, FontSecondary, furi_string_get_cstr(tmp));
+        app->widget, 0, 16, AlignLeft, AlignTop, FontSecondary, furi_string_get_cstr(tmp));
+    furi_string_printf(tmp, "Code: %s", app->join_code);
     widget_add_string_element(
-        app->widget, 0, 29, AlignLeft, AlignTop, FontSecondary, "then 192.168.4.1");
+        app->widget, 0, 25, AlignLeft, AlignTop, FontSecondary, furi_string_get_cstr(tmp));
+    widget_add_string_element(
+        app->widget, 0, 34, AlignLeft, AlignTop, FontSecondary, "Open: 192.168.4.1");
 
     // Player count (left) and the selected game (right) share one line so nothing
     // collides with the button row.
     furi_string_printf(tmp, "Players: %d", ha_player_count(app));
     widget_add_string_element(
-        app->widget, 0, 40, AlignLeft, AlignTop, FontSecondary, furi_string_get_cstr(tmp));
+        app->widget, 0, 43, AlignLeft, AlignTop, FontSecondary, furi_string_get_cstr(tmp));
     widget_add_string_element(
-        app->widget, 127, 40, AlignRight, AlignTop, FontSecondary, game_name(app->active_game));
+        app->widget, 127, 43, AlignRight, AlignTop, FontSecondary, game_name(app->active_game));
 
     // Left picks the game; Right shows scores. Games are player-driven, so there is no
     // host-side game screen — the main menu's Console shows the live event feed.

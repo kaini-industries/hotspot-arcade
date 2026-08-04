@@ -4,7 +4,7 @@
 // leave, rematch, and -- most importantly -- that a player's view never exposes an
 // un-hit enemy ship cell (hidden information). Drives the real engine headless.
 import assert from "node:assert/strict";
-import { newEngine, lastToWs } from "./harness-lib.mjs";
+import { newEngine, lastToWs, challengeId } from "./harness-lib.mjs";
 
 const BS = 12;
 // All five ships laid out horizontally, one per row (fixed ship order 5,4,3,3,2).
@@ -19,13 +19,24 @@ e.join(2, "BOB");
 e.selectGame(BS);
 
 // challenge -> accept -> placement
-e.input(1, { t: "challenge", to: 2 });
-let out = e.input(2, { t: "accept", from: 1 });
+const challenged = e.input(1, { t: "challenge", to: 2 });
+let out = e.input(2, { t: "accept", id: challengeId(challenged, 2) });
 assert.equal(lastToWs(out, 1, "bs").msg.phase, "place", "match starts in placement");
 
 // invalid layout (ships 0 and 1 overlap at row 0) is rejected: no state push
 let bad = e.input(1, { t: "place", ships: "0,0,0;0,0,0;2,0,0;3,0,0;4,0,0" });
 assert.equal(lastToWs(bad, 1, "bs"), undefined, "invalid placement is rejected, no change");
+
+for (const ships of [
+  "0,0,2;0,1,2;0,2,2;0,3,2;0,4,2",
+  LAYOUT + ";garbage",
+  "0,0,0;1,0,0;2,0,0;3,0,0;4,0,0garbage",
+  "999999999999999999999999999999999,0,0;1,0,0;2,0,0;3,0,0;4,0,0",
+  "0 0,0;1,0,0;2,0,0;3,0,0;4,0,0",
+]) {
+  bad = e.input(1, { t: "place", ships });
+  assert.equal(lastToWs(bad, 1, "bs"), undefined, `malformed fleet is rejected: ${ships}`);
+}
 
 // valid placements
 let a = lastToWs(e.input(1, { t: "place", ships: LAYOUT }), 1, "bs");

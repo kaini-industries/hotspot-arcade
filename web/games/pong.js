@@ -12,6 +12,17 @@
   var lastServerDir = 0;         // which way the server ball was last travelling
   var prevPhase = "";
   var prevS1 = 0, prevS2 = 0;
+  var statePaused = false;
+
+  function inputPaused() { return statePaused || !!A.serverPause; }
+  function syncPauseUi() {
+    var paused = inputPaused();
+    A.setGamePaused("pong", paused);
+    $("pong-up").disabled = paused;
+    $("pong-dn").disabled = paused;
+    $("pong-canvas").setAttribute("aria-disabled", paused ? "true" : "false");
+    if (paused) dir = 0;
+  }
 
   function ready() { canvas = $("pong-canvas"); cx = canvas.getContext("2d"); }
 
@@ -69,6 +80,7 @@
   }
 
   function setDir(d) {
+    if (inputPaused()) { dir = 0; return; }
     if (d === dir) return;
     dir = d;
     send({ t: "paddle", dir: d });
@@ -87,7 +99,13 @@
     // Score change blip.
     if (prevPhase === "playing" && (m.s1 !== prevS1 || m.s2 !== prevS2)) { A.sfx("score"); A.vibe(20); }
     prevS1 = m.s1; prevS2 = m.s2;
-    if (!raf) { render.bx = m.ball.x; render.by = m.ball.y; loop(); }
+    if (inputPaused()) {
+      stopLoop();
+      render.bx = m.ball.x; render.by = m.ball.y;
+      paint();
+    } else if (!raf) {
+      render.bx = m.ball.x; render.by = m.ball.y; loop();
+    }
   }
 
   function renderOver(m) {
@@ -112,11 +130,22 @@
   A.handlers.pong = function (m) {
     route("pong");
     if (A.view !== "pong") return;
+    statePaused = m.phase === "playing" && !!m.paused;
+    syncPauseUi();
+    A.pauseNotice(statePaused);
     if (m.phase === "playing") renderPlaying(m);
     else if (m.phase === "over") renderOver(m);
     else renderLobby(m);
     prevPhase = m.phase;
   };
+
+  A.pauseHooks.push(function (hostPaused) {
+    if (A.view !== "pong") return;
+    syncPauseUi();
+    if (inputPaused()) stopLoop();
+    else if (!hostPaused && st && prevPhase === "playing" && !raf) loop();
+    if (!hostPaused) A.pauseNotice(statePaused);
+  });
 
   function bindHold(el, d) {
     var press = function (e) { e.preventDefault(); setDir(d); };

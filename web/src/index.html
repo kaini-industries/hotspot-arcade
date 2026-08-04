@@ -35,7 +35,7 @@
 </div>
 
 <!-- Reconnect banner -->
-<div id="netbar" class="netbar hide" data-i18n="net.reconnecting">Reconnecting...</div>
+<div id="netbar" class="netbar hide" role="status" aria-live="polite" data-i18n="net.reconnecting">Reconnecting...</div>
 
 <!-- Shared collapsible live leaderboard, pinned under the header. Any group-score
      game (trivia / scramble / reaction) mounts it via A.showLead(board). -->
@@ -56,6 +56,11 @@
     <h1 class="wordmark-big"><span>HOTSPOT</span><span class="accent">ARCADE</span></h1>
     <p class="tag" data-i18n="landing.tagline">Offline · Multiplayer · No signal</p>
   </div>
+  <label class="field">
+    <span class="sub" data-i18n="landing.code">Join code shown by the host</span>
+    <input id="join-code" maxlength="6" inputmode="numeric" autocomplete="one-time-code"
+           pattern="[0-9]{6}" placeholder="123456" data-i18n-ph="landing.code_ph">
+  </label>
   <label class="field">
     <span class="sub" data-i18n="landing.nick">Your nickname</span>
     <input id="nick" maxlength="12" autocomplete="off" autocapitalize="characters"

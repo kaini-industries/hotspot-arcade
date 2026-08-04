@@ -150,7 +150,7 @@ correct tile border/letter → `--good`; if your wrong pick → `--bad`; show th
 per option as a small dim number. Disable all after you answer.
 
 **Countdown bar** — thin (6px) full-width track `--surface-2` with an `--orange`
-fill that shrinks to 0 over the question `dur` (drive width by `deadline - now`).
+fill that shrinks to 0 over `duration_ms` from the received `remaining_ms` fraction.
 Turns `--bad` in the last ~3s. No fill after reveal.
 
 **Connect Four board** — 7×6 grid on `--surface`, cell borders `--line`, cells are

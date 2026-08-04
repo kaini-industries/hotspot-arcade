@@ -25,6 +25,15 @@ assert.match(play.msg.color, /^#[0-9A-F]{6}$/, "play carries the target as a hex
 const hex = play.msg.color;
 const [tr, tg, tb] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
 
+for (const bad of [
+  { r: -1, g: 0, b: 0 },
+  { r: 256, g: 0, b: 0 },
+  { r: 0, g: -1, b: 0 },
+  { r: 0, g: 0, b: 256 },
+]) {
+  assert.deepEqual(e.input(1, { t: "guess", ...bad }), [], "out-of-range RGB is rejected atomically");
+}
+
 // Alice nails it exactly (distance 0); Bob guesses the opposite corner (far).
 e.tick(5000);
 const far = (v) => (v < 128 ? 255 : 0);

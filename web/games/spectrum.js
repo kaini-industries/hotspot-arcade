@@ -7,6 +7,21 @@
    guesses, so a good clue pays off. */
 (function () {
   var myready = false;
+  var statePaused = false;
+  var lastMsg = null;
+
+  function inputPaused() { return statePaused || !!A.serverPause; }
+  function syncPauseUi() {
+    var paused = inputPaused();
+    A.setGamePaused("spectrum", paused);
+    $("sp-ready").disabled = paused;
+    $("sp-cluein").disabled = paused;
+    $("sp-cluego").disabled = paused;
+    $("sp-guessgo").disabled = paused || !spCanGuess;
+    $("sp-again").disabled = paused;
+    $("sp-dial").setAttribute("aria-disabled", paused ? "true" : "false");
+    if (paused) dragging = false;
+  }
 
   function sub(name) {
     ["lobby", "count", "play", "final"].forEach(function (id) {
@@ -75,13 +90,13 @@
     return Math.round((180 - deg) / 1.8);
   }
   function dragMove(e) {
-    if (!dragging || !spCanGuess) return;
+    if (!dragging || !spCanGuess || inputPaused()) return;
     spGuess = valFromEvent(e);
     setNeedle(spGuess, false);
     $("sp-note").textContent = t("sp.guess_hint", { n: spGuess });
     if (e.cancelable) e.preventDefault();
   }
-  function dragStart(e) { if (!spCanGuess) return; dragging = true; dragMove(e); }
+  function dragStart(e) { if (!spCanGuess || inputPaused()) return; dragging = true; dragMove(e); }
   function dragEnd() { dragging = false; }
 
   function renderLobby(m) {
@@ -91,7 +106,7 @@
     A.packVote({
       boxId: "sp-topics",
       packs: m.packs, myvote: m.myvote,
-      onVote: function (i) { send({ t: "vote", pack: i }); },
+      onVote: function (i) { if (!inputPaused()) send({ t: "vote", pack: i }); },
     });
   }
 
@@ -110,8 +125,7 @@
     $("sp-left").textContent = m.left || "";
     $("sp-right").textContent = m.right || "";
 
-    noteDeadline(m.deadline, m.dur);
-    A.timebar("sp-bar", m.deadline, m.dur, false);
+    A.timebar("sp-bar", m.remaining_ms, m.duration_ms, false, inputPaused());
 
     var needle = $("sp-ndl"), dmarks = $("sp-dmarks");
     var clueForm = $("sp-clueform"), clue = $("sp-clue");
@@ -134,7 +148,8 @@
         note.textContent = t("sp.give_clue");
         if (lastRound !== m.round) { $("sp-cluein").value = ""; setTimeout(function () { $("sp-cluein").focus(); }, 60); }
       } else {
-        note.textContent = t("sp.thinking", { nick: m.psychic });
+        note.textContent = inputPaused() ? t(A.serverPause ? "net.host_paused" : "net.opp_reconnect") :
+          t("sp.thinking", { nick: m.psychic });
       }
     } else if (stage === "guess") {
       clueForm.classList.add("hide");
@@ -191,15 +206,29 @@
   A.handlers.spectrum = function (m) {
     route("spectrum");
     if (A.view !== "spectrum") return;
+    lastMsg = m;
+    statePaused = m.phase === "play" && m.stage === "clue" && (!!m.paused ||
+      (!m.iam && A.playerOffline(m.scores, m.psychic)));
+    A.pauseNotice(statePaused);
     switch (m.phase) {
       case "lobby": renderLobby(m); break;
       case "countdown": renderCount(m); break;
       case "play": renderPlay(m); break;
       case "final": renderFinal(m); break;
     }
+    syncPauseUi();
   };
 
+  A.pauseHooks.push(function (hostPaused) {
+    if (A.view !== "spectrum") return;
+    syncPauseUi();
+    if (!hostPaused && !statePaused && lastMsg && lastMsg.phase === "play")
+      A.timebar("sp-bar", lastMsg.remaining_ms, lastMsg.duration_ms, false, false);
+    if (!hostPaused) A.pauseNotice(statePaused);
+  });
+
   $("sp-ready").addEventListener("click", function () {
+    if (inputPaused()) return;
     A.sfx("buzz"); A.vibe(15);
     send({ t: "ready", ready: !myready });
   });
@@ -210,6 +239,7 @@
   window.addEventListener("pointerup", dragEnd);
   window.addEventListener("pointercancel", dragEnd);
   $("sp-cluego").addEventListener("click", function () {
+    if (inputPaused()) return;
     var v = $("sp-cluein").value.trim();
     if (!v) return;
     A.sfx("start"); A.vibe(20);
@@ -219,12 +249,14 @@
     if (e.key === "Enter") $("sp-cluego").click();
   });
   $("sp-guessgo").addEventListener("click", function () {
+    if (inputPaused() || !spCanGuess) return;
     A.sfx("buzz"); A.vibe(18);
     send({ t: "slide", n: spGuess });
     spCanGuess = false;
     this.classList.add("hide");
   });
   $("sp-again").addEventListener("click", function () {
+    if (inputPaused()) return;
     A.sfx("start"); A.vibe(20);
     send({ t: "again" });
   });

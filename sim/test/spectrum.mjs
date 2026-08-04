@@ -15,6 +15,7 @@ e.contentClear();
 e.contentPack(SP, "Test");
 e.contentItem(JSON.stringify({ left: "Cold", right: "Hot" }));
 e.contentItem(JSON.stringify({ left: "Cheap", right: "Expensive" }));
+e.contentCommit();
 
 // lobby -> all ready -> countdown -> play(clue)
 e.input(1, { t: "ready", ready: true });
@@ -47,6 +48,9 @@ for (const g of guessers) {
   assert.equal(m.msg.clue, "lukewarm", "clue is broadcast to guessers");
 }
 
+assert.deepEqual(e.input(guessers[0], { t: "slide", n: -1 }), [], "negative slider input is rejected");
+assert.deepEqual(e.input(guessers[0], { t: "slide", n: 101 }), [], "oversized slider input is rejected");
+
 // One guesser nails the target, the other is far. Reveal fires when all have guessed.
 e.input(guessers[0], { t: "slide", n: target });
 out = e.input(guessers[1], { t: "slide", n: (target + 60) % 100 });
@@ -56,5 +60,25 @@ assert.equal(rev.msg.target, target, "reveal exposes the target to everyone");
 assert.ok(Array.isArray(rev.msg.guesses) && rev.msg.guesses.length === 2, "reveal lists both guesses");
 const near = rev.msg.guesses.find((x) => x.g === target);
 assert.ok(near && near.pts >= 4, "an exact guess earns the bullseye (got " + (near && near.pts) + ")");
+
+// Run the remaining timed rounds, replay, and ensure the new match does not
+// inherit the score just earned above.
+let now = 4000;
+for (let round = 2; round <= 6; round++) {
+  now += 6000; e.tick(now);   // next clue round
+  now += 45000; e.tick(now);  // no clue -> guess stage
+  now += 30000; e.tick(now);  // no guesses -> reveal
+}
+now += 6000;
+out = e.tick(now);
+assert.equal(lastToWs(out, 1, "spectrum").msg.phase, "final");
+e.input(1, { t: "again" });
+e.input(1, { t: "ready", ready: true });
+e.input(2, { t: "ready", ready: true });
+e.input(3, { t: "ready", ready: true });
+now += 3000;
+out = e.tick(now);
+assert.ok(lastToWs(out, 1, "spectrum").msg.scores.every((p) => p.score === 0),
+  "Spectrum replay resets every score");
 
 console.log("spectrum: all checks passed");

@@ -3,16 +3,47 @@ import createEngine from "../web/engine.js";
 
 export async function newEngine() {
   const M = await createEngine();
-  const drain = () => JSON.parse(M.ccall("ha_drain", "string", [], []));
+  const drain = () => {
+    const items = JSON.parse(M.ccall("ha_drain", "string", [], []));
+    const forbidden = new Set(["deadline", "dur", "run", "oms", "now", "resume"]);
+    const inspect = (value, path) => {
+      if(!value || typeof value !== "object") return;
+      for(const [key, child] of Object.entries(value)) {
+        if(forbidden.has(key)) throw new Error(`raw credential/clock field ${path}.${key}`);
+        inspect(child, `${path}.${key}`);
+      }
+    };
+    for(const [index, item] of items.entries()) if(item.msg) inspect(item.msg, `outbox[${index}].msg`);
+    return items;
+  };
   const api = {
     drain,
     reset: () => { M.ccall("ha_reset", null, [], []); return drain(); },
+    resetAt: (ms) => { M.ccall("ha_reset_at", null, ["number"], [ms]); return drain(); },
+    resetKeepKnown: (ms = 0) => {
+      M.ccall("ha_reset_keep_known", null, ["number"], [ms]);
+      return drain();
+    },
     tick: (ms) => { M.ccall("ha_tick", null, ["number"], [ms]); return drain(); },
     input: (wsId, obj) => {
       M.ccall("ha_input", null, ["number", "string"], [wsId, JSON.stringify(obj)]);
       return drain();
     },
+    inputRaw: (wsId, json) => {
+      M.ccall("ha_input", null, ["number", "string"], [wsId, json]);
+      return drain();
+    },
+    inputAt: (wsId, obj, ms) => {
+      M.ccall("ha_input_at", null, ["number", "string", "number"], [wsId, JSON.stringify(obj), ms]);
+      return drain();
+    },
     disconnect: (wsId) => { M.ccall("ha_disconnect", null, ["number"], [wsId]); return drain(); },
+    pause: () => { M.ccall("ha_pause", null, [], []); return drain(); },
+    resume: () => { M.ccall("ha_resume", null, [], []); return drain(); },
+    timeReached: (now, deadline) =>
+      M.ccall("ha_time_reached", "number", ["number", "number"], [now, deadline]) !== 0,
+    timeRemaining: (now, deadline) =>
+      M.ccall("ha_time_remaining", "number", ["number", "number"], [now, deadline]) >>> 0,
     selectGame: (id) => { M.ccall("ha_select_game", null, ["number"], [id]); return drain(); },
     roundEnd: () => { M.ccall("ha_round_end", null, [], []); return drain(); },
     resetScores: () => { M.ccall("ha_reset_scores", null, [], []); return drain(); },
@@ -21,11 +52,17 @@ export async function newEngine() {
     triviaAddTopic: (name) => { M.ccall("ha_trivia_add_topic", null, ["string"], [name]); return drain(); },
     triviaAddQ: (json) => { M.ccall("ha_trivia_add_q", null, ["string"], [json]); return drain(); },
     contentClear: () => { M.ccall("ha_content_clear", null, [], []); return drain(); },
+    contentLoseStage: () => { M.ccall("ha_content_lose_stage", null, [], []); return drain(); },
     contentPack: (game, name) => {
       M.ccall("ha_content_pack", null, ["number", "string"], [game, name]);
       return drain();
     },
     contentItem: (json) => { M.ccall("ha_content_item", null, ["string"], [json]); return drain(); },
+    contentCommit: () => { M.ccall("ha_content_commit", null, [], []); return drain(); },
+    contentCommitExpected: (packs, items) => ({
+      ok: M.ccall("ha_content_commit_expected", "number", ["number", "number"], [packs, items]) !== 0,
+      out: drain(),
+    }),
     // HA_CHESS_TEST-only hooks: load an arbitrary position into match slot 0 (must
     // already be a live game from challenge/accept), and perft a scratch position
     // against the real move generator.
@@ -44,7 +81,13 @@ export async function newEngine() {
         [board64, stm, rights, ep, depth],
       ),
   };
-  api.join = (wsId, nick) => api.input(wsId, { t: "hello", nick, avatar: "🙂" });
+  api.join = (wsId, nick, resume = undefined, code = undefined) => {
+    const token = resume || wsId.toString(16).padStart(32, "0").slice(-32);
+    return api.input(wsId, {
+      t: "hello", proto: 2, nick, avatar: "🙂", resume: token,
+      ...((code === null) ? {} : { code: code === undefined ? "123456" : code }),
+    });
+  };
   return api;
 }
 
@@ -65,4 +108,15 @@ export function lastToWs(items, wsId, type) {
   return items
     .filter((o) => o.to === "ws" && o.id === wsId && o.msg && o.msg.t === type)
     .pop();
+}
+
+/** Challenge id allocated in a lobby push, optionally narrowed to its recipient. */
+export function challengeId(items, to = undefined) {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const cs = items[i]?.msg?.challenges;
+    if (!Array.isArray(cs)) continue;
+    const c = [...cs].reverse().find((x) => to === undefined || x.to === to);
+    if (c) return c.id;
+  }
+  return undefined;
 }

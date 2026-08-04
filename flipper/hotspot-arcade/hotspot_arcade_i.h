@@ -21,6 +21,8 @@
 #include "scenes/ha_scene.h"
 
 #define HA_SSID_MAX             (33) // 32 + NUL
+#define HA_JOIN_CODE_LEN        (6)
+#define HA_JOIN_CODE_SIZE       (HA_JOIN_CODE_LEN + 1)
 #define HA_MAX_PLAYERS          (12)
 #define HA_NICK_LEN             (20)
 #define HA_MAX_ASSETS           (8)
@@ -77,8 +79,10 @@ typedef struct {
 
 // A connected player, mirrored from the ESP (JOIN/LEAVE/SCORE).
 typedef struct {
-    bool used;
+    bool used; // permanent identity in the current host session
+    bool online;
     uint8_t pid;
+    char identity[HA_IDENTITY_BYTES * 2 + 1];
     char nick[HA_NICK_LEN];
     int32_t score;
 } HaPlayer;
@@ -108,12 +112,16 @@ typedef struct HotspotArcadeApp {
 
     HaUart* uart;
 
-    // Config (persisted)
+    // Settings (persisted)
     FuriString* ssid;
     char ssid_buf[HA_SSID_MAX];
     bool sound_on;
     bool vibro_on;
     char lang[8]; // content language code, "" = English (streams packs/<game>/<lang>/)
+
+    // App-lifetime admission code. It is intentionally not persisted and stays
+    // stable across a portal pause/reconnect so existing players can resume.
+    char join_code[HA_JOIN_CODE_SIZE];
 
     // Web bundle (from manifest.json)
     HaAsset assets[HA_MAX_ASSETS];
@@ -124,6 +132,7 @@ typedef struct HotspotArcadeApp {
 
     // Live roster
     HaPlayer players[HA_MAX_PLAYERS];
+    bool content_refresh_pending;
 
     // Active game (HA_GAME_*)
     uint8_t active_game;

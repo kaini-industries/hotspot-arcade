@@ -1,7 +1,8 @@
 #pragma once
 #include <furi.h>
 
-// Minimal flat-JSON readers for the small EVENT/ROUND_RESULT/manifest payloads.
+// Minimal flat-JSON readers for bundle manifests and legacy v17 payloads. Protocol-v18
+// host events use a bounded typed binary envelope and do not pass through this parser.
 // Not a general parser; good for our controlled, shallow objects.
 
 static inline const char* ha_json_find(const char* s, const char* key) {

@@ -45,7 +45,8 @@ screen. Everything is phone-driven: the Flipper just selects the game and keeps 
 
 1. Attach your ESP32 board (flash its firmware via **Install Firmware**, picking your board, the first time).
 2. **Start Session** — the dashboard shows **Broadcasting**.
-3. Friends join the WiFi and open **192.168.4.1** in their browser, pick a nickname, and play.
+3. Friends join the WiFi, open **192.168.4.1**, and enter the six-digit code shown on
+   the Flipper dashboard before picking a nickname and playing.
 4. **Games** selects the active game; **Scores** shows the live leaderboard.
 
 ## Responsible use

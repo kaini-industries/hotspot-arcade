@@ -2,6 +2,23 @@
 #include "helpers/ha_storage.h"
 #include "helpers/ha_session.h"
 
+#include <furi_hal_random.h>
+
+#define HA_JOIN_CODE_SPACE (1000000UL)
+
+static void ha_generate_join_code(char out[HA_JOIN_CODE_SIZE]) {
+    // Rejection sampling avoids the modulo bias caused by 2^32 not being a
+    // multiple of one million. Leading zeroes are kept, so every result is six
+    // digits and the full million-code space is available.
+    const uint32_t accept_below = UINT32_MAX - (UINT32_MAX % HA_JOIN_CODE_SPACE);
+    uint32_t random;
+    do {
+        random = furi_hal_random_get();
+    } while(random >= accept_below);
+    snprintf(
+        out, HA_JOIN_CODE_SIZE, "%06lu", (unsigned long)(random % HA_JOIN_CODE_SPACE));
+}
+
 static bool ha_custom_event_callback(void* context, uint32_t event) {
     HotspotArcadeApp* app = context;
     if(event == HaEventRxData) {
@@ -113,6 +130,7 @@ static HotspotArcadeApp* ha_app_alloc(void) {
     app->sound_on = true;
     app->vibro_on = true;
     app->active_game = HA_GAME_NONE;
+    ha_generate_join_code(app->join_code);
     ha_storage_ensure_dirs();
     ha_storage_load_config(app);
 

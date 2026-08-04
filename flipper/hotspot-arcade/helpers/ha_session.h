@@ -18,6 +18,8 @@ void ha_session_stop(HotspotArcadeApp* app);
 // Host controls.
 void ha_select_game(HotspotArcadeApp* app, uint8_t game);
 void ha_reset_scores(HotspotArcadeApp* app);
+// Transactionally replace content and phone locale while a session is live.
+void ha_session_apply_language(HotspotArcadeApp* app);
 
 // Roster helper for the leaderboard.
 int ha_player_count(HotspotArcadeApp* app);

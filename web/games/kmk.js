@@ -7,6 +7,18 @@
   var myready = false;
   var LBL = ["kmk.kiss", "kmk.marry", "kmk.kill"]; // index = label key
   var EMO = ["💋", "💍", "💀"]; // kiss/marry/kill
+  var statePaused = false;
+  var lastMsg = null;
+
+  function inputPaused() { return statePaused || !!A.serverPause; }
+  function syncPauseUi() {
+    var paused = inputPaused();
+    A.setGamePaused("kmk", paused);
+    $("kmk-ready").disabled = paused;
+    $("kmk-go").disabled = paused || !valid(mine);
+    $("kmk-again").disabled = paused;
+    $("kmk-people").setAttribute("aria-disabled", paused ? "true" : "false");
+  }
 
   function sub(name) {
     ["lobby", "count", "play", "final"].forEach(function (id) {
@@ -31,7 +43,7 @@
     A.packVote({
       boxId: "kmk-topics",
       packs: m.packs, myvote: m.myvote,
-      onVote: function (i) { send({ t: "vote", pack: i }); },
+      onVote: function (i) { if (!inputPaused()) send({ t: "vote", pack: i }); },
     });
   }
 
@@ -68,7 +80,7 @@
       if (interactive) {
         row.classList.add("tap");
         row.addEventListener("click", function () {
-          if (!canEdit) return;
+          if (!canEdit || inputPaused()) return;
           mine[i] = nextLabel(mine[i]);
           A.sfx("buzz"); A.vibe(10);
           renderPeople(people, mine, true);
@@ -85,8 +97,7 @@
     var stage = m.stage; // choose | guess | reveal
     $("kmk-meta").textContent = t("common.round", { n: m.round, total: m.rounds });
     $("kmk-role").textContent = m.iam ? t("kmk.you_choose") : t("kmk.chooser_is", { nick: m.chooser });
-    noteDeadline(m.deadline, m.dur);
-    A.timebar("kmk-bar", m.deadline, m.dur, false);
+    A.timebar("kmk-bar", m.remaining_ms, m.duration_ms, false, inputPaused());
 
     var go = $("kmk-go"), note = $("kmk-note");
 
@@ -126,7 +137,8 @@
         canEdit = false;
         renderPeople(m.people, null, false);
         go.classList.add("hide");
-        note.textContent = t("kmk.deciding", { nick: m.chooser });
+        note.textContent = inputPaused() ? t(A.serverPause ? "net.host_paused" : "net.opp_reconnect") :
+          t("kmk.deciding", { nick: m.chooser });
       }
     } else { // guess
       if (m.iam) {
@@ -159,26 +171,41 @@
   A.handlers.kmk = function (m) {
     route("kmk");
     if (A.view !== "kmk") return;
+    lastMsg = m;
+    statePaused = m.phase === "play" && m.stage === "choose" && (!!m.paused ||
+      (!m.iam && A.playerOffline(m.scores, m.chooser)));
+    A.pauseNotice(statePaused);
     switch (m.phase) {
       case "lobby": renderLobby(m); break;
       case "countdown": renderCount(m); break;
       case "play": renderPlay(m); break;
       case "final": renderFinal(m); break;
     }
+    syncPauseUi();
   };
 
+  A.pauseHooks.push(function (hostPaused) {
+    if (A.view !== "kmk") return;
+    syncPauseUi();
+    if (!hostPaused && !statePaused && lastMsg && lastMsg.phase === "play")
+      A.timebar("kmk-bar", lastMsg.remaining_ms, lastMsg.duration_ms, false, false);
+    if (!hostPaused) A.pauseNotice(statePaused);
+  });
+
   $("kmk-ready").addEventListener("click", function () {
+    if (inputPaused()) return;
     A.sfx("buzz"); A.vibe(15);
     send({ t: "ready", ready: !myready });
   });
   $("kmk-go").addEventListener("click", function () {
-    if (!valid(mine)) return;
+    if (inputPaused() || !valid(mine)) return;
     A.sfx("start"); A.vibe(20);
     send({ t: "assign", kiss: mine.indexOf(0), marry: mine.indexOf(1), kill: mine.indexOf(2) });
     canEdit = false;
     $("kmk-go").classList.add("hide");
   });
   $("kmk-again").addEventListener("click", function () {
+    if (inputPaused()) return;
     A.sfx("start"); A.vibe(20);
     send({ t: "again" });
   });

@@ -6,10 +6,11 @@ var A = {
   pid: null,
   nick: "",
   avatar: "🙂",   // emoji avatar, picked on the landing screen
+  resume: "",          // browser-only 128-bit token, persisted per phone
+  code: "",            // six-digit party admission code; deliberately not persisted
   view: "landing",     // landing | lobby | trivia | duel | draw | pong
   joined: false,       // true once the user committed a nick (Play) or is rejoining
-  offset: 0,           // serverMillis - localNow, learned from first timed msg
-  offsetSet: false,
+  authenticated: false, // true only after welcome on the current WebSocket
   retry: 0,
   handlers: {},        // messageType -> fn(msg), filled by game modules
 };
@@ -135,21 +136,6 @@ function syncWakeLock() {
    never yank someone off the landing screen before they pick a nickname. */
 function route(name) { if (A.joined) screen(name); }
 
-/* Cosmetic clock aligned to the server. deadline - serverNow() = ms remaining. */
-function serverNow() { return Date.now() + A.offset; }
-// The ESP sends deadlines in ms but window durations in seconds; normalise a
-// duration to ms so a bare seconds value (e.g. 20) and a ms value (20000) both work.
-A.durMs = function (dur) { return dur ? (dur < 1000 ? dur * 1000 : dur) : 0; };
-function noteDeadline(deadline, dur) {
-  // Estimate the offset once from the first timed message so the countdown
-  // matches the server. dur is the full window length (seconds or ms).
-  dur = A.durMs(dur);
-  if (!A.offsetSet && deadline && dur) {
-    A.offset = (deadline - dur) - Date.now();
-    A.offsetSet = true;
-  }
-}
-
 var toastTimer;
 function toast(msg) {
   var el = $("toast");
@@ -235,10 +221,12 @@ A.readyLobby = function (cfg) {
   (cfg.players || []).forEach(function (p) {
     var li = document.createElement("li");
     if (p.pid === A.pid) { li.className = "self"; mine = !!p.ready; }
+    if (p.online === false) li.className += (li.className ? " " : "") + "offline";
     li.innerHTML =
       '<span class="av">' + esc(p.avatar || "🙂") + "</span>" +
       '<span class="pn">' + esc(p.nick) + "</span>" +
-      '<span class="rdy' + (p.ready ? " on" : "") + '">' + (p.ready ? "Ready" : "...") + "</span>";
+      '<span class="rdy' + (p.ready ? " on" : "") + '">' +
+      (p.online === false ? "Offline" : (p.ready ? "Ready" : "...")) + "</span>";
     ul.appendChild(li);
   });
   var rb = $(cfg.readyId);
@@ -301,13 +289,13 @@ A.podium = function (listId, board) {
 
 // Shared countdown timer bar (used by trivia + scramble). Per-bar state lives on
 // the element. `ticks` plays blips at 3/2/1s. Call A.timebarStop to freeze it.
-A.timebar = function (barId, deadline, dur, ticks) {
-  dur = A.durMs(dur);
+A.timebar = function (barId, remainingMs, durationMs, ticks, paused) {
+  var dur = Math.max(0, Number(durationMs) || 0);
   var bar = $(barId), fill = bar.firstElementChild;
   A.timebarStop(barId);
   show(barId);
-  var st = bar._ha || (bar._ha = { anim: null, ticks: [] });
-  var remain = deadline - serverNow();
+  var st = bar._ha || (bar._ha = { anim: null, ticks: [], frame: 0 });
+  var remain = Math.max(0, Number(remainingMs) || 0);
   bar.classList.remove("hot");
   if (remain <= 0 || !dur) {
     fill.style.transition = "none"; fill.style.transform = "scaleX(0)"; bar.classList.add("hot"); return;
@@ -315,7 +303,16 @@ A.timebar = function (barId, deadline, dur, ticks) {
   var frac = Math.max(0, Math.min(1, remain / dur));
   fill.style.transition = "none";
   fill.style.transform = "scaleX(" + frac + ")";
+  // A disconnected critical-role player freezes the authoritative game clock.
+  // Hold the bar at the server-provided fraction too, rather than visually count
+  // down while the engine is deliberately waiting for that player to reconnect.
+  if (paused) {
+    if (remain <= 3000) bar.classList.add("hot");
+    return;
+  }
+  var frame = ++st.frame;
   requestAnimationFrame(function () {
+    if (st.frame !== frame) return;
     fill.style.transition = "transform " + remain + "ms linear";
     fill.style.transform = "scaleX(0)";
   });
@@ -327,11 +324,77 @@ A.timebar = function (barId, deadline, dur, ticks) {
 };
 A.timebarStop = function (barId) {
   var bar = $(barId), st = bar._ha;
-  if (st) { if (st.anim) { clearTimeout(st.anim); st.anim = null; } st.ticks.forEach(clearTimeout); st.ticks = []; }
+  if (st) {
+    st.frame = (st.frame || 0) + 1;
+    if (st.anim) { clearTimeout(st.anim); st.anim = null; }
+    st.ticks.forEach(clearTimeout); st.ticks = [];
+  }
+};
+
+A.serverPause = null;
+A.pauseHooks = [];
+A.playerOffline = function (players, nick) {
+  if (!nick) return false;
+  var matched = false;
+  for (var i = 0; i < (players || []).length; i++) {
+    var p = players[i];
+    if (p.nick !== nick) continue;
+    matched = true;
+    // Duplicate display names are allowed. Treat the named role as offline only
+    // when every matching seat is offline; a false pause is worse than waiting
+    // for the next authoritative snapshot.
+    if (p.online !== false) return false;
+  }
+  return matched;
+};
+A.setGamePaused = function (screenId, paused) {
+  var root = $(screenId);
+  if (!root) return;
+  root.classList.toggle("input-paused", !!paused);
+  root.setAttribute("aria-busy", paused ? "true" : "false");
+};
+A.pauseNotice = function (paused) {
+  if (paused) {
+    $("netbar").textContent = t("net.opp_reconnect");
+    show("netbar");
+  } else if (!A.serverPause && A.ws && A.ws.readyState === 1) {
+    hide("netbar");
+  }
+};
+A.freezeTimebars = function () {
+  var bars = document.querySelectorAll(".timebar");
+  for (var i = 0; i < bars.length; i++) {
+    if (bars[i].id) A.timebarStop(bars[i].id);
+    var fill = bars[i].firstElementChild;
+    if (fill) {
+      var held = getComputedStyle(fill).transform;
+      fill.style.transition = "none";
+      fill.style.transform = held;
+    }
+  }
 };
 
 function send(obj) {
+  // During a planned host transport pause the engine accepts only identity
+  // recovery and keepalives. Mirror that contract in the browser so controls
+  // cannot queue misleading intents while the host is unavailable.
+  if (A.serverPause && obj && obj.t !== "hello" && obj.t !== "ping") return;
   if (A.ws && A.ws.readyState === 1) A.ws.send(JSON.stringify(obj));
+}
+function sendHello() {
+  send({
+    t: "hello", proto: 2, nick: A.nick, avatar: A.avatar, resume: A.resume,
+    code: A.code || undefined,
+  });
+}
+
+function createResumeToken() {
+  if(!window.crypto || !window.crypto.getRandomValues) return "";
+  var bytes = new Uint8Array(16);
+  window.crypto.getRandomValues(bytes);
+  var token = "";
+  for(var i = 0; i < bytes.length; i++) token += bytes[i].toString(16).padStart(2, "0");
+  return token;
 }
 
 /* Header status dot: "" connected (orange), "warn" reconnecting, "bad" down. */
@@ -381,14 +444,20 @@ function connect() {
     catch (e) { scheduleReconnect(); return; }
   }
   A.ws = ws;
+  A.authenticated = false;
 
   ws.onopen = function () {
     A.retry = 0;
-    hide("netbar");
+    if (A.serverPause) {
+      $("netbar").textContent = t("net.host_paused");
+      show("netbar");
+    } else {
+      hide("netbar");
+    }
     setDot("");           // connected
     // Auto (re)join only if we already have a nickname. A first-time visitor
     // stays on the landing screen until they press Play.
-    if (A.joined) send({ t: "hello", nick: A.nick, avatar: A.avatar });
+    if (A.joined) sendHello();
   };
 
   ws.onmessage = function (ev) {
@@ -397,14 +466,14 @@ function connect() {
     dispatch(m);
   };
 
-  ws.onclose = function () { scheduleReconnect(); };
+  ws.onclose = function () { A.authenticated = false; scheduleReconnect(); };
   ws.onerror = function () { try { ws.close(); } catch (e) {} };
 }
 
 function scheduleReconnect() {
   setDot(A.retry > 4 ? "bad" : "warn");   // down after repeated failures
   if (A.view !== "landing") {
-    $("netbar").textContent = t("net.reconnecting");
+    $("netbar").textContent = A.serverPause ? t("net.host_paused") : t("net.reconnecting");
     show("netbar");
   }
   var wait = Math.min(1000 * Math.pow(1.6, A.retry), 8000);
@@ -436,9 +505,63 @@ function maybeCaptive() {
 function dispatch(m) {
   switch (m.t) {
     case "welcome":
+      var hadServerPause = !!A.serverPause;
+      if (m.paused) {
+        A.serverPause = A.serverPause || { t: "server_pause" };
+        if (!hadServerPause) {
+          for (var pi = 0; pi < A.pauseHooks.length; pi++) A.pauseHooks[pi](true, m);
+        }
+        $("netbar").textContent = t("net.host_paused");
+        show("netbar");
+      } else {
+        A.serverPause = null;
+        hide("netbar");
+        for (var ri = 0; ri < A.pauseHooks.length; ri++) A.pauseHooks[ri](false, m);
+      }
       A.pid = m.pid;
+      A.authenticated = true;
+      A.code = "";
+      if($("join-code")) $("join-code").value = "";
       if (A.setLang) A.setLang(m.lang); // host-chosen UI language; localizes static text
       if (m.nick) { A.nick = m.nick; setNick(); }
+      break;
+    case "config":
+      if (A.setLang) A.setLang(m.lang);
+      break;
+    case "server_pause":
+      A.serverPause = m;
+      A.freezeTimebars();
+      for (var hi = 0; hi < A.pauseHooks.length; hi++) A.pauseHooks[hi](true, m);
+      $("netbar").textContent = t("net.host_paused");
+      show("netbar");
+      break;
+    case "server_resume":
+      var retryHello = A.joined && !A.authenticated;
+      A.serverPause = null;
+      hide("netbar");
+      for (var rhi = 0; rhi < A.pauseHooks.length; rhi++) A.pauseHooks[rhi](false, m);
+      if (retryHello) sendHello();
+      break;
+    case "reject":
+      A.authenticated = false;
+      var why = m.code === "full" ? "Game is full — your seat was not changed." :
+                m.code === "bad_protocol" ? "This game page is out of date. Reload it." :
+                m.code === "auth_required" ? "Enter the six-digit code shown by the host." :
+                m.code === "bad_code" ? "That join code is not correct." :
+                m.code === "throttled" ? "Too many attempts. Wait a moment and try again." :
+                "Unable to join this game.";
+      $("netbar").textContent = why;
+      show("netbar"); setDot("bad"); toast(why);
+      if(m.code === "auth_required" || m.code === "bad_code" || m.code === "throttled") {
+        A.joined = false;
+        screen("landing");
+        if($("join-code")) $("join-code").focus();
+      }
+      break;
+    case "error":
+      toast(m.code === "match_capacity" ? "All match tables are busy. Try again soon." :
+            m.code === "challenge_capacity" ? "Too many open challenges. Try again soon." :
+            "That action could not be completed.");
       break;
     case "lobby":
       onLobby(m);
@@ -481,7 +604,7 @@ function lobbyView(incEl, listEl, challenges) {
     row.className = "challenge";
     if (c.to === A.pid) {
       row.innerHTML = '<span class="pn">' + esc(nickOf(c.from)) + " challenged you</span>";
-      btn(row, "Accept", "btn sm", function () { A.sfx("buzz"); send({ t: "accept", from: c.from }); });
+      btn(row, "Accept", "btn sm", function () { A.sfx("buzz"); send({ t: "accept", id: c.id }); });
       btn(row, "Decline", "btn ghost sm", function () { send({ t: "cancel" }); });
     } else if (c.from === A.pid) {
       row.innerHTML = '<span class="pn">Waiting on ' + esc(nickOf(c.to)) + "...</span>";
@@ -493,7 +616,9 @@ function lobbyView(incEl, listEl, challenges) {
   var iChallenged = challenges.some(function (c) { return c.from === A.pid; });
   // Exclude yourself and anyone currently in a 1v1 match (playing or still on their
   // over screen) — they can't be challenged until they come back to the lobby.
-  var others = (A.players || []).filter(function (p) { return p.pid !== A.pid && !p.busy; });
+  var others = (A.players || []).filter(function (p) {
+    return p.pid !== A.pid && p.online !== false && !p.busy;
+  });
   listEl.innerHTML = "";
   if (!others.length) {
     var empty = document.createElement("li");
@@ -530,10 +655,11 @@ function onLobby(m) {
   A.players.forEach(function (p) {
     var li = document.createElement("li");
     if (p.pid === A.pid) li.className = "self";
+    if (p.online === false) li.className += (li.className ? " " : "") + "offline";
     li.innerHTML =
       '<span class="av">' + esc(p.avatar || "🙂") + "</span>" +
       '<span class="pn">' + esc(p.nick) + "</span>" +
-      '<span class="ps">' + (p.score || 0) + "</span>";
+      '<span class="ps">' + (p.online === false ? "Offline" : (p.score || 0)) + "</span>";
     list.appendChild(li);
   });
 
@@ -563,13 +689,24 @@ function startPlay() {
     $("nick").value = n;
     buildAvatarPicker();
   }
+  var code = $("join-code").value.replace(/\D/g, "");
+  if(!/^\d{6}$/.test(code)) {
+    toast("Enter the six-digit code shown by the host.");
+    $("join-code").focus();
+    return;
+  }
+  if(!/^[0-9a-f]{32}$/.test(A.resume)) {
+    toast("This browser cannot create a secure player identity.");
+    return;
+  }
   A.nick = n;
+  A.code = code;
   A.joined = true;
   setNick();
   A.initAudio();          // first gesture: unlock audio for the session
   A.sfx("start"); A.vibe(30);
   try { localStorage.setItem(storeKey("ha_nick"), n); localStorage.setItem(storeKey("ha_avatar"), A.avatar); } catch (e) {}
-  send({ t: "hello", nick: n, avatar: A.avatar });
+  sendHello();
   screen("lobby");
 }
 
@@ -639,7 +776,7 @@ function saveIdEdit() {
   setNick();
   A.sfx("start"); A.vibe(20);
   try { localStorage.setItem(storeKey("ha_nick"), n); localStorage.setItem(storeKey("ha_avatar"), A.avatar); } catch (e) {}
-  send({ t: "hello", nick: n, avatar: A.avatar });
+  sendHello();
   closeIdEdit();
 }
 
@@ -694,7 +831,14 @@ function initApp() {
   try {
     saved = (localStorage.getItem(storeKey("ha_nick")) || "").toUpperCase();
     A.avatar = localStorage.getItem(storeKey("ha_avatar")) || A.avatar;
+    A.resume = localStorage.getItem(storeKey("ha_resume")) || "";
   } catch (e) {}
+  if(!/^[0-9a-f]{32}$/.test(A.resume)) {
+    A.resume = createResumeToken();
+    if(A.resume) {
+      try { localStorage.setItem(storeKey("ha_resume"), A.resume); } catch (e) {}
+    }
+  }
   A.nick = saved;
   A.joined = !!saved;   // returning player: rejoin automatically on connect
   $("nick").value = saved;
@@ -769,4 +913,7 @@ function initApp() {
   setInterval(function () { send({ t: "ping" }); }, 20000);
 }
 
+if (typeof globalThis !== "undefined" && globalThis.__HA_TEST__) {
+  globalThis.__HA_TEST_API__ = { dispatch: dispatch, sendHello: sendHello };
+}
 document.addEventListener("DOMContentLoaded", initApp);

@@ -9,6 +9,17 @@
 #define HA_UART_BAUD   (921600)
 #define HA_SYNC        (0xA5)
 #define HA_MAX_PAYLOAD (4096)
+#define HA_IDENTITY_BYTES (16) // first 128 bits of SHA-256(browser resume token)
+#define HA_HOST_EVENT_VERSION (1)
+#define HA_HOST_EVENT_TEXT_MAX (96)
+
+#define HA_HOST_EVT_MATCH_STARTED  (1)
+#define HA_HOST_EVT_CHAT           (2)
+#define HA_HOST_EVT_ROLE           (3)
+#define HA_HOST_EVT_ROUND_WIN      (4)
+#define HA_HOST_EVT_ROUND_DRAW     (5)
+#define HA_HOST_EVT_ROUND_COMPLETE (6)
+#define HA_HOST_EVT_GAME_FINAL     (7)
 
 // Firmware identity in the PING beacon (must match the ESP's ha_proto.h). MAGIC
 // tells our board from another project's; VERSION lets us flag an outdated board.
@@ -16,7 +27,7 @@
 #define HA_FW_MAGIC_1 0x41
 #define HA_FW_MAGIC_2 0x52
 #define HA_FW_MAGIC_3 0x43
-#define HA_FW_VERSION 17 // v17: Chess game added
+#define HA_FW_VERSION 18 // v18: browser protocol v2 resume + transport-safe clocks
 
 // Flipper -> ESP
 #define HA_MSG_CLEAR_FILES   0x10
@@ -34,13 +45,14 @@
 #define HA_MSG_CONTENT_CLEAR 0x1C // drop all packs, for every game
 #define HA_MSG_CONTENT_PACK  0x1D // payload = game byte + pack name; begins a pack
 #define HA_MSG_CONTENT_ITEM  0x1E // payload = JSON object of the file's own keys
+#define HA_MSG_CONTENT_COMMIT 0x1F // atomically publish staged packs and return to lobby
 
 // ESP -> Flipper
 #define HA_MSG_STATUS       0x80
 #define HA_MSG_JOIN         0x81
 #define HA_MSG_LEAVE        0x82
 #define HA_MSG_SCORE        0x83
-#define HA_MSG_ROUND_RESULT 0x84
+#define HA_MSG_ROUND_RESULT 0x84 // reserved legacy JSON result (v17 and older)
 #define HA_MSG_EVENT        0x85
 #define HA_MSG_PING         0x86
 

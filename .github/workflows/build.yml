@@ -1,5 +1,8 @@
 name: build
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [master]
@@ -9,10 +12,12 @@ on:
 jobs:
   flipper-app:
     name: Build Flipper app (fap)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
       - name: Install ufbt
@@ -22,19 +27,21 @@ jobs:
       - name: Build fap
         working-directory: flipper/hotspot-arcade
         run: ufbt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hotspot-arcade-fap
           path: flipper/hotspot-arcade/dist/hotspot_arcade.fap
 
   web-bundle:
     name: Build web bundle
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          node-version: "20"
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24.19.0"
       - name: Install web deps
         working-directory: web
         # Zero runtime deps (Node stdlib only); install only if a lockfile exists.
@@ -46,8 +53,10 @@ jobs:
           fi
       - name: Build web bundle
         working-directory: web
-        run: node build.mjs
-      - uses: actions/upload-artifact@v4
+        run: |
+          npm test
+          node build.mjs
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hotspot-arcade-web
           path: |
@@ -56,23 +65,27 @@ jobs:
 
   esp32-firmware:
     name: Build ESP32 firmware
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - name: Install arduino-cli
         run: |
-          mkdir -p "$HOME/bin"
-          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR="$HOME/bin" sh
-          echo "$HOME/bin" >> "$GITHUB_PATH"
+          archive="$RUNNER_TEMP/arduino-cli.tar.gz"
+          bindir="$RUNNER_TEMP/arduino-cli-bin"
+          curl --proto '=https' --tlsv1.2 -fsSLo "$archive" \
+            https://github.com/arduino/arduino-cli/releases/download/v1.5.1/arduino-cli_1.5.1_Linux_64bit.tar.gz
+          echo "28a8e119c498a25607821c36cb2dc49e8463941b261a0d99091baa7bc692dd2b  $archive" | sha256sum -c -
+          mkdir -p "$bindir"
+          tar -xzf "$archive" -C "$bindir" arduino-cli
+          echo "$bindir" >> "$GITHUB_PATH"
       - name: Install esp32 cores
-        # Two cores on purpose: the S2/WROOM images stay pinned to 2.0.17, and the C5
-        # only exists in the 3.x line, so it builds against that instead of moving the
-        # working boards onto a core with different WiFi/USB behaviour.
+        # All firmware variants share one reviewed core and package-index checksum set.
         run: |
           arduino-cli config init --overwrite
           arduino-cli config set board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
           arduino-cli core update-index
-          arduino-cli core install esp32:esp32@2.0.17
           arduino-cli core install esp32:esp32@3.3.11
       - name: Compile firmware (all boards)
         # Same sketch, one build per supported board. AsyncTCP + ESPAsyncWebServer are
@@ -108,7 +121,7 @@ jobs:
             mv "$dir/hotspot-arcade-fw.ino.partitions.bin" "$dir/ha-part-$tag.bin"
             mv "$dir/hotspot-arcade-fw.ino.bin"            "$dir/ha-fw-$tag.bin"
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hotspot-arcade-firmware
           path: esp32/hotspot-arcade-fw/build/*/*.bin
@@ -121,12 +134,14 @@ jobs:
     # v0.2.0 released a fap with no firmware in it, and a later commit left v6 images in
     # a fap that required v7. This job is that missing alarm.
     name: Bundled assets are current
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          node-version: "20"
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24.19.0"
 
       - name: Web bundle matches assets/web
         # Compare the DECOMPRESSED bundle: zlib emits different bytes across platforms
@@ -153,7 +168,9 @@ jobs:
               exit 1
             fi
           done
-          if [ "$(ls -1 packs/*/*.txt | wc -l)" != "$(ls -1 flipper/hotspot-arcade/assets/packs/*/*.txt | wc -l)" ]; then
+          source_count="$(find packs -mindepth 2 -maxdepth 2 -type f -name '*.txt' | wc -l)"
+          bundled_count="$(find flipper/hotspot-arcade/assets/packs -mindepth 2 -maxdepth 2 -type f -name '*.txt' | wc -l)"
+          if [ "$source_count" != "$bundled_count" ]; then
             echo "::error::assets/packs has packs that packs/ doesn't. Run tools/build-fap.sh and commit the result."
             exit 1
           fi
@@ -170,37 +187,23 @@ jobs:
           fi
 
   simulator:
-    # Compile-only guard for the local simulator (sim/), which builds the REAL game
-    # engine to WebAssembly. sim/engine/Arduino.h implements exactly the Arduino
-    # surface ha_games.h uses TODAY; the first time the firmware gains a String
-    # method or an ESP-IDF call, the simulator stops building. Without this job that
-    # failure is silent until someone next tries to run it, possibly months later.
-    # Compiling is the guard — the headless tests deliberately aren't run here.
-    name: Simulator engine compiles
-    runs-on: ubuntu-latest
+    name: Simulator headless suite (Emscripten 6.0.2)
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-
-      # 'latest' rather than a pin on purpose: the question this job answers is
-      # "does the engine still build with a current toolchain", and the emcc flags
-      # used (MODULARIZE / EXPORT_ES6 / EXPORTED_FUNCTIONS) have been stable for
-      # years. If a future emscripten release breaks the build, that is a real
-      # finding, not noise to be pinned away.
-      - uses: mymindstorm/setup-emsdk@v14
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          version: latest
+          persist-credentials: false
+      - uses: mymindstorm/setup-emsdk@6ab9eb1bda2574c4ddb79809fc9247783eaf9021 # v14
+        with:
+          version: 6.0.2
           actions-cache-folder: emsdk-cache
 
-      - name: Build the WASM engine
-        run: sim/engine/build.sh
-
-      - name: Confirm the build produced a loadable module
-        # A zero-byte or missing artifact would otherwise pass as "compiled".
+      - name: Build and test the real engine
         run: |
-          for f in sim/web/engine.js sim/web/engine.wasm; do
-            if [ ! -s "$f" ]; then
-              echo "::error::$f missing or empty after sim/engine/build.sh"
-              exit 1
-            fi
-          done
-          ls -l sim/web/engine.js sim/web/engine.wasm
+          sim/engine/build.sh
+          sim/test/all.sh
+
+      - name: Run ASan and UBSan suite
+        run: |
+          sim/engine/build.sh --asan
+          sim/test/all.sh

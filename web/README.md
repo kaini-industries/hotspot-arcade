@@ -76,8 +76,8 @@ One flat JSON object per message, specified per game in `docs/PROTOCOL.md`
 (client intents like `hello`/`challenge`/`move`, server state like `welcome`/
 `lobby`/per-game payloads). The ESP is authoritative; the client sends intents
 and renders server state. The trivia countdown is cosmetic: the client learns the server
-clock offset from the first timed message (`deadline` is a server `millis()`
-value) and animates a bar toward the deadline. The server is the real referee.
+relative `remaining_ms`/`duration_ms` snapshot from each timed message and animates
+the bar locally. Raw server clocks never cross the wire; the server is the referee.
 
 ## Captive-portal handoff (limitation)
 

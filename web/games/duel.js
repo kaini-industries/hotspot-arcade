@@ -7,13 +7,22 @@
   var prevPhase = "";
   var prevTurnMine = false;
   var rematchTimer = null; // pending "did the rematch actually restart?" check
+  var statePaused = false;
+
+  function inputPaused() { return statePaused || !!A.serverPause; }
+  function syncPauseUi() {
+    var paused = inputPaused();
+    A.setGamePaused("duel", paused);
+    $("duel-board").setAttribute("aria-disabled", paused ? "true" : "false");
+    $("duel-rematch").disabled = paused;
+  }
 
   /* ---- Connect 4 / Tic-Tac-Toe: a simple cell grid ---- */
   function renderGrid(m) {
     var cols = m.cols || (m.kind === "ttt" ? 3 : 7);
     var rows = m.rows || (m.kind === "ttt" ? 3 : 6);
     var n = cols * rows;
-    var myTurn = m.turn === m.you;
+    var myTurn = !inputPaused() && m.turn === m.you;
     var board = $("duel-board");
     board.className = "board" + (m.kind === "ttt" ? " ttt" : "") + (myTurn ? " mine" : "");
     board.style.gridTemplateColumns = "repeat(" + cols + ",1fr)";
@@ -70,7 +79,7 @@
     var w = m.w, h = m.h;
     var hedges = m.hedges || [], vedges = m.vedges || [], boxes = m.boxes || [];
     var hoff = (h + 1) * w;               // vertical-edge index offset in move.n
-    var myTurn = m.turn === m.you;
+    var myTurn = !inputPaused() && m.turn === m.you;
     var board = $("duel-board");
     board.className = "dotsgrid" + (myTurn ? " mine" : "");
     // dot rows/cols are fixed and thin; edge + box tracks flex so the whole board
@@ -112,7 +121,7 @@
   /* ---- Reversi / Othello: 8x8, discs, server sends legal moves in `valid` ---- */
   function renderReversi(m) {
     var cols = 8, rows = 8, n = 64;
-    var myTurn = m.turn === m.you;
+    var myTurn = !inputPaused() && m.turn === m.you;
     var valid = m.valid || [];
     var vset = {};
     valid.forEach(function (i) { vset[i] = 1; });
@@ -161,14 +170,18 @@
     el.addEventListener("click", function () { move(n); });
   }
 
-  function move(n) { A.sfx("drop"); A.vibe(15); send({ t: "move", n: n }); }
+  function move(n) {
+    if (inputPaused()) return;
+    A.sfx("drop"); A.vibe(15); send({ t: "move", n: n });
+  }
 
   /* ---- Phases ---- */
   function renderPlaying(m) {
     hide("duel-lobby"); hide("duel-over"); show("duel-match"); show("duel-leave");
-    var myTurn = m.turn === m.you;
+    var myTurn = !inputPaused() && m.turn === m.you;
     var turn = $("duel-turn");
-    turn.textContent = myTurn ? t("common.your_turn") : t("common.opp_turn", { nick: esc(m.opp) || t("common.opponent") });
+    turn.textContent = inputPaused() ? t(A.serverPause ? "net.host_paused" : "net.opp_reconnect") :
+      (myTurn ? t("common.your_turn") : t("common.opp_turn", { nick: esc(m.opp) || t("common.opponent") }));
     turn.className = "turn" + (myTurn ? " you" : "");
 
     if (m.kind === "dots") renderDots(m);
@@ -206,6 +219,9 @@
   A.handlers.duel = function (m) {
     route("duel");
     if (A.view !== "duel") return;   // still on landing; render when joined
+    statePaused = m.phase === "playing" && !!m.paused;
+    syncPauseUi();
+    A.pauseNotice(statePaused);
     // Any state that isn't the game-over screen means a pending rematch resolved
     // (restarted → "playing", or we bailed → "lobby"): stop watching for it.
     if (rematchTimer && m.phase !== "over") { clearTimeout(rematchTimer); rematchTimer = null; }
@@ -217,10 +233,17 @@
     prevPhase = m.phase;
   };
 
+  A.pauseHooks.push(function (hostPaused) {
+    if (A.view !== "duel") return;
+    syncPauseUi();
+    if (!hostPaused) A.pauseNotice(statePaused);
+  });
+
   document.addEventListener("DOMContentLoaded", function () {
     $("duel-leave").addEventListener("click", function () { send({ t: "leaveGame" }); });
     $("duel-back").addEventListener("click", function () { send({ t: "leaveGame" }); });
     $("duel-rematch").addEventListener("click", function () {
+      if (inputPaused()) return;
       A.sfx("buzz"); send({ t: "rematch" });
       // The server restarts instantly when the opponent is still here; if it stays
       // silent, they left, so don't strand us on the game-over screen — drop back to

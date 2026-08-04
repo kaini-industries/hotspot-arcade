@@ -19,6 +19,7 @@ e.contentClear();
 e.contentPack(KMK, "Test");
 for (const n of ["Cleopatra", "Darth Vader", "Taylor Swift", "Sherlock Holmes"])
   e.contentItem(JSON.stringify({ name: n }));
+e.contentCommit();
 
 // lobby -> all ready -> countdown -> play(choose)
 e.input(1, { t: "ready", ready: true });
@@ -63,5 +64,24 @@ const exact = rev.msg.guesses.find((x) => x.pts === 3);
 const partial = rev.msg.guesses.find((x) => x.pts === 1);
 assert.ok(exact, "the exact guess scores the full 3");
 assert.ok(partial, "the one-position guess scores 1");
+
+// Finish by deadlines, replay, and prove scores start clean.
+let now = 4000;
+for (let round = 2; round <= 6; round++) {
+  now += 7000; e.tick(now);   // next chooser round
+  now += 40000; e.tick(now);  // auto chooser assignment
+  now += 30000; e.tick(now);  // no guesses -> reveal
+}
+now += 7000;
+out = e.tick(now);
+assert.equal(lastToWs(out, 1, "kmk").msg.phase, "final");
+e.input(1, { t: "again" });
+e.input(1, { t: "ready", ready: true });
+e.input(2, { t: "ready", ready: true });
+e.input(3, { t: "ready", ready: true });
+now += 3000;
+out = e.tick(now);
+assert.ok(lastToWs(out, 1, "kmk").msg.scores.every((p) => p.score === 0),
+  "KMK replay resets every score");
 
 console.log("kmk: all checks passed");

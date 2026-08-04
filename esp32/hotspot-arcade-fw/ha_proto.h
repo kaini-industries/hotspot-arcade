@@ -7,6 +7,19 @@
 #define HA_UART_BAUD 921600
 #define HA_SYNC 0xA5
 #define HA_MAX_PAYLOAD 4096
+#define HA_IDENTITY_BYTES 16 // first 128 bits of SHA-256(browser resume token)
+#define HA_HOST_EVENT_VERSION 1
+#define HA_HOST_EVENT_TEXT_MAX 96
+
+enum {
+    HA_HOST_EVT_MATCH_STARTED = 1,
+    HA_HOST_EVT_CHAT = 2,
+    HA_HOST_EVT_ROLE = 3,
+    HA_HOST_EVT_ROUND_WIN = 4,
+    HA_HOST_EVT_ROUND_DRAW = 5,
+    HA_HOST_EVT_ROUND_COMPLETE = 6,
+    HA_HOST_EVT_GAME_FINAL = 7,
+};
 
 // Firmware identity carried in every PING beacon: a 4-byte project MAGIC so a
 // different project's beacon is never mistaken for ours, and a VERSION so the
@@ -16,7 +29,7 @@
 #define HA_FW_MAGIC_1 0x41 // 'A'
 #define HA_FW_MAGIC_2 0x52 // 'R'
 #define HA_FW_MAGIC_3 0x43 // 'C'  ("HARC" = Hotspot ARCade)
-#define HA_FW_VERSION 17 // v17: Chess game added
+#define HA_FW_VERSION 18 // v18: browser protocol v2 resume + transport-safe clocks
 
 // Flipper -> ESP
 enum {
@@ -35,6 +48,7 @@ enum {
     HA_MSG_CONTENT_CLEAR = 0x1C, // drop all packs, for every game
     HA_MSG_CONTENT_PACK = 0x1D, // payload = game byte + pack name; begins a pack
     HA_MSG_CONTENT_ITEM = 0x1E, // payload = JSON object of the file's own keys
+    HA_MSG_CONTENT_COMMIT = 0x1F, // atomically publish staged packs and return to lobby
 };
 
 // ESP -> Flipper
@@ -43,7 +57,7 @@ enum {
     HA_MSG_JOIN = 0x81,
     HA_MSG_LEAVE = 0x82,
     HA_MSG_SCORE = 0x83,
-    HA_MSG_ROUND_RESULT = 0x84,
+    HA_MSG_ROUND_RESULT = 0x84, // reserved legacy JSON result (v17 and older)
     HA_MSG_EVENT = 0x85,
     HA_MSG_PING = 0x86,
 };
