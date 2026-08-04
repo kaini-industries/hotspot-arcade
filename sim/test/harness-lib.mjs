@@ -24,6 +24,10 @@ export async function newEngine() {
       M.ccall("ha_reset_keep_known", null, ["number"], [ms]);
       return drain();
     },
+    setAdmissionFull: (full) => {
+      M.ccall("ha_set_admission_full", null, ["number"], [full ? 1 : 0]);
+      return drain();
+    },
     tick: (ms) => { M.ccall("ha_tick", null, ["number"], [ms]); return drain(); },
     input: (wsId, obj) => {
       M.ccall("ha_input", null, ["number", "string"], [wsId, JSON.stringify(obj)]);

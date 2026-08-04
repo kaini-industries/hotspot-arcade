@@ -25,6 +25,7 @@ enum HaJoinAuthResult : uint8_t {
     HA_JOIN_AUTH_BAD_CODE = 2,
     HA_JOIN_AUTH_THROTTLED = 3,
     HA_JOIN_AUTH_KNOWN = 4, // host ledger recognizes the digest; code may be omitted
+    HA_JOIN_AUTH_FULL = 5, // durable host ledger is full even if an engine pid is free
 };
 
 // Browser resume tokens are credentials and never become server state. Derive a
@@ -699,7 +700,8 @@ public:
             uint8_t auth = haAuthorizeIdentity(wsId, identity, code ? code : "", &retryMs);
             if(auth != HA_JOIN_AUTH_OK && auth != HA_JOIN_AUTH_KNOWN) {
                 const char* reason = auth == HA_JOIN_AUTH_REQUIRED ? "auth_required" :
-                                     auth == HA_JOIN_AUTH_THROTTLED ? "throttled" : "bad_code";
+                                     auth == HA_JOIN_AUTH_THROTTLED ? "throttled" :
+                                     auth == HA_JOIN_AUTH_FULL ? "full" : "bad_code";
                 String reject = String("{\"t\":\"reject\",\"code\":\"") + reason + "\"";
                 if(auth == HA_JOIN_AUTH_THROTTLED) reject += String(",\"retry_ms\":") + retryMs;
                 reject += "}";

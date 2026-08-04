@@ -17,6 +17,10 @@ out = e.input(98, { t: "hello", proto: 2, nick: "NO CODE", avatar: "🙂", resum
 assert.equal(lastToWs(out, 98, "reject").msg.code, "auth_required");
 out = e.input(98, { t: "hello", proto: 2, nick: "BAD CODE", avatar: "🙂", resume: token, code: "654321" });
 assert.equal(lastToWs(out, 98, "reject").msg.code, "bad_code");
+e.setAdmissionFull(true);
+out = e.input(96, { t: "hello", proto: 2, nick: "LEDGER FULL", avatar: "🙂", resume: "96969696969696969696969696969696", code: "123456" });
+assert.equal(lastToWs(out, 96, "reject").msg.code, "full", "host ledger capacity is an explicit full rejection");
+e.setAdmissionFull(false);
 out = e.input(97, { t: "hello", proto: 2, nick: "LONG CODE", avatar: "🙂", resume: token, code: "1234567" });
 assert.equal(lastToWs(out, 97, "reject").msg.code, "bad_code", "overlong code must not authenticate by truncation");
 

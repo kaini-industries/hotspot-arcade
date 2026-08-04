@@ -23,6 +23,7 @@ uint32_t millis() { return g_millis; }
 static Engine engine;
 static std::vector<std::string> g_outbox;
 static std::vector<std::string> g_knownIdentities;
+static bool g_admissionFull = false;
 static std::string g_drained; // return buffer; must outlive the call
 
 // Escape a C string for embedding as a JSON string value. Only nicknames and score
@@ -75,6 +76,7 @@ uint8_t haAuthorizeIdentity(
     if(std::find(g_knownIdentities.begin(), g_knownIdentities.end(), identity) !=
        g_knownIdentities.end())
         return HA_JOIN_AUTH_KNOWN;
+    if(g_admissionFull) return HA_JOIN_AUTH_FULL;
     if(!code || !code[0]) return HA_JOIN_AUTH_REQUIRED;
     return strcmp(code, "123456") == 0 ? HA_JOIN_AUTH_OK : HA_JOIN_AUTH_BAD_CODE;
 }
@@ -116,17 +118,22 @@ extern "C" {
 void ha_reset() {
     g_millis = 0;
     g_knownIdentities.clear();
+    g_admissionFull = false;
     engine.reset(g_millis);
 }
 void ha_reset_at(uint32_t now) {
     g_millis = now;
     g_knownIdentities.clear();
+    g_admissionFull = false;
     engine.reset(g_millis);
 }
 void ha_reset_keep_known(uint32_t now) {
     g_millis = now;
+    g_admissionFull = false;
     engine.reset(g_millis);
 }
+
+void ha_set_admission_full(int full) { g_admissionFull = full != 0; }
 
 void ha_tick(uint32_t now) {
     g_millis = now;
