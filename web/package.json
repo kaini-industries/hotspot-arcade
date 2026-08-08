@@ -7,6 +7,6 @@
   "scripts": {
     "build": "node build.mjs",
     "mock": "node mock-server.mjs",
-    "test": "node test/pause-state.mjs"
+    "test": "node test/pause-state.mjs && node test/socket-reconnect.mjs"
   }
 }

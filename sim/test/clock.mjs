@@ -61,6 +61,58 @@ out = redundantResume.tick(120000);
 assert.ok(out.some((x) => x.to === "uart" && x.kind === "leave" && x.pid === 1),
   "redundant resume does not extend transient grace");
 
+// Ending planned downtime normally retains missing seats and begins their
+// ordinary transient grace at the moment transport returns.
+const plannedGrace = await newEngine();
+plannedGrace.resetAt(0);
+plannedGrace.join(1, "ALICE");
+plannedGrace.pause();
+plannedGrace.disconnect(1);
+plannedGrace.tick(600000);
+out = plannedGrace.resume();
+assert.equal(out.some((x) => x.to === "uart" && x.kind === "leave"), false,
+  "ordinary planned resume retains a detached seat");
+out = plannedGrace.join(2, "ALICE", "00000000000000000000000000000001", null);
+assert.equal(lastToWs(out, 2, "welcome").msg.resumed, true,
+  "a missing player can resume the retained seat after transport returns");
+
+// When the host's planned reconnect window itself expires, missing seats are
+// finalized while logical game time is still frozen. They must not receive an
+// extra 120-second grace window after the ten-minute host deadline.
+const plannedTimeout = await newEngine();
+plannedTimeout.resetAt(0);
+plannedTimeout.contentClear();
+plannedTimeout.contentPack(DRAW, "Timeout");
+plannedTimeout.contentItem(JSON.stringify({ word: "exact" }));
+plannedTimeout.contentCommit();
+plannedTimeout.join(1, "ALICE"); plannedTimeout.join(2, "BOB");
+plannedTimeout.selectGame(DRAW);
+out = plannedTimeout.tick(0);
+const state1 = lastToWs(out, 1, "draw").msg;
+const state2 = lastToWs(out, 2, "draw").msg;
+const missingPid = state1.role === "drawer" ? 2 : 1;
+const presentPid = missingPid === 1 ? 2 : 1;
+const presentWs = presentPid;
+const remainingBefore = (presentPid === 1 ? state1 : state2).remaining_ms;
+plannedTimeout.pause();
+plannedTimeout.disconnect(missingPid);
+plannedTimeout.tick(600000);
+out = plannedTimeout.resumeExpired();
+assert.equal(out.filter((x) => x.to === "uart" && x.kind === "leave" && x.pid === missingPid).length, 1,
+  "timeout resume finalizes each detached seat immediately and exactly once");
+assert.equal(lastToWs(out, presentWs, "draw").msg.remaining_ms, remainingBefore,
+  "the planned reconnect window consumes no logical round time");
+assert.deepEqual(plannedTimeout.resumeExpired(), [], "duplicate timeout resume is a no-op");
+out = plannedTimeout.tick(600001);
+assert.equal(out.some((x) => x.to === "uart" && x.kind === "leave" && x.pid === missingPid), false,
+  "finalized seats do not leave again on a later tick");
+const missingToken = missingPid === 1
+  ? "00000000000000000000000000000001"
+  : "00000000000000000000000000000002";
+out = plannedTimeout.join(3, missingPid === 1 ? "ALICE" : "BOB", missingToken, null);
+assert.equal(lastToWs(out, 3, "welcome").msg.resumed, false,
+  "returning after host timeout receives a fresh engine seat, not renewed grace");
+
 // A normal disconnect of a role-critical player freezes only that active round.
 // The 120-second identity grace continues on raw host time while the logical
 // deadline remains exact.

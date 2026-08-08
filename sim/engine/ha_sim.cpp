@@ -62,7 +62,8 @@ void haWsSendWs(uint32_t wsId, const String& msg) {
 
 void haWsCloseWs(uint32_t wsId) {
     g_outbox.push_back(
-        "{\"to\":\"ws\",\"id\":" + std::to_string(wsId) + ",\"kind\":\"close\"}");
+        "{\"to\":\"ws\",\"id\":" + std::to_string(wsId) +
+        ",\"kind\":\"close\",\"code\":1008,\"reason\":\"identity takeover\"}");
 }
 
 void haWsBroadcast(const String& msg) {
@@ -148,6 +149,7 @@ void ha_input_at(uint32_t wsId, const char* json, uint32_t now) {
 void ha_disconnect(uint32_t wsId) { engine.onWsDisconnect(wsId, g_millis); }
 void ha_pause() { engine.transportPause(g_millis); }
 void ha_resume() { engine.transportResume(g_millis); }
+void ha_resume_expire() { engine.transportResume(g_millis, true); }
 int ha_time_reached(uint32_t now, uint32_t deadline) { return haTimeReached(now, deadline); }
 uint32_t ha_time_remaining(uint32_t now, uint32_t deadline) {
     return haTimeRemaining(now, deadline);

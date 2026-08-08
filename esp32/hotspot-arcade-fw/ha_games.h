@@ -606,22 +606,32 @@ public:
     }
 
     // Freeze only game time. Raw time keeps advancing so reconnect grace remains
-    // measurable; resume grants every detached player a fresh grace window.
+    // measurable; normal resume grants each detached player a fresh grace window,
+    // while an expired host reconnect window finalizes them before unpausing.
     void transportPause(uint32_t rawNow) {
         advanceClock(rawNow);
         if(!_pauseActive) announceServerPause("ap_off", "", 600000);
         _clockPaused = true;
     }
-    void transportResume(uint32_t rawNow) {
+    void transportResume(uint32_t rawNow, bool expireDetachedNow = false) {
         // START/transportResume may be delivered more than once.  A redundant
         // resume must be a complete no-op: in particular, it must not renew a
         // normally disconnected player's 120-second grace window.
         if(!_clockPaused) return;
+        // Establish the new raw-time baseline while logical time is still frozen.
+        // A host-expired planned reconnect window must finalize missing seats here,
+        // rather than unpausing and accidentally granting each one another 120s.
         _lastRawNow = rawNow;
         _clockStarted = true;
+        if(expireDetachedNow) {
+            for(uint8_t pid = 1; pid <= HA_MAX_PLAYERS; pid++)
+                if(_p[pid].used && _p[pid].detached) finalizeLeave(pid);
+        }
         _clockPaused = false;
-        for(uint8_t pid = 1; pid <= HA_MAX_PLAYERS; pid++)
-            if(_p[pid].used && _p[pid].detached) _p[pid].detachedAt = rawNow;
+        if(!expireDetachedNow) {
+            for(uint8_t pid = 1; pid <= HA_MAX_PLAYERS; pid++)
+                if(_p[pid].used && _p[pid].detached) _p[pid].detachedAt = rawNow;
+        }
         for(uint8_t pid = 1; pid <= HA_MAX_PLAYERS; pid++) {
             if(_p[pid].used && _p[pid].wsId)
                 resumeAffectedGame(pid, rawNow);

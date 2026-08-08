@@ -83,7 +83,10 @@ assert.equal(lastToWs(out, 3, "lobby").msg.players.find((p) => p.pid === 1).onli
 out = e.join(4, "ALICE", token);
 assert.equal(lastToWs(out, 4, "welcome").msg.pid, 1);
 assert.equal(lastToWs(out, 4, "welcome").msg.resumed, true);
-assert.ok(out.some((x) => x.to === "ws" && x.id === 3 && x.kind === "close"), "takeover closes the stale socket");
+const takeoverClose = out.find((x) => x.to === "ws" && x.id === 3 && x.kind === "close");
+assert.ok(takeoverClose, "takeover closes the stale socket");
+assert.equal(takeoverClose.code, 1008, "takeover is a WebSocket policy close");
+assert.equal(takeoverClose.reason, "identity takeover", "client can distinguish a deliberate takeover");
 assert.deepEqual(e.input(3, { t: "challenge", to: 2 }), []);
 
 const challengedAgain = e.input(4, { t: "challenge", to: 2 });

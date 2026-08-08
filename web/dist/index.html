@@ -462,6 +462,7 @@ view: "landing",     // landing | lobby | trivia | duel | draw | pong
 joined: false,       // true once the user committed a nick (Play) or is rejoining
 authenticated: false, // true only after welcome on the current WebSocket
 retry: 0,
+takeover: false,      // this tab was displaced by a newer socket for the same identity
 handlers: {},        // messageType -> fn(msg), filled by game modules
 };
 var $ = function (id) { return document.getElementById(id); };
@@ -757,7 +758,10 @@ if(!window.crypto || !window.crypto.getRandomValues) return "";
 var bytes = new Uint8Array(16);
 window.crypto.getRandomValues(bytes);
 var token = "";
-for(var i = 0; i < bytes.length; i++) token += bytes[i].toString(16).padStart(2, "0");
+for(var i = 0; i < bytes.length; i++) {
+var hex = bytes[i].toString(16);
+token += hex.length < 2 ? "0" + hex : hex;
+}
 return token;
 }
 function setDot(cls) { $("dot").className = "dot" + (cls ? " " + cls : ""); }
@@ -783,6 +787,7 @@ var h = new URLSearchParams(location.search).get("harness");
 return h ? name + "_" + h : name;
 }
 function connect() {
+if (A.takeover) return;
 var ws = harnessSocket();
 if (!ws) {
 try { ws = new WebSocket(wsUrl()); }
@@ -806,10 +811,23 @@ var m;
 try { m = JSON.parse(ev.data); } catch (e) { return; }
 dispatch(m);
 };
-ws.onclose = function () { A.authenticated = false; scheduleReconnect(); };
+ws.onclose = function (ev) {
+if (A.ws !== ws) return;
+A.ws = null;
+A.authenticated = false;
+if (ev && ev.code === 1008 && ev.reason === "identity takeover") {
+A.takeover = true;
+setDot("bad");
+$("netbar").textContent = t("net.identity_takeover");
+show("netbar");
+return;
+}
+scheduleReconnect();
+};
 ws.onerror = function () { try { ws.close(); } catch (e) {} };
 }
 function scheduleReconnect() {
+if (A.takeover) return;
 setDot(A.retry > 4 ? "bad" : "warn");   // down after repeated failures
 if (A.view !== "landing") {
 $("netbar").textContent = A.serverPause ? t("net.host_paused") : t("net.reconnecting");
@@ -1171,7 +1189,12 @@ connect();
 setInterval(function () { send({ t: "ping" }); }, 20000);
 }
 if (typeof globalThis !== "undefined" && globalThis.__HA_TEST__) {
-globalThis.__HA_TEST_API__ = { dispatch: dispatch, sendHello: sendHello };
+globalThis.__HA_TEST_API__ = {
+dispatch: dispatch,
+sendHello: sendHello,
+connect: connect,
+createResumeToken: createResumeToken,
+};
 }
 document.addEventListener("DOMContentLoaded", initApp);
 var MESSAGES = {
@@ -1207,6 +1230,7 @@ en: {
 "net.reconnecting": "Reconnecting...",
 "net.host_paused": "Host paused the game. Please wait...",
 "net.opp_reconnect": "Opponent disconnected. Waiting to reconnect...",
+"net.identity_takeover": "This player is active in another tab. Reload to use this tab.",
 "lobby.title": "Lobby",
 "lobby.waiting": "Waiting for the host to pick a game.",
 "lobby.chat": "Chat",
@@ -1380,6 +1404,7 @@ de: {
 "net.reconnecting": "Verbinde neu...",
 "net.host_paused": "Der Host hat das Spiel pausiert. Bitte warten...",
 "net.opp_reconnect": "Gegner getrennt. Warte auf die Wiederverbindung...",
+"net.identity_takeover": "Dieser Spieler ist in einem anderen Tab aktiv. Lade neu, um diesen Tab zu verwenden.",
 "lobby.title": "Lobby",
 "lobby.waiting": "Warte, bis der Host ein Spiel wählt.",
 "lobby.chat": "Chat",
@@ -1553,6 +1578,7 @@ de: {
 "net.reconnecting": "Reconectando...",
 "net.host_paused": "O anfitrião pausou o jogo. Aguarde...",
 "net.opp_reconnect": "O oponente desconectou. Aguardando reconexão...",
+"net.identity_takeover": "Este jogador está ativo em outra aba. Recarregue para usar esta aba.",
 "lobby.title": "Lobby",
 "lobby.waiting": "Aguardando o anfitrião escolher um jogo.",
 "lobby.chat": "Bate-papo",

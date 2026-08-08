@@ -44,6 +44,7 @@ export async function newEngine() {
     disconnect: (wsId) => { M.ccall("ha_disconnect", null, ["number"], [wsId]); return drain(); },
     pause: () => { M.ccall("ha_pause", null, [], []); return drain(); },
     resume: () => { M.ccall("ha_resume", null, [], []); return drain(); },
+    resumeExpired: () => { M.ccall("ha_resume_expire", null, [], []); return drain(); },
     timeReached: (now, deadline) =>
       M.ccall("ha_time_reached", "number", ["number", "number"], [now, deadline]) !== 0,
     timeRemaining: (now, deadline) =>

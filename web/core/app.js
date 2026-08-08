@@ -12,6 +12,7 @@ var A = {
   joined: false,       // true once the user committed a nick (Play) or is rejoining
   authenticated: false, // true only after welcome on the current WebSocket
   retry: 0,
+  takeover: false,      // this tab was displaced by a newer socket for the same identity
   handlers: {},        // messageType -> fn(msg), filled by game modules
 };
 
@@ -393,7 +394,10 @@ function createResumeToken() {
   var bytes = new Uint8Array(16);
   window.crypto.getRandomValues(bytes);
   var token = "";
-  for(var i = 0; i < bytes.length; i++) token += bytes[i].toString(16).padStart(2, "0");
+  for(var i = 0; i < bytes.length; i++) {
+    var hex = bytes[i].toString(16);
+    token += hex.length < 2 ? "0" + hex : hex;
+  }
   return token;
 }
 
@@ -438,6 +442,11 @@ function storeKey(name) {
 }
 
 function connect() {
+  // A policy close for duplicate-identity takeover is intentionally terminal for
+  // this tab. Reloading is the explicit way to take the identity back; an automatic
+  // reconnect here would close the newer tab, which would reconnect and close this
+  // one again forever. Ordinary network/server closes still use the retry path below.
+  if (A.takeover) return;
   var ws = harnessSocket();
   if (!ws) {
     try { ws = new WebSocket(wsUrl()); }
@@ -466,11 +475,26 @@ function connect() {
     dispatch(m);
   };
 
-  ws.onclose = function () { A.authenticated = false; scheduleReconnect(); };
+  ws.onclose = function (ev) {
+    // Ignore a late close from a stale socket after another connection has already
+    // become current. Otherwise it can schedule a redundant retry over a healthy link.
+    if (A.ws !== ws) return;
+    A.ws = null;
+    A.authenticated = false;
+    if (ev && ev.code === 1008 && ev.reason === "identity takeover") {
+      A.takeover = true;
+      setDot("bad");
+      $("netbar").textContent = t("net.identity_takeover");
+      show("netbar");
+      return;
+    }
+    scheduleReconnect();
+  };
   ws.onerror = function () { try { ws.close(); } catch (e) {} };
 }
 
 function scheduleReconnect() {
+  if (A.takeover) return;
   setDot(A.retry > 4 ? "bad" : "warn");   // down after repeated failures
   if (A.view !== "landing") {
     $("netbar").textContent = A.serverPause ? t("net.host_paused") : t("net.reconnecting");
@@ -914,6 +938,11 @@ function initApp() {
 }
 
 if (typeof globalThis !== "undefined" && globalThis.__HA_TEST__) {
-  globalThis.__HA_TEST_API__ = { dispatch: dispatch, sendHello: sendHello };
+  globalThis.__HA_TEST_API__ = {
+    dispatch: dispatch,
+    sendHello: sendHello,
+    connect: connect,
+    createResumeToken: createResumeToken,
+  };
 }
 document.addEventListener("DOMContentLoaded", initApp);
