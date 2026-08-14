@@ -199,4 +199,15 @@ assert.equal(incoming.children[0].children.length, 2);
 incoming.children[0].children[0].click();
 assert.deepEqual(sockets[1].sent.at(-1), { t: "accept", id: 77 });
 
+// A committed locale reaches already-connected phones, and a phone game request is
+// answered as policy—not with the legacy vote overlay or a local game mutation.
+let configuredLang = null;
+context.A.setLang = (lang) => { configuredLang = lang; };
+context.__HA_TEST_API__.dispatch({ t: "config", lang: "de" });
+assert.equal(configuredLang, "de");
+context.__HA_TEST_API__.dispatch({
+  t: "result", event: "game_change", status: "policy_denied", game: "wyr", id: 8,
+});
+assert.equal(elements.get("toast").textContent, "gamevote.host_only");
+
 console.log("web protocol-v2 reconnect policy: OK");

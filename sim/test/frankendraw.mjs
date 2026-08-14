@@ -296,7 +296,7 @@ assert.equal(lob.need, 3);
   assert.equal(view(o, 2).used, 0);
 }
 
-// --- reachable from the phone-side game vote -----------------------------------
+// --- recognized by the phone-side host-policy request ---------------------------
 // gameIdByName() used to stop at the highest id it knew about, which made a game
 // numbered above that bound impossible to propose from a phone at all.
 {
@@ -306,9 +306,10 @@ assert.equal(lob.need, 3);
   g.join(2, "BOB");
   g.selectGame(13); // start somewhere else, then propose this game by name
   const o = g.input(1, { t: "proposeGame", game: "frankendraw" });
-  const gv = lastToWs(o, 2, "gamevote");
-  assert.ok(gv, "a phone can propose this game (its id is inside the name lookup)");
-  assert.equal(gv.msg.game, "frankendraw", "proposed by its wire name, not its label");
+  const result = lastToWs(o, 1, "result");
+  assert.ok(result, "the high-numbered game is recognized by the policy path");
+  assert.equal(result.msg.game, "frankendraw", "requested by its wire name, not its label");
+  assert.equal(result.msg.status, "policy_denied", "no synchronous content switch occurs");
 }
 
 console.log("frankendraw: all checks passed");

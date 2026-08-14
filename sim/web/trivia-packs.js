@@ -90,6 +90,7 @@ export async function loadSamplePacks(names = ["general", "movies", "science"]) 
 // the object it ships genuinely carries the key more than once — and stringifyItem()
 // below reproduces exactly that, which is why this parser must not collapse repeats.
 export function parseGenericPack(text, fallbackName = "") {
+  if (text.includes("\0")) throw new Error("malformed pack: embedded NUL");
   let name = fallbackName;
   const items = [];
   let cur = {};
@@ -99,11 +100,11 @@ export function parseGenericPack(text, fallbackName = "") {
     const line = raw.trim();
     if (line === "" || line === "---") { flush(); continue; }
     const c = line.indexOf(":");
-    if (c < 0) continue;
+    if (c < 0) throw new Error(`malformed pack line: ${line}`);
     const key = line.slice(0, c).trim().toLowerCase();
     const val = line.slice(c + 1).trim();
     if (key === "pack") { if (val) name = val; continue; }
-    if (!key) continue;
+    if (!key) throw new Error("malformed pack line: empty key");
     if (key in cur) cur[key] = [].concat(cur[key], val);
     else cur[key] = val;
     any = true;

@@ -192,9 +192,11 @@ the games stay in sync.
 - The captive page hands off to the game web app at `http://192.168.4.1` (captive
   mini-browsers are too limited for WebSockets, so it is a "tap to open in your browser"
   handoff).
-- The Flipper streams the (gzipped) web bundle and content packs to the ESP over a
-  framed UART protocol, then orchestrates rounds. The web bundle is stored in a **LittleFS
-  flash partition** on the ESP and served from flash (so it costs no RAM and survives a
+- The Flipper streams the (gzipped) web bundle and the **selected game's** content to the
+  ESP over a framed UART protocol, then orchestrates rounds. Game/locale changes use a
+  count-checked transaction: a malformed or failed load leaves the prior game untouched,
+  and the ESP holds one live typed content bank plus at most one staged bank. The web bundle
+  is stored in a **LittleFS flash partition** on the ESP and served from flash (so it costs no RAM and survives a
   reboot); the Flipper re-streams it only when it changes — the board reports the bundle's
   CRC in its beacon and the Flipper skips the transfer when it already matches. Real-time
   game traffic stays on the ESP and never crosses the slow UART. Protocol:
@@ -311,8 +313,9 @@ On the Flipper: **Apps → GPIO → [ESP32] Hotspot Arcade**.
 
 ## Content packs
 
-Seven games are content-driven from plain-text files under `packs/`, one directory per
-game (`trivia/`, `wyr/`, `scramble/`, `draw/`, `spectrum/`, `kmk/`, `spyfall/`). Format:
+Nine games are content-driven from plain-text files under `packs/`, one directory per
+game (`trivia/`, `wyr/`, `scramble/`, `draw/`, `spectrum/`, `kmk/`, `secrets/`,
+`fillblank/`, `spyfall/`). Format:
 `Key: value` lines, blocks split by `---` or a blank line, `Pack:` names the pack. The
 keys are per game — e.g. Trivia uses `Q:`, `A:`-`D:` and `Answer:`; Would You Rather uses
 `A:` / `B:`; Word Scramble and Draw &amp; Guess use `Word:`; Spyfall uses `Loc:` plus one
@@ -324,7 +327,9 @@ clash). See [packs/README.md](packs/README.md).
 content follow it. English is the default; **Brazilian Portuguese** ships as the first
 translation — the phone UI is fully localized, with a starter content pack per game.
 Translated packs live in a `<lang>/` subdirectory (`packs/<game>/pt-br/`), falling back to
-English per game, and content is UTF-8. The Flipper's own host menus stay English.
+English per game, and content is UTF-8. A language change transaction returns the current
+game to a fresh lobby while preserving its phone scoreboard. The Flipper's own host menus
+stay English.
 
 ## Responsible use
 

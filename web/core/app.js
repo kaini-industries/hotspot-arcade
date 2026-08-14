@@ -567,16 +567,6 @@ function maybeCaptive() {
 /* Core message routing. Game-specific messages hand off to registered
    handlers so the modules stay self-contained. */
 function dispatch(m) {
-  // Do NOT retire the vote overlay from here. Two attempts at that shipped broken: closing on
-  // anything that was not "gamevote" let the 2s keepalive's {t:"pong"} dismiss the prompt
-  // before it could be read, and closing on "the first real state push" made the prompt never
-  // appear on the other phones at all. Both were fixing a symptom of something else entirely
-  // (a duplicate SCREENS block that stopped the client from starting).
-  //
-  // The engine already makes this unnecessary: while a proposal is open it sends ONLY the vote
-  // (pushAll() returns early when _gvActive), so no game state can arrive mid-vote. Both
-  // outcomes then go through pushAll()'s normal path, which leads with lobbyJson() -- so
-  // onLobby() sees every resolution, approved or rejected. That is the one place that closes it.
   notePlayerCount(m);   // the switcher greys out on the CURRENT count, not the last lobby's
   switch (m.t) {
     case "welcome":
@@ -598,6 +588,13 @@ function dispatch(m) {
           localStorage.setItem(storeKey("ha_avatar"), A.avatar);
         } catch (e) {}
       }
+      break;
+    case "config":
+      if (A.setLang) A.setLang(m.lang);
+      break;
+    case "result":
+      if (m.event === "game_change" && m.status === "policy_denied")
+        toast(t("gamevote.host_only"));
       break;
     case "reject":
       A.authenticated = false;
@@ -696,8 +693,7 @@ A.lobbyView = lobbyView;
    game view; a game message can also switch us in (see game modules). */
 function onLobby(m) {
   if (m.me) A.pid = m.me;
-  // A lobby push only arrives when no game-change vote is pending, so its arrival means
-  // any vote has resolved (approved -> new game, or rejected -> resumed): close the modal.
+  // Retire a legacy vote overlay if this client reconnects to an older server.
   if (A.closeGamevote) A.closeGamevote();
   var prevCount = (A.players || []).length;
   A.players = m.players || [];   // kept for the duel/pong challenge lists
@@ -960,8 +956,8 @@ function openGameMenu() {
     if (name === A.curGame) return;   // the active game isn't a switch target
     list.appendChild(gameMenuItem(name, GAME_LABEL[name]));
   });
-  // Leaving the current game is a change like any other, so it votes too. Nothing to
-  // propose when we're already in the plain lobby -- the engine would refuse it.
+  // Leaving the current game is also a host-policy request. Nothing to request when
+  // already in the plain lobby.
   if (A.curGame !== "none") {
     var sep = document.createElement("div");
     sep.className = "game-sep";
@@ -1041,7 +1037,7 @@ function initApp() {
   $("game-overlay").addEventListener("click", function (e) {
     if (e.target === $("game-overlay")) closeGameMenu();
   });
-  // Change-game vote: OK / No buttons emit voteGame; the ESP tallies and resolves.
+  // Legacy vote overlay controls remain for compatibility with pre-v21 firmware.
   $("gamevote-yes").addEventListener("click", function () {
     A.sfx("buzz"); A.vibe(15);
     send({ t: "voteGame", ok: true });

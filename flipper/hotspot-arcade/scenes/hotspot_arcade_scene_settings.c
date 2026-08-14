@@ -1,4 +1,5 @@
 #include "../hotspot_arcade_i.h"
+#include "../helpers/ha_session.h"
 #include "../helpers/ha_storage.h"
 
 static const char* const on_off[] = {"OFF", "ON"};
@@ -22,6 +23,8 @@ static void ha_settings_lang_cb(VariableItem* item) {
     strlcpy(app->lang, ha_langs[i].code, sizeof(app->lang));
     variable_item_set_current_value_text(item, ha_langs[i].label);
     ha_storage_save_config(app);
+    if(app->session_active && app->hs == HaHsUp)
+        ha_select_game(app, app->active_game); // same-game locale transaction -> fresh lobby
 }
 
 static void ha_settings_sound_cb(VariableItem* item) {

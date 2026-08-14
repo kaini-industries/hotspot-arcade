@@ -202,6 +202,12 @@ static void uartStatus(const char* token) {
     uartSend(HA_MSG_STATUS, (const uint8_t*)token, strlen(token));
 }
 
+static void uartContentStatus(const char* kind, uint8_t game) {
+    char token[40];
+    snprintf(token, sizeof(token), "%s game=%u", kind, (unsigned)game);
+    uartStatus(token);
+}
+
 // ---------------- sinks used by the engine ----------------
 
 void haWsSendWs(uint32_t wsId, const String& msg) {
@@ -213,6 +219,21 @@ void haWsCloseWs(uint32_t wsId) {
 }
 void haWsBroadcast(const String& msg) {
     ws.textAll(msg);
+}
+void* haContentAlloc(size_t bytes) {
+    void* memory = ps_malloc(bytes);
+    return memory ? memory : malloc(bytes);
+}
+void haContentFree(void* memory) {
+    free(memory);
+}
+bool haContentAllocationAllowed() {
+    return true;
+}
+bool haPhoneGameChangeAllowed(uint8_t fromGame, uint8_t toGame) {
+    (void)fromGame;
+    (void)toGame;
+    return false; // no loop-task/SD request queue exists in this adapter yet
 }
 static bool identityKnown(const char* identity) {
     if(!identity || strlen(identity) != HA_IDENTITY_LEN) return false;
@@ -455,6 +476,9 @@ static uint8_t rxType = 0;
 static uint16_t rxLen = 0, rxIdx = 0;
 static uint8_t rxCrc = 0;
 static uint8_t rxBuf[HA_MAX_PAYLOAD + 1];
+// Target of the current serialized host content transaction. It survives a failed
+// BEGIN/staging bank so the one terminal COMMIT result still carries the requested id.
+static uint8_t contentRequestGame = 0xFF;
 
 // FILE_BEGIN payload: flags(1) pathlen(1) path mimelen(1) mime total(4 LE)
 static void handleFileBegin(const uint8_t* p, size_t len) {
@@ -516,33 +540,98 @@ static void dispatchFrame() {
         ESP.restart();
         break;
     case HA_MSG_SELECT_GAME:
-        if(rxLen >= 1) {
+        // v21 selection is inseparable from its content transaction. Silently
+        // selecting here could expose a zero-pack lobby, so old hosts get an
+        // explicit failure and leave the live game untouched.
+        uartStatus("select_deprecated");
+        break;
+    case HA_MSG_CONTENT_BEGIN: {
+        bool ok = false;
+        uint8_t target = rxLen ? rxBuf[0] : 0xFF;
+        contentRequestGame = target;
+        if(rxLen >= 1 && rxLen <= 8) {
+            char lang[8];
+            size_t n = rxLen - 1;
+            memcpy(lang, rxBuf + 1, n);
+            lang[n] = '\0';
             ENGINE_LOCK();
-            engine.selectGame(rxBuf[0]);
+            ok = engine.contentBegin(rxBuf[0], lang);
+            ENGINE_UNLOCK();
+        } else {
+            // Any BEGIN frame supersedes staging. A malformed one must not leave
+            // an older transaction available to an unrelated later COMMIT.
+            ENGINE_LOCK();
+            engine.contentAbort();
             ENGINE_UNLOCK();
         }
+        // BEGIN/PACK/ITEM diagnostics are deliberately nonterminal. Only COMMIT
+        // emits content_ok/content_error, so a delayed intermediate failure cannot
+        // cancel a later same-game retry on the host.
+        uartContentStatus(ok ? "content_begin" : "content_invalid", target);
         break;
-    case HA_MSG_CONTENT_CLEAR:
-        ENGINE_LOCK();
-        engine.contentClear();
-        ENGINE_UNLOCK();
-        break;
+    }
     case HA_MSG_CONTENT_PACK:
         // payload: game byte, then the pack name (not NUL-terminated on the wire).
-        if(rxLen >= 2) {
+        if(rxLen >= 2 && rxLen <= 64) {
             char name[64];
-            size_t n = rxLen - 1 < sizeof(name) - 1 ? (size_t)(rxLen - 1) : sizeof(name) - 1;
+            size_t n = rxLen - 1;
             memcpy(name, rxBuf + 1, n);
             name[n] = '\0';
+            bool ok;
             ENGINE_LOCK();
-            engine.contentPack(rxBuf[0], name);
+            ok = engine.contentPack(rxBuf[0], name);
             ENGINE_UNLOCK();
+            if(!ok) uartContentStatus("content_invalid", contentRequestGame);
+        } else {
+            // Poison an existing stage as well as reporting the malformed frame;
+            // truncating an overlong name could otherwise commit different content
+            // than the host counted and displayed.
+            ENGINE_LOCK();
+            engine.contentPack(rxLen ? rxBuf[0] : 0, "");
+            ENGINE_UNLOCK();
+            uartContentStatus("content_invalid", contentRequestGame);
         }
         break;
-    case HA_MSG_CONTENT_ITEM:
+    case HA_MSG_CONTENT_ITEM: {
+        bool ok;
         ENGINE_LOCK();
-        engine.contentItem((const char*)rxBuf);
+        ok = engine.contentItem((const char*)rxBuf);
         ENGINE_UNLOCK();
+        if(!ok) uartContentStatus("content_invalid", contentRequestGame);
+        break;
+    }
+    case HA_MSG_CONTENT_COMMIT: {
+        bool ok = false;
+        uint8_t target = contentRequestGame;
+        if(rxLen == 4) {
+            uint16_t packs = (uint16_t)rxBuf[0] | ((uint16_t)rxBuf[1] << 8);
+            uint16_t items = (uint16_t)rxBuf[2] | ((uint16_t)rxBuf[3] << 8);
+            ENGINE_LOCK();
+            ok = engine.contentCommit(packs, items);
+            ENGINE_UNLOCK();
+        } else {
+            // A malformed commit terminates the transaction; retaining its stage
+            // could let an unrelated later COMMIT publish stale content.
+            ENGINE_LOCK();
+            engine.contentAbort();
+            ENGINE_UNLOCK();
+        }
+        if(ok) {
+            // Include the committed id so delayed/back-to-back host requests cannot
+            // misassociate an acknowledgement with a newer pending selection.
+            uartContentStatus("content_ok", target);
+        } else {
+            uartContentStatus("content_error", target);
+        }
+        contentRequestGame = 0xFF;
+        break;
+    }
+    case HA_MSG_CONTENT_ABORT:
+        ENGINE_LOCK();
+        engine.contentAbort();
+        ENGINE_UNLOCK();
+        contentRequestGame = 0xFF;
+        uartStatus("content_abort");
         break;
     case HA_MSG_ROUND_END:
         ENGINE_LOCK();
@@ -564,13 +653,12 @@ static void dispatchFrame() {
         int v;
         if(ha_json_int(configJson, "max", &v) && v >= 1 && v <= HA_MAX_PLAYERS)
             apMaxConn = (uint8_t)v;
-        char lang[8];
-        bool hasLang = ha_json_str(configJson, "lang", lang, sizeof(lang));
         // The async WebSocket path reads admission state only while holding the
-        // engine mutex. Update the code and locale in that same synchronization
-        // domain so a hello cannot race a partial CONFIG transition.
+        // engine mutex. Update admission state in that same synchronization
+        // domain so a hello cannot race a partial CONFIG transition. Locale is
+        // committed transactionally with the selected content bank and CONFIG
+        // cannot change it ahead of a content commit that may fail.
         ENGINE_LOCK();
-        if(hasLang) engine.setLang(lang);
         if(codeValue) strlcpy(joinCode, code, sizeof(joinCode));
         ENGINE_UNLOCK();
         break;
@@ -687,8 +775,8 @@ void loop() {
         lastPing = now;
         // Identity beacon: magic + version + the CRC of the web bundle we hold in flash +
         // the current game id. Version flags an outdated board; the CRC lets the Flipper skip
-        // re-streaming an unchanged bundle; the game id lets it mirror phone-vote game changes
-        // reliably. Bytes 6-10 are new in v19; bytes 11-14 (free heap KB, free PSRAM KB, LE
+        // re-streaming an unchanged bundle; the game id lets it recover the last host-committed
+        // selection reliably. Bytes 6-10 are new in v19; bytes 11-14 (free heap KB, free PSRAM KB, LE
         // uint16 each) are new in v1.7.1 for the Flipper's memory readout. Older Flippers read
         // only the bytes they know and ignore the rest, so growing this stays compatible.
         uint32_t bcrc = fsReady ? assets.bundleCrc() : 0;

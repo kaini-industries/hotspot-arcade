@@ -82,6 +82,8 @@ static const char* ha_stage_label(HotspotArcadeApp* app) {
         return "Preparing board...";
     case HaHsFiles:
         return "Uploading game...";
+    case HaHsContent:
+        return "Loading content...";
     case HaHsSetAp:
         return "Naming hotspot...";
     case HaHsStart:
@@ -97,10 +99,12 @@ static int ha_stage_progress(HotspotArcadeApp* app) {
         return 8;
     case HaHsFiles: {
         int n = app->asset_count ? app->asset_count : 1;
-        return 12 + (73 * app->file_idx) / n;
+        return 12 + (68 * app->file_idx) / n;
     }
+    case HaHsContent:
+        return 84;
     case HaHsSetAp:
-        return 88;
+        return 90;
     case HaHsStart:
         return 96;
     case HaHsUp:
