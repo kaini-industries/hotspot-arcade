@@ -40,6 +40,9 @@
 
 <!-- Reconnect banner -->
 <div id="netbar" class="netbar hide" data-i18n="net.reconnecting">Reconnecting...</div>
+<!-- Generic by design: identifying the missing player could leak a hidden role. -->
+<div id="game-pause" class="game-pause hide" role="status" aria-live="polite"
+     data-i18n="pause.player">Waiting for a player to reconnect</div>
 
 <!-- Shared collapsible live leaderboard, pinned under the header. Any group-score
      game (trivia / scramble / reaction) mounts it via A.showLead(board). -->
@@ -300,6 +303,7 @@
   </div>
   <div id="rc-arena" class="hide">
     <div class="bar"><span id="rc-meta" class="me"></span></div>
+    <div id="rc-bar" class="timebar hide"><i></i></div>
     <div id="rc-pad" class="rc-pad wait"><span class="rc-big" data-i18n="rc.wait">Wait...</span></div>
   </div>
   <div id="rc-final" class="hide">
@@ -323,6 +327,7 @@
   </div>
   <div id="gc-play" class="hide gc-play">
     <div class="bar"><span id="gc-meta" class="me"></span></div>
+    <div id="gc-bar" class="timebar hide"><i></i></div>
     <div class="gc-target-wrap">
       <div id="gc-target" class="gc-chip gc-chip-lg"></div>
       <span class="gc-lbl" data-i18n="gc.match">Match this color &mdash; dial in R / G / B</span>
@@ -349,6 +354,7 @@
   </div>
   <div id="gc-reveal" class="hide gc-play">
     <div class="bar"><span id="gc-rmeta" class="me"></span></div>
+    <div id="gc-rbar" class="timebar hide"><i></i></div>
     <div class="gc-target-wrap">
       <div id="gc-rtarget" class="gc-chip gc-chip-lg"></div>
       <span id="gc-answer" class="gc-lbl gc-answer">Answer</span>
@@ -773,6 +779,19 @@
       <button id="captive-copy" class="btn sm" type="button" data-i18n="captive.copy">Copy</button>
     </div>
     <button id="captive-dismiss" class="captive-dismiss" type="button" data-i18n="captive.dismiss">Dismiss</button>
+  </div>
+</div>
+
+<!-- Planned AP downtime. This remains blocking through reconnect and server_resume,
+     until a subsequent authoritative state has rendered. -->
+<div id="transport" class="transport hide" role="dialog" aria-modal="true"
+     aria-labelledby="transport-title" aria-describedby="transport-body">
+  <div class="transport-card" aria-live="polite">
+    <div class="transport-spinner" aria-hidden="true"></div>
+    <div id="transport-title" class="transport-title">Game paused</div>
+    <p id="transport-body" class="transport-body">The host paused the game network.</p>
+    <p id="transport-ssid" class="transport-ssid hide"></p>
+    <p id="transport-hint" class="transport-hint hide"></p>
   </div>
 </div>
 

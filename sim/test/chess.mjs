@@ -62,8 +62,8 @@ function mv(pid, from, to, promo) {
   assert.equal(a.msg.moves.length, 20, "white has all 20 opening moves");
   assert.deepEqual(b.msg.moves, [], "it is not black's turn: no moves are sent to them");
   assert.equal(a.msg.board, STARTPOS, "board is the standard starting position");
-  assert.equal(a.msg.run, 300000, "the side to move's clock starts at 5:00");
-  assert.equal(a.msg.oms, 300000, "the opponent's clock also starts at 5:00");
+  assert.equal(a.msg.remaining_ms, 300000, "the side to move's clock starts at 5:00");
+  assert.equal(a.msg.other_remaining_ms, 300000, "the opponent's clock also starts at 5:00");
 }
 
 // ---- 2. Illegal moves are silently rejected (no `chess` push at all) --------------
@@ -430,8 +430,8 @@ function mv(pid, from, to, promo) {
   assert.equal(b.msg.white, true, "colors swap: the previous black (BOB) is now white");
   assert.equal(b.msg.moves.length, 20);
   assert.equal(b.msg.board, STARTPOS);
-  assert.equal(b.msg.run, 300000);
-  assert.equal(b.msg.oms, 300000);
+  assert.equal(b.msg.remaining_ms, 300000);
+  assert.equal(b.msg.other_remaining_ms, 300000);
 }
 
 // ---- 18. Reaction scoping -----------------------------------------------------------------

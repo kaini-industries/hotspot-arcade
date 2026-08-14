@@ -23,7 +23,7 @@
 
   function loop() {
     raf = requestAnimationFrame(loop);
-    if (!st) return;
+    if (!st || st.paused) return;
     // Ease the drawn ball toward the latest server position. The easing means the
     // drawn ball trails the real one by roughly a frame and a half, which is fine
     // mid-court but reads as "the ball bounced off nothing" at a paddle: the server
@@ -69,6 +69,7 @@
   }
 
   function setDir(d) {
+    if (d && A.inputsPaused()) return;
     if (d === dir) return;
     dir = d;
     send({ t: "paddle", dir: d });
@@ -81,6 +82,7 @@
     if (!canvas) ready();
     sizeCanvas();
     st = m;
+    if (m.paused) dir = 0;
     $("pong-score").innerHTML =
       '<span' + (m.me === 1 ? ' class="you"' : "") + ">" + t("common.you") + " " + (m.me === 1 ? m.s1 : m.s2) + "</span>" +
       '<span' + (m.me === 2 ? ' class="you"' : "") + ">" + esc(m.opp || "Opp") + " " + (m.me === 1 ? m.s2 : m.s1) + "</span>";
@@ -106,6 +108,7 @@
   function renderLobby(m) {
     stopLoop(); st = null;
     hide("pong-match"); hide("pong-over"); show("pong-lobby"); hide("pong-leave");
+    A.players = m.players || [];
     lobbyView($("pong-incoming"), $("pong-players"), m.challenges);
   }
 

@@ -33,6 +33,10 @@ static char joinCode[7] = ""; // optional here; the Cardputer host always config
 static char knownIdentities[32][HA_IDENTITY_LEN + 1] = {};
 static uint8_t knownIdentityCount = 0;
 static bool portalRunning = false;
+static bool networkSuspendPending = false;
+static uint32_t networkSuspendAt = 0;
+static char previousApName[33] = "Hotspot Arcade";
+static char pendingApName[33] = "";
 static uint8_t apMaxConn = AP_MAX_CONN;
 static bool fsReady = false; // LittleFS mounted (bundle store)
 
@@ -206,6 +210,38 @@ static void uartContentStatus(const char* kind, uint8_t game) {
     char token[40];
     snprintf(token, sizeof(token), "%s game=%u", kind, (unsigned)game);
     uartStatus(token);
+}
+
+static void uartTransportState() {
+    uint8_t reason;
+    uint16_t expected, online;
+    uint32_t reconnectMs;
+    bool paused;
+    ENGINE_LOCK();
+    paused = engine.transportPaused();
+    reason = engine.transportReason();
+    expected = engine.transportExpectedMask();
+    online = engine.transportOnlineExpectedMask();
+    reconnectMs = engine.transportReconnectMs();
+    ENGINE_UNLOCK();
+    // A portal scheduled to go down is not resume-ready even though the sockets are
+    // deliberately left alive for the 200 ms server_pause flush window. Reporting it
+    // ready here would let the host immediately undo the pause before shutdown.
+    bool networkReady = portalRunning && !networkSuspendPending;
+    uint8_t p[10] = {
+        (uint8_t)((paused ? 0x01 : 0) | (networkReady ? 0x02 : 0) |
+                  (expected == online ? 0x04 : 0) | (portalRunning ? 0x08 : 0)),
+        reason,
+        (uint8_t)(expected & 0xFF),
+        (uint8_t)(expected >> 8),
+        (uint8_t)(online & 0xFF),
+        (uint8_t)(online >> 8),
+        (uint8_t)(reconnectMs & 0xFF),
+        (uint8_t)((reconnectMs >> 8) & 0xFF),
+        (uint8_t)((reconnectMs >> 16) & 0xFF),
+        (uint8_t)((reconnectMs >> 24) & 0xFF),
+    };
+    uartSend(HA_MSG_TRANSPORT_STATE, p, sizeof(p));
 }
 
 // ---------------- sinks used by the engine ----------------
@@ -394,9 +430,12 @@ static void onWsEvent(
     size_t len) {
     (void)srv;
     if(type == WS_EVT_DISCONNECT) {
+        bool reportTransport;
         ENGINE_LOCK();
         engine.onWsDisconnect(client->id(), millis());
+        reportTransport = engine.transportPaused();
         ENGINE_UNLOCK();
+        if(reportTransport) uartTransportState();
     } else if(type == WS_EVT_DATA) {
         AwsFrameInfo* info = (AwsFrameInfo*)arg;
         if(info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT &&
@@ -404,9 +443,12 @@ static void onWsEvent(
             char buf[WS_MSG_MAX];
             memcpy(buf, data, len);
             buf[len] = '\0';
+            bool reportTransport;
             ENGINE_LOCK();
             engine.onInput(client->id(), buf, millis());
+            reportTransport = engine.transportPaused();
             ENGINE_UNLOCK();
+            if(reportTransport) uartTransportState();
         }
     }
 }
@@ -430,26 +472,40 @@ static void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
         leaseForget(info.wifi_ap_stadisconnected.mac);
 }
 
-static void startPortal() {
+static bool startPortal() {
+    if(portalRunning) {
+        uartStatus("ap_already");
+        String up = String("up ip=") + WiFi.softAPIP().toString();
+        uartStatus(up.c_str());
+        uartTransportState();
+        return true;
+    }
     leasesClear(); // a fresh session leases fresh addresses
     WiFi.mode(WIFI_AP);
-    WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-    WiFi.softAP(apName, nullptr, 1, 0, apMaxConn); // open AP, up to apMaxConn stations
+    if(!WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0)) ||
+       !WiFi.softAP(apName, nullptr, 1, 0, apMaxConn)) {
+        WiFi.softAPdisconnect(true);
+        uartStatus("ap_error");
+        return false;
+    }
     delay(100);
     uartStatus("ap_ok");
 
-    dnsServer.start(53, "*", apIP);
-    ws.onEvent(onWsEvent);
-    server.addHandler(&ws);
-    server.addHandler(new ArcadeHandler()).setFilter(ON_AP_FILTER);
+    if(!dnsServer.start(53, "*", apIP)) {
+        WiFi.softAPdisconnect(true);
+        uartStatus("dns_error");
+        return false;
+    }
     server.begin();
     portalRunning = true;
 
     String up = String("up ip=") + WiFi.softAPIP().toString();
     uartStatus(up.c_str());
+    uartTransportState();
+    return true;
 }
 
-static void stopPortal() {
+static void suspendPortalNetwork() {
     if(portalRunning) {
         ws.closeAll();
         server.end();
@@ -458,6 +514,12 @@ static void stopPortal() {
         portalRunning = false;
     }
     leasesClear();
+    uartStatus("network_suspended");
+    uartTransportState();
+}
+
+static void stopPortal() {
+    suspendPortalNetwork();
     // Admission memory is session-scoped. A player known to the old party must
     // present the next party's join code after a host stop/new-session cycle.
     ENGINE_LOCK();
@@ -529,7 +591,19 @@ static void dispatchFrame() {
         uartStatus("ap_set");
         break;
     case HA_MSG_START:
-        startPortal();
+        if(!startPortal() && pendingApName[0]) {
+            strlcpy(apName, previousApName, sizeof(apName));
+            pendingApName[0] = '\0';
+            // The first pause notice correctly named the requested SSID. From this
+            // point onward the proven fallback is authoritative, so resumed phones
+            // must not be sent back toward the AP that just failed.
+            ENGINE_LOCK();
+            (void)engine.replacePausedTransportSsid(apName);
+            ENGINE_UNLOCK();
+            uartStatus("ap_fallback");
+            (void)startPortal();
+        }
+        if(portalRunning) pendingApName[0] = '\0';
         break;
     case HA_MSG_STOP:
         stopPortal();
@@ -607,7 +681,7 @@ static void dispatchFrame() {
             uint16_t packs = (uint16_t)rxBuf[0] | ((uint16_t)rxBuf[1] << 8);
             uint16_t items = (uint16_t)rxBuf[2] | ((uint16_t)rxBuf[3] << 8);
             ENGINE_LOCK();
-            ok = engine.contentCommit(packs, items);
+            ok = engine.contentCommit(packs, items, millis());
             ENGINE_UNLOCK();
         } else {
             // A malformed commit terminates the transaction; retaining its stage
@@ -633,9 +707,69 @@ static void dispatchFrame() {
         contentRequestGame = 0xFF;
         uartStatus("content_abort");
         break;
+    case HA_MSG_TRANSPORT_PAUSE: {
+        HaTransportResult result = HA_TRANSPORT_BAD_ARGUMENT;
+        if(ha_json_flat_object_valid((const char*)rxBuf)) {
+            char reasonText[16] = "", ssid[33] = "";
+            int reconnect = -1;
+            bool haveReason = ha_json_str((const char*)rxBuf, "reason", reasonText, sizeof(reasonText));
+            const char* ssidValue = ha_json_find((const char*)rxBuf, "ssid");
+            bool haveSsid = !ssidValue || ha_json_str((const char*)rxBuf, "ssid", ssid, sizeof(ssid));
+            bool haveReconnect = ha_json_int((const char*)rxBuf, "reconnect_ms", &reconnect);
+            HaTransportReason reason = strcmp(reasonText, "ssid_change") == 0
+                                           ? HA_TRANSPORT_SSID_CHANGE
+                                           : HA_TRANSPORT_AP_OFF;
+            bool validReason = haveReason &&
+                               (strcmp(reasonText, "ssid_change") == 0 ||
+                                strcmp(reasonText, "ap_off") == 0);
+            if(validReason && haveSsid && haveReconnect && reconnect >= 0 && reconnect <= 600000 &&
+               (reason != HA_TRANSPORT_SSID_CHANGE || ssid[0])) {
+                ENGINE_LOCK();
+                result = engine.pauseTransport(reason, ssid, (uint32_t)reconnect, millis());
+                if(result == HA_TRANSPORT_OK) {
+                    // Publish non-ready before releasing the same mutex used by WS
+                    // callbacks. A ping racing this command can therefore never emit
+                    // a paused-but-ready snapshot in the gap before shutdown is armed.
+                    networkSuspendPending = portalRunning;
+                    networkSuspendAt = millis() + 200;
+                }
+                ENGINE_UNLOCK();
+                if(result == HA_TRANSPORT_OK) {
+                    strlcpy(previousApName, apName, sizeof(previousApName));
+                    if(reason == HA_TRANSPORT_SSID_CHANGE) {
+                        strlcpy(pendingApName, ssid, sizeof(pendingApName));
+                        strlcpy(apName, ssid, sizeof(apName));
+                    } else {
+                        pendingApName[0] = '\0';
+                    }
+                }
+            }
+        }
+        uartStatus(result == HA_TRANSPORT_OK ? "transport_pausing" :
+                   result == HA_TRANSPORT_ALREADY ? "transport_already" :
+                   result == HA_TRANSPORT_CONFLICT ? "transport_conflict" :
+                                                     "transport_error");
+        uartTransportState();
+        break;
+    }
+    case HA_MSG_TRANSPORT_RESUME: {
+        HaTransportResult result = HA_TRANSPORT_CONFLICT;
+        // Do not accept resume during the pre-shutdown flush window. The host must wait
+        // for a genuine post-restart transport snapshot with network-ready set.
+        if(portalRunning && !networkSuspendPending) {
+            ENGINE_LOCK();
+            result = engine.resumeTransport(millis());
+            ENGINE_UNLOCK();
+        }
+        uartStatus(result == HA_TRANSPORT_OK ? "transport_resumed" :
+                   result == HA_TRANSPORT_NOT_PAUSED ? "transport_not_paused" :
+                                                      "transport_network_down");
+        uartTransportState();
+        break;
+    }
     case HA_MSG_ROUND_END:
         ENGINE_LOCK();
-        engine.roundEnd();
+        engine.roundEnd(millis());
         ENGINE_UNLOCK();
         break;
     case HA_MSG_CONFIG: {
@@ -747,6 +881,9 @@ void setup() {
     engineMutex = xSemaphoreCreateRecursiveMutex();
     WiFi.onEvent(onWiFiEvent, ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED);
     WiFi.onEvent(onWiFiEvent, ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
+    ws.onEvent(onWsEvent);
+    server.addHandler(&ws);
+    server.addHandler(new ArcadeHandler()).setFilter(ON_AP_FILTER);
     Serial.setRxBufferSize(4096);
     Serial.begin(HA_UART_BAUD);
     delay(100);
@@ -763,9 +900,15 @@ void loop() {
     if(portalRunning) {
         dnsServer.processNextRequest();
         ws.cleanupClients();
-        ENGINE_LOCK();
-        engine.tick(millis());
-        ENGINE_UNLOCK();
+    }
+    ENGINE_LOCK();
+    engine.tick(millis());
+    ENGINE_UNLOCK();
+    if(networkSuspendPending && (int32_t)(millis() - networkSuspendAt) >= 0) {
+        // Keep pending asserted while closeAll invokes disconnect callbacks; their
+        // transport snapshots must not briefly advertise resume-ready mid-shutdown.
+        suspendPortalNetwork();
+        networkSuspendPending = false;
     }
     pumpSerial();
 
@@ -799,5 +942,10 @@ void loop() {
             (uint8_t)(psramKb & 0xFF),
             (uint8_t)(psramKb >> 8)};
         uartSend(HA_MSG_PING, beacon, sizeof(beacon));
+        // Lifecycle STATUS and state frames are individually CRC-protected but not
+        // acknowledged. Repeat the authoritative snapshot with the existing beacon
+        // so dropping any single `up`, `network_suspended`, or TRANSPORT_STATE frame
+        // converges within two seconds (including an empty expected-player mask).
+        uartTransportState();
     }
 }

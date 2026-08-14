@@ -29,7 +29,7 @@
   function renderCount(m) {
     sub("count");
     stopBar();
-    A.countdown("sec-count-num", m.sec);
+    A.countdown("sec-count-num", m.remaining_ms, m.paused);
   }
 
   // The stepper is deliberately silent: this is a hidden-vote game played around one
@@ -48,9 +48,9 @@
     setNum();
     // Prominent prompt above the stepper (past tense: answers came first this round).
     $("sec-predict-label").textContent = t("secrets.predict_hint", { n: m.n });
-    $("sec-minus").disabled = locked;
-    $("sec-plus").disabled = locked;
-    $("sec-predict-go").disabled = locked;
+    $("sec-minus").disabled = locked || !!m.paused;
+    $("sec-plus").disabled = locked || !!m.paused;
+    $("sec-predict-go").disabled = locked || !!m.paused;
     $("sec-predict-go").classList.toggle("hide", locked);
     $("sec-note").textContent = locked ? t("secrets.predict_locked", { n: m.myprediction }) : "";
   }
@@ -58,8 +58,8 @@
   function renderAnswer(m) {
     hide("sec-predict"); show("sec-answer"); hide("sec-reveal");
     var locked = (typeof m.myanswer === "number" && m.myanswer >= 0);
-    $("sec-yes").disabled = locked;
-    $("sec-no").disabled = locked;
+    $("sec-yes").disabled = locked || !!m.paused;
+    $("sec-no").disabled = locked || !!m.paused;
     $("sec-yes").classList.toggle("mine", m.myanswer === 1);
     $("sec-no").classList.toggle("mine", m.myanswer === 0);
     $("sec-note").textContent = locked ? t("secrets.answer_locked") : t("secrets.answer_hint");
@@ -119,8 +119,7 @@
     $("sec-q").textContent = m.q || "";
     // The timer bar ticks the predict/answer window, and the pause before the next
     // question while revealing.
-    noteDeadline(m.deadline, m.dur);
-    A.timebar("sec-bar", m.deadline, m.dur, m.phase !== "reveal");
+    A.timebar("sec-bar", m.remaining_ms, m.duration_ms, m.paused, m.phase !== "reveal");
     // The +gain line belongs to reveal only; clear it while answering/predicting.
     if (m.phase !== "reveal") $("sec-result").textContent = "";
     if (m.phase === "reveal") renderReveal(m);
@@ -151,20 +150,25 @@
     send({ t: "ready", ready: !myready });
   });
   $("sec-minus").addEventListener("click", function () {
+    if (A.inputsPaused()) return;
     if (predVal > 0) { predVal--; setNum(); A.vibe(8); }
   });
   $("sec-plus").addEventListener("click", function () {
+    if (A.inputsPaused()) return;
     if (predVal < predMax) { predVal++; setNum(); A.vibe(8); }
   });
   $("sec-predict-go").addEventListener("click", function () {
+    if (A.inputsPaused()) return;
     A.sfx("start"); A.vibe(20);
     send({ t: "predict", n: predVal });
   });
   $("sec-yes").addEventListener("click", function () {
+    if (A.inputsPaused()) return;
     A.sfx("buzz"); A.vibe(18);
     send({ t: "reply", v: 1 });
   });
   $("sec-no").addEventListener("click", function () {
+    if (A.inputsPaused()) return;
     A.sfx("buzz"); A.vibe(18);
     send({ t: "reply", v: 0 });
   });

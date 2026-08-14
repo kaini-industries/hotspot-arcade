@@ -47,7 +47,7 @@
     sub("count");
     A.hideLead();
     $("tv-count-topic").textContent = m.topic || "";
-    A.countdown("tv-count-num", m.secs);
+    A.countdown("tv-count-num", m.remaining_ms, m.paused);
   }
 
   // ---- question / reveal shared option rendering ----------------------------
@@ -74,7 +74,7 @@
         cls.push("mine");
       }
       if (cls.length) b.className += " " + cls.join(" ");
-      if (reveal || picked) b.disabled = true;
+      if (reveal || picked || m.paused) b.disabled = true;
 
       var cnt = reveal ? ('<span class="cnt">' + (counts[i] || 0) + "</span>") : "";
       b.innerHTML =
@@ -100,14 +100,14 @@
     $("tv-answered").textContent = t("trivia.answered", { n: m.answered || 0, total: m.total || 0 });
     $("tv-q").textContent = m.q || "";
     var mine = (typeof m.mine === "number") ? m.mine : -1;
-    noteDeadline(m.deadline, m.dur); A.timebar("tv-bar", m.deadline, m.dur, true);
+    A.timebar("tv-bar", m.remaining_ms, m.duration_ms, m.paused, true);
     renderOpts(m, false, mine);
     renderLead(m, false);
   }
 
   function renderReveal(m) {
     sub("play");
-    A.timebarStop("tv-bar"); hide("tv-bar");
+    A.timebar("tv-bar", m.remaining_ms, m.duration_ms, m.paused, false);
     head(m);
     var gained = (typeof m.gained === "number") ? m.gained : 0;
     $("tv-answered").textContent = gained > 0 ? "+" + gained + " pts" : "";

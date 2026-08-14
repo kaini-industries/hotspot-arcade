@@ -17,7 +17,7 @@
 #define HA_FW_MAGIC_1 0x41
 #define HA_FW_MAGIC_2 0x52
 #define HA_FW_MAGIC_3 0x43
-#define HA_FW_VERSION 21 // v21: v1.8 games + browser protocol v2 resumable identities
+#define HA_FW_VERSION 22 // v22: logical clocks + planned transport pause/resume
 
 // Flipper -> ESP
 #define HA_MSG_CLEAR_FILES   0x10
@@ -35,8 +35,10 @@
 #define HA_MSG_CONTENT_BEGIN 0x1C // payload = target game byte + locale ("" = English)
 #define HA_MSG_CONTENT_PACK  0x1D // payload = target game byte + pack name
 #define HA_MSG_CONTENT_ITEM  0x1E // payload = JSON object of the file's own keys
-#define HA_MSG_CONTENT_COMMIT 0x1F // payload = expected pack/item counts, uint16 LE each
-#define HA_MSG_CONTENT_ABORT 0x20 // discard staged bank; live game remains untouched
+#define HA_MSG_TRANSPORT_PAUSE 0x1F // JSON: reason, ssid, reconnect_ms
+#define HA_MSG_TRANSPORT_RESUME 0x20
+#define HA_MSG_CONTENT_COMMIT 0x21 // payload = expected pack/item counts, uint16 LE each
+#define HA_MSG_CONTENT_ABORT 0x22 // discard staged bank; live game remains untouched
 
 // ESP -> Flipper
 #define HA_MSG_STATUS       0x80
@@ -47,6 +49,10 @@
 #define HA_MSG_EVENT        0x85
 #define HA_MSG_PING         0x86
 #define HA_MSG_ART          0x87 // finished artwork, streamed: op byte + JSON (see HA_ART_*)
+#define HA_MSG_TRANSPORT_STATE 0x88 // fixed 10-byte binary snapshot; flags bit3 = portal live
+
+#define HA_TRANSPORT_SSID_CHANGE 1
+#define HA_TRANSPORT_AP_OFF      2
 
 // HA_MSG_ART op byte. A completed picture is streamed as BEGIN, one STROKE per line
 // segment, then END, so neither side ever has to hold a whole drawing in RAM.

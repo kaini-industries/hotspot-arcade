@@ -37,16 +37,17 @@
   }
   // A readable mm:ss next to the bar: six minutes of talking is far too long to judge
   // from a shrinking bar alone.
-  function startClock(deadline) {
+  function startClock(remainingMs, durationMs, paused) {
     stopClock();
+    var snap = A.timerSnapshot(remainingMs, durationMs, paused);
     function paint() {
-      var left = Math.max(0, Math.round((deadline - (Date.now() + A.offset)) / 1000));
-      var m = Math.floor(left / 60), s = left % 60;
-      $("sf-clock").textContent = m + ":" + (s < 10 ? "0" : "") + s;
+      var left = Math.max(0, Math.ceil(A.timerRemaining(snap) / 1000));
+      var min = Math.floor(left / 60), sec = left % 60;
+      $("sf-clock").textContent = min + ":" + (sec < 10 ? "0" : "") + sec;
       $("sf-clock").classList.toggle("hot", left <= 30);
     }
     paint();
-    ticker = setInterval(paint, 500);
+    if (!snap.paused && snap.remaining > 0) ticker = setInterval(paint, 200);
   }
 
   function renderLobby(m) {
@@ -66,7 +67,7 @@
   function renderCount(m) {
     sub("count");
     stopBar(); stopClock(); holdOff();
-    A.countdown("sf-count-num", m.sec);
+    A.countdown("sf-count-num", m.remaining_ms, m.paused);
   }
 
   /* ---- the card ---------------------------------------------------------------
@@ -137,6 +138,7 @@
     var r = row("tap" + (armed === key ? " armed" : ""), label,
                 armed === key ? t("sf.confirm") : "");
     r.addEventListener("click", function () {
+      if (A.gamePaused || A.transportBlocked) return;
       if (armed === key) { A.sfx("start"); A.vibe(30); armed = -1; onCommit(); return; }
       armed = key;
       A.sfx("buzz"); A.vibe(12);
@@ -256,9 +258,8 @@
     last = m;
 
     $("sf-meta").textContent = t("common.round", { n: m.round, total: m.rounds });
-    noteDeadline(m.deadline, m.dur);
-    A.timebar("sf-bar", m.deadline, m.dur, false);
-    if (fresh) startClock(m.deadline);
+    A.timebar("sf-bar", m.remaining_ms, m.duration_ms, m.paused, false);
+    startClock(m.remaining_ms, m.duration_ms, m.paused);
 
     hide("sf-ok"); hide("sf-hold"); hide("sf-acts"); hide("sf-poll");
     hide("sf-loc"); hide("sf-who"); hide("sf-listhead");
@@ -316,23 +317,27 @@
     send({ t: "again" });
   });
   $("sf-ok").addEventListener("click", function () {
+    if (A.gamePaused || A.transportBlocked) return;
     A.sfx("buzz"); A.vibe(15);
     send({ t: "seen" });
   });
   $("sf-loc").addEventListener("click", function () {
+    if (A.gamePaused || A.transportBlocked) return;
     A.sfx("buzz"); A.vibe(12);
     picker = "loc"; armed = -1; renderPlay(last);
   });
   $("sf-who").addEventListener("click", function () {
-    if (this.disabled) return;
+    if (this.disabled || A.gamePaused || A.transportBlocked) return;
     A.sfx("buzz"); A.vibe(12);
     picker = "spy"; armed = -1; renderPlay(last);
   });
   $("sf-in").addEventListener("click", function () {
+    if (A.gamePaused || A.transportBlocked) return;
     A.sfx("start"); A.vibe(20);
     send({ t: "agree", in: true });
   });
   $("sf-no").addEventListener("click", function () {
+    if (A.gamePaused || A.transportBlocked) return;
     A.sfx("buzz"); A.vibe(12);
     send({ t: "agree", in: false });
   });

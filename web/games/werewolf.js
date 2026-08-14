@@ -43,7 +43,7 @@
   function renderCount(m) {
     sub("count");
     stopBar();
-    A.countdown("ww-count-num", m.sec);
+    A.countdown("ww-count-num", m.remaining_ms, m.paused);
   }
 
   /* One row per player. pickable() decides which pids can be tapped and onPick()
@@ -57,9 +57,10 @@
       var row = document.createElement("div");
       var cls = "ww-row";
       if (!p.alive || !p.in) cls += " out";
+      if (p.online === false) cls += " offline";
       if (p.pid === m.you) cls += " self";
       var block = cfg.blocked && cfg.blocked(p);
-      var can = !block && cfg.pickable && cfg.pickable(p);
+      var can = !m.paused && !block && cfg.pickable && cfg.pickable(p);
       if (can) cls += " tap";
       if (block) cls += " barred";
       if (cfg.chosen === p.pid) cls += " chosen";
@@ -110,8 +111,7 @@
     $("ww-role").textContent = iam ? ROLE_ICON[iam] + " " + roleName(iam) : "";
     $("ww-counts").textContent = t("werewolf.counts", { v: m.villagersleft, w: m.wolvesleft });
 
-    noteDeadline(m.deadline, m.dur);
-    A.timebar("ww-bar", m.deadline, m.dur, false);
+    A.timebar("ww-bar", m.remaining_ms, m.duration_ms, m.paused, false);
 
     var banner = $("ww-banner"), note = $("ww-note"), check = $("ww-check");
     var wait = $("ww-wait");

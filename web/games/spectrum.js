@@ -98,7 +98,7 @@
   function renderCount(m) {
     sub("count");
     stopBar();
-    A.countdown("sp-count-num", m.sec);
+    A.countdown("sp-count-num", m.remaining_ms, m.paused);
   }
 
   var lastRound = -1, lastStage = "";
@@ -110,8 +110,7 @@
     $("sp-left").textContent = m.left || "";
     $("sp-right").textContent = m.right || "";
 
-    noteDeadline(m.deadline, m.dur);
-    A.timebar("sp-bar", m.deadline, m.dur, false);
+    A.timebar("sp-bar", m.remaining_ms, m.duration_ms, m.paused, false);
 
     var needle = $("sp-ndl"), dmarks = $("sp-dmarks");
     var clueForm = $("sp-clueform"), clue = $("sp-clue");
@@ -132,7 +131,11 @@
       guessGo.classList.add("hide");
       if (m.iam) {
         note.textContent = t("sp.give_clue");
-        if (lastRound !== m.round) { $("sp-cluein").value = ""; setTimeout(function () { $("sp-cluein").focus(); }, 60); }
+        $("sp-cluein").disabled = !!m.paused;
+        $("sp-cluego").disabled = !!m.paused;
+        if (lastRound !== m.round && !m.paused) {
+          $("sp-cluein").value = ""; setTimeout(function () { $("sp-cluein").focus(); }, 60);
+        }
       } else {
         note.textContent = t("sp.thinking", { nick: m.psychic });
       }
@@ -145,10 +148,10 @@
       } else {
         var locked = (typeof m.myguess === "number" && m.myguess >= 0);
         if (lastRound !== m.round || lastStage !== "guess") spGuess = locked ? m.myguess : 50;
-        spCanGuess = !locked;
+        spCanGuess = !locked && !m.paused;
         setNeedle(spGuess, false); // drag the dial to move it
         guessGo.classList.toggle("hide", locked);
-        guessGo.disabled = locked;
+        guessGo.disabled = locked || !!m.paused;
         note.textContent = locked ? t("sp.guess_locked", { n: m.myguess })
                                   : t("sp.drag");
       }
@@ -210,6 +213,7 @@
   window.addEventListener("pointerup", dragEnd);
   window.addEventListener("pointercancel", dragEnd);
   $("sp-cluego").addEventListener("click", function () {
+    if (A.inputsPaused()) return;
     var v = $("sp-cluein").value.trim();
     if (!v) return;
     A.sfx("start"); A.vibe(20);
@@ -219,6 +223,7 @@
     if (e.key === "Enter") $("sp-cluego").click();
   });
   $("sp-guessgo").addEventListener("click", function () {
+    if (A.inputsPaused()) return;
     A.sfx("buzz"); A.vibe(18);
     send({ t: "slide", n: spGuess });
     spCanGuess = false;

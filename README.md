@@ -26,7 +26,7 @@ reactions that float up on everyone's screen mid-game.
 **Whole-group** (scale to everyone in the room, ready-up lobby, shared live leaderboard):
 
 - **Trivia** — Kahoot-style and fully self-organizing. Players ready up and vote a topic
-  in the lobby; an all-ready 5-second countdown starts it; phones buzz in A/B/C/D with
+  in the lobby; an all-ready 3-second countdown starts it; phones buzz in A/B/C/D with
   points for correct and fast; a collapsible leaderboard rides along and a podium ends
   it. Topics are the trivia packs on the SD card.
 - **Would You Rather** — a live A/B poll; tap your pick, watch the split reveal. Prompts
@@ -201,6 +201,11 @@ the games stay in sync.
   CRC in its beacon and the Flipper skips the transfer when it already matches. Real-time
   game traffic stays on the ESP and never crosses the slow UART. Protocol:
   [docs/PROTOCOL.md](docs/PROTOCOL.md).
+- Timers use nested rollover-safe logical clocks. A normal phone disconnect reserves its
+  seat for exactly two minutes and pauses only an affected match or role-critical round;
+  planned AP downtime freezes the entire session. **Pause Hotspot** keeps the game intact,
+  and changing the SSID uses the same non-destructive pause/restart path with a ten-minute
+  return window. The host may resume early or stop the session explicitly.
 
 ## Install
 
@@ -310,6 +315,10 @@ On the Flipper: **Apps → GPIO → [ESP32] Hotspot Arcade**.
    up; the duels (Connect Four / Tic-Tac-Toe / Dots & Boxes / Reversi), **Drawing**, and
    **Pong** organize themselves too. The dashboard **Feed** watches events.
 5. **Leaderboard** shows live scores; **Console** shows the raw event log.
+6. Use **Pause Hotspot** for planned radio downtime, **Restart Hotspot** to bring it back,
+   and **Resume Now** if you do not want to wait for every expected phone. If the ten-minute
+   SSID-change window expires, the dashboard offers **Resume** / **End** directly and no late
+   reconnect can silently resume the game. **Stop Session** remains destructive.
 
 ## Content packs
 
