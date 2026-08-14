@@ -29,6 +29,14 @@ const hard = []; // { ok, label, detail }
 const soft = [];
 const H = (ok, label, detail = "") => hard.push({ ok, label, detail });
 const S = (ok, label, detail = "") => soft.push({ ok, label, detail });
+const crc32 = (b) => {
+  let c = 0xffffffff;
+  for(let i = 0; i < b.length; i++) {
+    c ^= b[i];
+    for(let k = 0; k < 8; k++) c = c & 1 ? (c >>> 1) ^ 0xedb88320 : c >>> 1;
+  }
+  return (c ^ 0xffffffff) >>> 0;
+};
 
 // ---- HARD: ha_proto.h consistency (the two headers must agree) ----
 const espProto = read("/esp32/hotspot-arcade-fw/ha_proto.h");
@@ -61,14 +69,6 @@ try {
   const committedManifest = JSON.parse(
     execSync("git show HEAD:web/dist/manifest.json", { cwd: REPO, encoding: "utf8" }));
   const route = committedManifest.find((a) => a.path === "/");
-  const crc32 = (b) => {
-    let c = 0xffffffff;
-    for(let i = 0; i < b.length; i++) {
-      c ^= b[i];
-      for(let k = 0; k < 8; k++) c = c & 1 ? (c >>> 1) ^ 0xedb88320 : c >>> 1;
-    }
-    return (c ^ 0xffffffff) >>> 0;
-  };
   const committedCrcOk = route && route.crc === crc32(committedGz);
   sh("node web/build.mjs"); // overwrites web/dist in the working tree
   const builtHtml = gunzipSync(readFileSync(REPO + "web/dist/index.html.gz")).toString();
@@ -91,19 +91,28 @@ H(bundleOk, "web/dist matches `node web/build.mjs` (decompressed)", bundleDetail
 // screen to route to and no handler for the game's state pushes, so phones just sat in
 // the lobby forever. Mirrors the build.yml "bundled-assets" job so it fails here first.
 let webAssetOk = false, webAssetDetail = "";
-// The two copies can differ only by line endings on a CRLF checkout; compare content.
-const lf = (s) => s.split("\r").join("");
 try {
-  const dist = gunzipSync(readFileSync(REPO + "/web/dist/index.html.gz")).toString();
-  const bundled = gunzipSync(
-    readFileSync(REPO + "/flipper/hotspot-arcade/assets/web/index.html.gz")).toString();
-  const manifestSame =
-    lf(read("/web/dist/manifest.json")) === lf(read("/flipper/hotspot-arcade/assets/web/manifest.json"));
-  webAssetOk = dist === bundled && manifestSame;
+  const distGz = readFileSync(REPO + "/web/dist/index.html.gz");
+  const bundledGz = readFileSync(REPO + "/flipper/hotspot-arcade/assets/web/index.html.gz");
+  const dist = gunzipSync(distGz).toString();
+  const bundled = gunzipSync(bundledGz).toString();
+  const distRoute = JSON.parse(read("/web/dist/manifest.json")).find((a) => a.path === "/");
+  const bundledRoute = JSON.parse(
+    read("/flipper/hotspot-arcade/assets/web/manifest.json")).find((a) => a.path === "/");
+  const routeContract = (a) => a && JSON.stringify({
+    path: a.path, file: a.file, mime: a.mime, gzip: a.gzip,
+  });
+  // pr-check rebuilds web/dist on the runner. Its gzip bytes/CRC may legitimately
+  // differ from the committed Flipper copy when Node links a different zlib. Require
+  // each manifest to describe its own gzip and compare the served HTML + route contract.
+  const manifestsValid = routeContract(distRoute) === routeContract(bundledRoute) &&
+    distRoute && distRoute.crc === crc32(distGz) &&
+    bundledRoute && bundledRoute.crc === crc32(bundledGz);
+  webAssetOk = dist === bundled && manifestsValid;
   webAssetDetail = webAssetOk ? "up to date"
     : dist !== bundled
       ? "assets/web/index.html.gz is stale — run `tools/build-fap.sh` (or copy web/dist/*.gz over) and commit"
-      : "assets/web/manifest.json is stale — run `tools/build-fap.sh` and commit";
+      : "a web manifest does not describe its gzip/route contract — rebuild and commit the matching pair";
 } catch (e) {
   webAssetDetail = "could not check the bundled web asset: " + e.message.split("\n")[0];
 }
