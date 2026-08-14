@@ -167,8 +167,8 @@ async function toNight(n) {
   skip(g);
   assert.equal(g.stage(), "night", "night falls");
   assert.equal(g.view[1].nokill, undefined, "eight players hunt on night one");
-  const nightDeadline = g.view[1].deadline;
-  assert.equal(g.view[1].dur, 60, "the night window is a fixed 60s");
+  const nightRemaining = g.view[1].remaining_ms;
+  assert.equal(g.view[1].duration_ms, 60000, "the night window is a fixed 60s");
   assert.equal(g.view[wolves[0]].owe, true, "a wolf owes an action");
   assert.equal(g.view[village.find((p) => g.role[p] === VILLAGER)].owe, false,
     "a plain villager owes nothing at night");
@@ -209,8 +209,8 @@ async function toNight(n) {
   // Every night actor has now acted -- and the night still runs its full length,
   // because a short night would tell the room how many specials are alive.
   assert.equal(g.stage(), "night", "the night does not end early");
-  assert.equal(g.view[1].deadline, nightDeadline, "and its deadline never moved");
-  g.tick(nightDeadline - 1000);
+  assert.equal(g.view[1].remaining_ms, nightRemaining, "and its remaining time never moved");
+  g.tick(g.ms + nightRemaining - 1000);
   assert.equal(g.stage(), "night", "still night a second before the deadline");
 
   skip(g);
@@ -229,7 +229,8 @@ async function toNight(n) {
   assert.equal(g.view[1].voters, 7, "seven still alive");
   assert.equal(g.view[1].needed, 4, "a hammer is a strict majority of them");
   assert.equal(g.view[1].waiting, 7, "nobody has voted yet");
-  assert.equal(g.view[1].dur, 60 + 20 * 7, "the day is 60s + 20s per living player");
+  assert.equal(g.view[1].duration_ms, (60 + 20 * 7) * 1000,
+    "the day is 60s + 20s per living player");
 
   const camp = g.living().filter((p) => p !== wolves[0] && p !== wolves[1]); // 5 villagers
   // Three votes each way with one abstention: a dead heat, and short of a hammer.
@@ -310,7 +311,7 @@ async function toNight(n) {
   const wolves = g.of(WOLF);
   const prey = g.living().find((p) => g.role[p] !== WOLF);
   for (const wolf of wolves) g.send(wolf, { t: "kill", n: prey });
-  g.tick(g.view[1].deadline);
+  g.tick(g.ms + g.view[1].remaining_ms);
   assert.equal(g.stage(), "dawn");
   const originalNick = NICKS[prey - 1];
   const originalRole = g.role[prey];
@@ -450,7 +451,7 @@ async function toNight(n) {
 for (const N of [4, 5, 6, 8]) {
   const e = await newEngine();
   e.reset();
-  e.selectGame(WW); // host first, exactly like SELECT_GAME arriving over UART
+  e.selectGame(WW); // packless compatibility helper performs the host transaction
   const g = mkGame(e, N);
   for (let i = 1; i <= N; i++) g.join(i, NICKS[i - 1]);
   assert.equal(g.view[1].phase, "lobby", `N=${N}: joins land in the lobby`);

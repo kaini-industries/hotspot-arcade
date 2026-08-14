@@ -11,8 +11,14 @@ var A = {
   view: "landing",     // landing | lobby | trivia | duel | draw | pong
   joined: false,       // true once the user committed a nick (Play) or is rejoining
   authenticated: false,
-  offset: 0,           // serverMillis - localNow, learned from first timed msg
-  offsetSet: false,
+  gamePaused: false,   // authoritative role/match pause; safe intents still work
+  transportBlocked: false, // planned AP downtime, including restore synchronization
+  transportPaused: false,
+  transportRestoring: false,
+  clockFrozen: false,  // freezes every local timer while planned transport is paused
+  clockFrozenAt: 0,
+  clockPauseStarted: 0,
+  clockPausedTotal: 0,
   retry: 0,
   takeover: false,     // displaced by a newer socket using the same resume token
   handlers: {},        // messageType -> fn(msg), filled by game modules
@@ -145,20 +151,37 @@ function syncWakeLock() {
    never yank someone off the landing screen before they pick a nickname. */
 function route(name) { if (A.joined) screen(name); }
 
-/* Cosmetic clock aligned to the server. deadline - serverNow() = ms remaining. */
-function serverNow() { return Date.now() + A.offset; }
-// The ESP sends deadlines in ms but window durations in seconds; normalise a
-// duration to ms so a bare seconds value (e.g. 20) and a ms value (20000) both work.
-A.durMs = function (dur) { return dur ? (dur < 1000 ? dur * 1000 : dur) : 0; };
-function noteDeadline(deadline, dur) {
-  // Estimate the offset once from the first timed message so the countdown
-  // matches the server. dur is the full window length (seconds or ms).
-  dur = A.durMs(dur);
-  if (!A.offsetSet && deadline && dur) {
-    A.offset = (deadline - dur) - Date.now();
-    A.offsetSet = true;
-  }
+/* Server times are relative snapshots, never ESP epochs. Advance them only with
+   the browser's monotonic clock so wall-clock corrections cannot jump a game.
+   Planned transport pause additionally freezes every snapshot at one instant. */
+function monotonicNow() { return performance.now(); }
+function boundedMs(value) {
+  return typeof value === "number" && isFinite(value) && value > 0
+    ? Math.floor(value) : 0;
 }
+function timerNow() {
+  return A.clockFrozen ? A.clockFrozenAt : monotonicNow() - A.clockPausedTotal;
+}
+A.timerSnapshot = function (remainingMs, durationMs, paused) {
+  var duration = boundedMs(durationMs);
+  var remaining = boundedMs(remainingMs);
+  if (!duration) remaining = 0;
+  else if (remaining > duration) remaining = duration;
+  return {
+    remaining: remaining,
+    duration: duration,
+    sampledAt: timerNow(),
+    paused: !!paused,
+  };
+};
+A.timerRemaining = function (snapshot) {
+  if (!snapshot) return 0;
+  if (snapshot.paused) return snapshot.remaining;
+  return Math.max(0, snapshot.remaining - Math.max(0, timerNow() - snapshot.sampledAt));
+};
+A.secondsRemaining = function (remainingMs) {
+  return Math.max(0, Math.ceil(boundedMs(remainingMs) / 1000));
+};
 
 var toastTimer;
 function toast(msg) {
@@ -284,12 +307,32 @@ A.packVote = function (cfg) {
   });
 };
 
-// Countdown number with a per-second tick + pop animation.
-A.countdown = function (numId, sec) {
+// Countdown number driven from a relative snapshot and the local monotonic clock.
+// Duplicate server pushes do not replay the cue for the same displayed second.
+A.countdown = function (numId, remainingMs, paused) {
   var n = $(numId);
-  n.textContent = sec;
-  A.sfx("tick"); A.vibe(10);
-  if (!noMotionPref()) { n.classList.remove("pop"); void n.offsetWidth; n.classList.add("pop"); }
+  if (n._haCount && n._haCount.timer) clearInterval(n._haCount.timer);
+  var st = {
+    snap: A.timerSnapshot(remainingMs, boundedMs(remainingMs), paused),
+    timer: null,
+    last: null,
+  };
+  n._haCount = st;
+  function paint() {
+    var sec = A.secondsRemaining(A.timerRemaining(st.snap));
+    if (sec !== st.last) {
+      st.last = sec;
+      n.textContent = sec;
+      if (!st.snap.paused && sec > 0 && n._haSoundSec !== sec) {
+        n._haSoundSec = sec;
+        A.sfx("tick"); A.vibe(10);
+        if (!noMotionPref()) { n.classList.remove("pop"); void n.offsetWidth; n.classList.add("pop"); }
+      }
+    }
+    if (!sec && st.timer) { clearInterval(st.timer); st.timer = null; }
+  }
+  paint();
+  if (!st.snap.paused && st.snap.remaining > 0) st.timer = setInterval(paint, 100);
 };
 
 // Final podium (avatar + rank + score). Returns the ranked list so the caller
@@ -311,38 +354,153 @@ A.podium = function (listId, board) {
   return b;
 };
 
-// Shared countdown timer bar (used by trivia + scramble). Per-bar state lives on
-// the element. `ticks` plays blips at 3/2/1s. Call A.timebarStop to freeze it.
-A.timebar = function (barId, deadline, dur, ticks) {
-  dur = A.durMs(dur);
+// Shared timer bar. Every update is a relative server snapshot; progression uses
+// performance.now(), while `paused` and planned transport downtime freeze it.
+A.timerBars = [];
+A.timebar = function (barId, remainingMs, durationMs, paused, ticks) {
   var bar = $(barId), fill = bar.firstElementChild;
+  if (A.timerBars.indexOf(bar) < 0) A.timerBars.push(bar);
   A.timebarStop(barId);
   show(barId);
-  var st = bar._ha || (bar._ha = { anim: null, ticks: [] });
-  var remain = deadline - serverNow();
-  bar.classList.remove("hot");
-  if (remain <= 0 || !dur) {
-    fill.style.transition = "none"; fill.style.transform = "scaleX(0)"; bar.classList.add("hot"); return;
-  }
-  var frac = Math.max(0, Math.min(1, remain / dur));
+  var st = {
+    snap: A.timerSnapshot(remainingMs, durationMs, paused),
+    timer: null,
+    previous: 0,
+    ticks: !!ticks,
+  };
+  st.previous = st.snap.remaining;
+  bar._ha = st;
   fill.style.transition = "none";
-  fill.style.transform = "scaleX(" + frac + ")";
-  requestAnimationFrame(function () {
-    fill.style.transition = "transform " + remain + "ms linear";
-    fill.style.transform = "scaleX(0)";
-  });
-  if (remain <= 3000) bar.classList.add("hot");
-  else st.anim = setTimeout(function () { bar.classList.add("hot"); }, remain - 3000);
-  if (ticks) [3000, 2000, 1000].forEach(function (t) {
-    if (remain > t) st.ticks.push(setTimeout(function () { A.sfx("tick"); }, remain - t));
-  });
+  function paint() {
+    var remain = A.timerRemaining(st.snap);
+    var duration = st.snap.duration;
+    var frac = duration ? Math.max(0, Math.min(1, remain / duration)) : 0;
+    fill.style.transform = "scaleX(" + frac + ")";
+    bar.classList.toggle("hot", remain <= 3000);
+    bar.classList.toggle("paused", st.snap.paused || A.clockFrozen);
+    if (st.ticks) [3000, 2000, 1000].forEach(function (at) {
+      if (st.previous > at && remain <= at) A.sfx("tick");
+    });
+    st.previous = remain;
+    if (remain <= 0 && st.timer) { clearInterval(st.timer); st.timer = null; }
+  }
+  st.paint = paint;
+  paint();
+  if (!st.snap.paused && st.snap.remaining > 0) st.timer = setInterval(paint, 100);
 };
 A.timebarStop = function (barId) {
   var bar = $(barId), st = bar._ha;
-  if (st) { if (st.anim) { clearTimeout(st.anim); st.anim = null; } st.ticks.forEach(clearTimeout); st.ticks = []; }
+  if (st && st.timer) { clearInterval(st.timer); st.timer = null; }
+  bar._ha = null;
 };
 
+var AUTHORITATIVE_TYPES = {
+  lobby: 1, trivia: 1, duel: 1, draw: 1, pong: 1, wyr: 1,
+  scramble: 1, react: 1, gc: 1, bs: 1, spectrum: 1, kmk: 1,
+  chess: 1, secrets: 1, fillblank: 1, werewolf: 1, spyfall: 1, frankendraw: 1,
+};
+function authoritativeState(m) {
+  return !!(m && AUTHORITATIVE_TYPES[m.t] && (m.t !== "pong" || m.phase));
+}
+
+function setLocalClockFrozen(on) {
+  if (on === A.clockFrozen) return;
+  var now = monotonicNow();
+  if (on) {
+    A.clockFrozenAt = now - A.clockPausedTotal;
+    A.clockPauseStarted = now;
+    A.clockFrozen = true;
+  } else {
+    A.clockPausedTotal += Math.max(0, now - A.clockPauseStarted);
+    A.clockFrozen = false;
+  }
+  A.timerBars.forEach(function (bar) {
+    if (bar._ha && bar._ha.paint) bar._ha.paint();
+  });
+}
+
+function paintTransport() {
+  if (!A.transportBlocked) return;
+  var title = $("transport-title"), body = $("transport-body");
+  var ssid = $("transport-ssid"), hint = $("transport-hint");
+  if (A.transportRestoring) {
+    title.textContent = t("transport.restoring_title");
+    body.textContent = t("transport.restoring");
+    ssid.textContent = "";
+    ssid.classList.add("hide");
+    hint.textContent = "";
+    hint.classList.add("hide");
+    return;
+  }
+  title.textContent = t("transport.title");
+  body.textContent = A.transportReason === "ssid_change"
+    ? t("transport.ssid_change") : t("transport.ap_off");
+  if (A.transportSsid) {
+    ssid.textContent = t("transport.ssid", { ssid: A.transportSsid });
+    ssid.classList.remove("hide");
+  } else {
+    ssid.textContent = "";
+    ssid.classList.add("hide");
+  }
+  hint.textContent = A.transportReconnectMs
+    ? t("transport.timed", { minutes: Math.max(1, Math.ceil(A.transportReconnectMs / 60000)) })
+    : t("transport.indefinite");
+  hint.classList.remove("hide");
+}
+A.paintTransport = paintTransport;
+
+function transportPause(m) {
+  A.transportBlocked = true;
+  A.transportPaused = true;
+  A.transportRestoring = false;
+  A.transportReason = m.reason || "ap_off";
+  A.transportSsid = m.ssid || "";
+  A.transportReconnectMs = boundedMs(m.reconnect_ms);
+  setLocalClockFrozen(true);
+  hide("netbar");
+  hide("captive");
+  paintTransport();
+  show("transport");
+}
+
+function transportResume() {
+  if (!A.transportBlocked) return;
+  A.transportPaused = false;
+  A.transportRestoring = true;
+  paintTransport();
+  show("transport");
+}
+
+function finishTransportRestore() {
+  setLocalClockFrozen(false);
+  A.transportBlocked = false;
+  A.transportPaused = false;
+  A.transportRestoring = false;
+  A.transportReason = "";
+  A.transportSsid = "";
+  A.transportReconnectMs = 0;
+  hide("transport");
+}
+
+A.setGamePaused = function (paused) {
+  A.gamePaused = !!paused;
+  if (document.body) document.body.classList.toggle("game-paused", A.gamePaused);
+  $("game-pause").classList.toggle("hide", !A.gamePaused);
+};
+
+var TRANSPORT_SAFE_INTENTS = { hello: 1, ping: 1 };
+var GAME_PAUSE_SAFE_INTENTS = {
+  hello: 1, ping: 1, say: 1, react: 1, leaveGame: 1, resign: 1,
+};
+function inputBlocked(obj) {
+  if (!obj) return false;
+  if (A.transportBlocked) return !TRANSPORT_SAFE_INTENTS[obj.t];
+  return !!(A.gamePaused && !GAME_PAUSE_SAFE_INTENTS[obj.t]);
+}
+A.inputsPaused = function () { return A.transportBlocked || A.gamePaused; };
+
 function send(obj) {
+  if (inputBlocked(obj)) return;
   if (A.ws && A.ws.readyState === 1) A.ws.send(JSON.stringify(obj));
 }
 function sendHello() {
@@ -460,10 +618,10 @@ function closeAndReconnect(ws) {
 // so the old "a reconnect ate the vote overlay" behaviour cannot recur.
 function startLiveness() {
   stopLiveness();
-  lastRx = Date.now();
+  lastRx = monotonicNow();
   liveTimer = setInterval(function () {
     if (!A.ws || A.ws.readyState !== 1) return;
-    var quiet = Date.now() - lastRx;
+    var quiet = monotonicNow() - lastRx;
     if (quiet > DEAD_MS) {
       stopLiveness();
       closeAndReconnect(A.ws);
@@ -472,7 +630,9 @@ function startLiveness() {
     if (quiet > WARN_MS && !warned) {
       warned = true;
       setDot("warn");
-      if (A.view !== "landing") { $("netbar").textContent = t("net.quiet"); show("netbar"); }
+      if (!A.transportBlocked && A.view !== "landing") {
+        $("netbar").textContent = t("net.quiet"); show("netbar");
+      }
     } else if (quiet <= WARN_MS && warned) {
       warned = false;                       // it answered again
       setDot("");
@@ -506,7 +666,7 @@ function connect() {
 
   ws.onmessage = function (ev) {
     var m;
-    lastRx = Date.now();   // any frame proves the link is alive (see startLiveness)
+    lastRx = monotonicNow(); // any frame proves the link is alive (see startLiveness)
     try { m = JSON.parse(ev.data); } catch (e) { return; }
     dispatch(m);
   };
@@ -518,6 +678,7 @@ function connect() {
     A.ws = null;
     A.authenticated = false;
     if (ev && ev.code === 1008 && ev.reason === "identity takeover") {
+      if (A.transportBlocked) finishTransportRestore();
       A.takeover = true;
       setDot("bad");
       $("netbar").textContent = t("net.identity_takeover");
@@ -536,10 +697,10 @@ function connect() {
 function scheduleReconnect() {
   if (A.takeover) return;
   setDot(A.retry > 4 ? "bad" : "warn");   // down after repeated failures
-  if (A.view !== "landing") {
+  if (!A.transportBlocked && A.view !== "landing") {
     $("netbar").textContent = t("net.reconnecting");
     show("netbar");
-  }
+  } else if (A.transportBlocked) hide("netbar");
   var wait = Math.min(1000 * Math.pow(1.6, A.retry), 8000);
   A.retry++;
   maybeCaptive();
@@ -560,24 +721,17 @@ function captiveEligible() {
 }
 function maybeCaptive() {
   // A couple of failed reconnects in a captive context means the socket won't hold.
-  if (!captiveEligible() || A.retry < 2 || A.retry < captiveSnoozeUntil) return;
+  if (A.transportBlocked || !captiveEligible() || A.retry < 2 || A.retry < captiveSnoozeUntil) return;
   show("captive");
 }
 
 /* Core message routing. Game-specific messages hand off to registered
    handlers so the modules stay self-contained. */
 function dispatch(m) {
-  // Do NOT retire the vote overlay from here. Two attempts at that shipped broken: closing on
-  // anything that was not "gamevote" let the 2s keepalive's {t:"pong"} dismiss the prompt
-  // before it could be read, and closing on "the first real state push" made the prompt never
-  // appear on the other phones at all. Both were fixing a symptom of something else entirely
-  // (a duplicate SCREENS block that stopped the client from starting).
-  //
-  // The engine already makes this unnecessary: while a proposal is open it sends ONLY the vote
-  // (pushAll() returns early when _gvActive), so no game state can arrive mid-vote. Both
-  // outcomes then go through pushAll()'s normal path, which leads with lobbyJson() -- so
-  // onLobby() sees every resolution, approved or rejected. That is the one place that closes it.
   notePlayerCount(m);   // the switcher greys out on the CURRENT count, not the last lobby's
+  var isState = authoritativeState(m);
+  var finishesRestore = isState && A.transportRestoring;
+  if (isState) A.setGamePaused(m.paused === true);
   switch (m.t) {
     case "welcome":
       A.authenticated = true;
@@ -585,6 +739,9 @@ function dispatch(m) {
       if ($("join-code")) $("join-code").value = "";
       A.pid = m.pid;
       if (A.setLang) A.setLang(m.lang); // host-chosen UI language; localizes static text
+      // A reconnect can miss server_resume while the AP is down. Treat welcome as
+      // a restore attempt; a still-paused host immediately sends server_pause again.
+      if (A.transportBlocked) transportResume();
       if (m.avatar) A.avatar = m.avatar;
       if (m.nick) {
         A.nick = m.nick;
@@ -599,8 +756,31 @@ function dispatch(m) {
         } catch (e) {}
       }
       break;
+    case "config":
+      if (A.setLang) A.setLang(m.lang);
+      paintTransport();
+      break;
+    case "server_pause":
+      transportPause(m);
+      break;
+    case "server_resume":
+      transportResume();
+      // A first-time player rejected while paused has no authoritative state to
+      // receive yet. Retry the retained hello/code so welcome+state can complete
+      // the same restoring sequence without another tap.
+      if (A.transportBlocked && !A.authenticated && A.joined) sendHello();
+      break;
+    case "result":
+      if (m.event === "game_change" && m.status === "policy_denied")
+        toast(t("gamevote.host_only"));
+      break;
     case "reject":
       A.authenticated = false;
+      if (m.code === "server_paused") {
+        transportPause({ reason: "ap_off", reconnect_ms: m.retry_ms });
+        break;
+      }
+      if (A.transportBlocked) finishTransportRestore();
       A.joined = false;
       screen("landing");
       if ($("join-code")) $("join-code").focus();
@@ -629,6 +809,9 @@ function dispatch(m) {
     default:
       if (A.handlers[m.t]) A.handlers[m.t](m);
   }
+  // Keep the blocking Restoring overlay and frozen clock through the complete
+  // authoritative render. Only this state proves the browser is synchronized.
+  if (finishesRestore) finishTransportRestore();
 }
 
 /* Look up a player's nick from the last lobby snapshot. */
@@ -696,8 +879,7 @@ A.lobbyView = lobbyView;
    game view; a game message can also switch us in (see game modules). */
 function onLobby(m) {
   if (m.me) A.pid = m.me;
-  // A lobby push only arrives when no game-change vote is pending, so its arrival means
-  // any vote has resolved (approved -> new game, or rejected -> resumed): close the modal.
+  // Retire a legacy vote overlay if this client reconnects to an older server.
   if (A.closeGamevote) A.closeGamevote();
   var prevCount = (A.players || []).length;
   A.players = m.players || [];   // kept for the duel/pong challenge lists
@@ -960,8 +1142,8 @@ function openGameMenu() {
     if (name === A.curGame) return;   // the active game isn't a switch target
     list.appendChild(gameMenuItem(name, GAME_LABEL[name]));
   });
-  // Leaving the current game is a change like any other, so it votes too. Nothing to
-  // propose when we're already in the plain lobby -- the engine would refuse it.
+  // Leaving the current game is also a host-policy request. Nothing to request when
+  // already in the plain lobby.
   if (A.curGame !== "none") {
     var sep = document.createElement("div");
     sep.className = "game-sep";
@@ -1041,7 +1223,7 @@ function initApp() {
   $("game-overlay").addEventListener("click", function (e) {
     if (e.target === $("game-overlay")) closeGameMenu();
   });
-  // Change-game vote: OK / No buttons emit voteGame; the ESP tallies and resolves.
+  // Legacy vote overlay controls remain for compatibility with pre-v21 firmware.
   $("gamevote-yes").addEventListener("click", function () {
     A.sfx("buzz"); A.vibe(15);
     send({ t: "voteGame", ok: true });
@@ -1125,6 +1307,9 @@ if (typeof globalThis !== "undefined" && globalThis.__HA_TEST__) {
     connect: connect,
     createResumeToken: createResumeToken,
     lobbyView: lobbyView,
+    send: send,
+    inputBlocked: inputBlocked,
+    authoritativeState: authoritativeState,
   };
 }
 document.addEventListener("DOMContentLoaded", initApp);

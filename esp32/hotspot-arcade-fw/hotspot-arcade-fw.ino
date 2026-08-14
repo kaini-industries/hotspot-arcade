@@ -33,6 +33,10 @@ static char joinCode[7] = ""; // optional here; the Cardputer host always config
 static char knownIdentities[32][HA_IDENTITY_LEN + 1] = {};
 static uint8_t knownIdentityCount = 0;
 static bool portalRunning = false;
+static bool networkSuspendPending = false;
+static uint32_t networkSuspendAt = 0;
+static char previousApName[33] = "Hotspot Arcade";
+static char pendingApName[33] = "";
 static uint8_t apMaxConn = AP_MAX_CONN;
 static bool fsReady = false; // LittleFS mounted (bundle store)
 
@@ -202,6 +206,46 @@ static void uartStatus(const char* token) {
     uartSend(HA_MSG_STATUS, (const uint8_t*)token, strlen(token));
 }
 
+static void uartContentStatus(const char* kind, uint8_t game) {
+    char token[40];
+    snprintf(token, sizeof(token), "%s game=%u", kind, (unsigned)game);
+    uartStatus(token);
+}
+
+static void uartTransportState() {
+    uint8_t reason;
+    uint16_t expected, online;
+    uint32_t reconnectMs;
+    bool paused, portalLive, suspendPending;
+    ENGINE_LOCK();
+    paused = engine.transportPaused();
+    reason = engine.transportReason();
+    expected = engine.transportExpectedMask();
+    online = engine.transportOnlineExpectedMask();
+    reconnectMs = engine.transportReconnectMs();
+    portalLive = portalRunning;
+    suspendPending = networkSuspendPending;
+    ENGINE_UNLOCK();
+    // A portal scheduled to go down is not resume-ready even though the sockets are
+    // deliberately left alive for the 200 ms server_pause flush window. Reporting it
+    // ready here would let the host immediately undo the pause before shutdown.
+    bool networkReady = portalLive && !suspendPending;
+    uint8_t p[10] = {
+        (uint8_t)((paused ? 0x01 : 0) | (networkReady ? 0x02 : 0) |
+                  (expected == online ? 0x04 : 0) | (portalLive ? 0x08 : 0)),
+        reason,
+        (uint8_t)(expected & 0xFF),
+        (uint8_t)(expected >> 8),
+        (uint8_t)(online & 0xFF),
+        (uint8_t)(online >> 8),
+        (uint8_t)(reconnectMs & 0xFF),
+        (uint8_t)((reconnectMs >> 8) & 0xFF),
+        (uint8_t)((reconnectMs >> 16) & 0xFF),
+        (uint8_t)((reconnectMs >> 24) & 0xFF),
+    };
+    uartSend(HA_MSG_TRANSPORT_STATE, p, sizeof(p));
+}
+
 // ---------------- sinks used by the engine ----------------
 
 void haWsSendWs(uint32_t wsId, const String& msg) {
@@ -213,6 +257,21 @@ void haWsCloseWs(uint32_t wsId) {
 }
 void haWsBroadcast(const String& msg) {
     ws.textAll(msg);
+}
+void* haContentAlloc(size_t bytes) {
+    void* memory = ps_malloc(bytes);
+    return memory ? memory : malloc(bytes);
+}
+void haContentFree(void* memory) {
+    free(memory);
+}
+bool haContentAllocationAllowed() {
+    return true;
+}
+bool haPhoneGameChangeAllowed(uint8_t fromGame, uint8_t toGame) {
+    (void)fromGame;
+    (void)toGame;
+    return false; // no loop-task/SD request queue exists in this adapter yet
 }
 static bool identityKnown(const char* identity) {
     if(!identity || strlen(identity) != HA_IDENTITY_LEN) return false;
@@ -267,11 +326,24 @@ void haUartScore(uint8_t pid, int delta, const char* reason) {
     memcpy(buf + 3, reason, n);
     uartSend(HA_MSG_SCORE, buf, 3 + n);
 }
-void haUartEvent(const String& json) {
-    uartSend(HA_MSG_EVENT, (const uint8_t*)json.c_str(), json.length());
-}
-void haUartRoundResult(const String& json) {
-    uartSend(HA_MSG_ROUND_RESULT, (const uint8_t*)json.c_str(), json.length());
+void haUartHostEvent(
+    uint8_t kind,
+    uint8_t game,
+    uint8_t actor,
+    uint8_t target,
+    int16_t value,
+    const char* text) {
+    uint8_t buf[HA_HOST_EVENT_HEADER_SIZE + HA_HOST_EVENT_TEXT_MAX];
+    buf[0] = HA_HOST_EVENT_VERSION;
+    buf[1] = kind;
+    buf[2] = game;
+    buf[3] = actor;
+    buf[4] = target;
+    buf[5] = (uint8_t)((uint16_t)value & 0xFF);
+    buf[6] = (uint8_t)(((uint16_t)value >> 8) & 0xFF);
+    size_t n = text ? strnlen(text, HA_HOST_EVENT_TEXT_MAX) : 0;
+    if(n) memcpy(buf + HA_HOST_EVENT_HEADER_SIZE, text, n);
+    uartSend(HA_MSG_EVENT, buf, HA_HOST_EVENT_HEADER_SIZE + n);
 }
 // Finished artwork (Frankendraw). One frame per call -- a sheet header, a single line
 // segment, or the end marker -- so a whole drawing streams to the Flipper a segment at
@@ -373,9 +445,12 @@ static void onWsEvent(
     size_t len) {
     (void)srv;
     if(type == WS_EVT_DISCONNECT) {
+        bool reportTransport;
         ENGINE_LOCK();
         engine.onWsDisconnect(client->id(), millis());
+        reportTransport = engine.transportPaused();
         ENGINE_UNLOCK();
+        if(reportTransport) uartTransportState();
     } else if(type == WS_EVT_DATA) {
         AwsFrameInfo* info = (AwsFrameInfo*)arg;
         if(info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT &&
@@ -383,9 +458,19 @@ static void onWsEvent(
             char buf[WS_MSG_MAX];
             memcpy(buf, data, len);
             buf[len] = '\0';
+            bool accepted = false;
+            bool reportTransport = false;
             ENGINE_LOCK();
-            engine.onInput(client->id(), buf, millis());
+            // Check lifecycle under the same mutex as onInput and the PAUSE write.
+            // A callback that parsed before shutdown but waited for this lock cannot
+            // reattach its old socket after detachTransportSockets() has run.
+            if(!networkSuspendPending && portalRunning) {
+                engine.onInput(client->id(), buf, millis());
+                reportTransport = engine.transportPaused();
+                accepted = true;
+            }
             ENGINE_UNLOCK();
+            if(accepted && reportTransport) uartTransportState();
         }
     }
 }
@@ -409,34 +494,64 @@ static void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
         leaseForget(info.wifi_ap_stadisconnected.mac);
 }
 
-static void startPortal() {
+static bool startPortal() {
+    if(portalRunning) {
+        uartStatus("ap_already");
+        String up = String("up ip=") + WiFi.softAPIP().toString();
+        uartStatus(up.c_str());
+        uartTransportState();
+        return true;
+    }
     leasesClear(); // a fresh session leases fresh addresses
     WiFi.mode(WIFI_AP);
-    WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-    WiFi.softAP(apName, nullptr, 1, 0, apMaxConn); // open AP, up to apMaxConn stations
+    if(!WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0)) ||
+       !WiFi.softAP(apName, nullptr, 1, 0, apMaxConn)) {
+        WiFi.softAPdisconnect(true);
+        uartStatus("ap_error");
+        return false;
+    }
     delay(100);
     uartStatus("ap_ok");
 
-    dnsServer.start(53, "*", apIP);
-    ws.onEvent(onWsEvent);
-    server.addHandler(&ws);
-    server.addHandler(new ArcadeHandler()).setFilter(ON_AP_FILTER);
-    server.begin();
+    if(!dnsServer.start(53, "*", apIP)) {
+        WiFi.softAPdisconnect(true);
+        uartStatus("dns_error");
+        return false;
+    }
+    // Publish the lifecycle bit under the mutex used by onWsEvent, before the listener
+    // becomes reachable, so a racing first hello is accepted atomically.
+    ENGINE_LOCK();
     portalRunning = true;
+    ENGINE_UNLOCK();
+    server.begin();
 
     String up = String("up ip=") + WiFi.softAPIP().toString();
     uartStatus(up.c_str());
+    uartTransportState();
+    return true;
 }
 
-static void stopPortal() {
+static void suspendPortalNetwork() {
     if(portalRunning) {
+        // closeAll() only queues the WebSocket close handshake.  Detach the engine's
+        // live socket ids first, while its planned expected-mask remains intact, so
+        // startPortal() can never publish a stale all-returned transport snapshot.
+        ENGINE_LOCK();
+        engine.detachTransportSockets(millis());
+        portalRunning = false;
+        ENGINE_UNLOCK();
         ws.closeAll();
         server.end();
         dnsServer.stop();
         WiFi.softAPdisconnect(true);
-        portalRunning = false;
     }
     leasesClear();
+    uartStatus("network_suspended");
+    uartTransportState();
+}
+
+static void stopPortal() {
+    suspendPortalNetwork();
     // Admission memory is session-scoped. A player known to the old party must
     // present the next party's join code after a host stop/new-session cycle.
     ENGINE_LOCK();
@@ -455,6 +570,9 @@ static uint8_t rxType = 0;
 static uint16_t rxLen = 0, rxIdx = 0;
 static uint8_t rxCrc = 0;
 static uint8_t rxBuf[HA_MAX_PAYLOAD + 1];
+// Target of the current serialized host content transaction. It survives a failed
+// BEGIN/staging bank so the one terminal COMMIT result still carries the requested id.
+static uint8_t contentRequestGame = 0xFF;
 
 // FILE_BEGIN payload: flags(1) pathlen(1) path mimelen(1) mime total(4 LE)
 static void handleFileBegin(const uint8_t* p, size_t len) {
@@ -505,7 +623,19 @@ static void dispatchFrame() {
         uartStatus("ap_set");
         break;
     case HA_MSG_START:
-        startPortal();
+        if(!startPortal() && pendingApName[0]) {
+            strlcpy(apName, previousApName, sizeof(apName));
+            pendingApName[0] = '\0';
+            // The first pause notice correctly named the requested SSID. From this
+            // point onward the proven fallback is authoritative, so resumed phones
+            // must not be sent back toward the AP that just failed.
+            ENGINE_LOCK();
+            (void)engine.replacePausedTransportSsid(apName);
+            ENGINE_UNLOCK();
+            uartStatus("ap_fallback");
+            (void)startPortal();
+        }
+        if(portalRunning) pendingApName[0] = '\0';
         break;
     case HA_MSG_STOP:
         stopPortal();
@@ -516,37 +646,167 @@ static void dispatchFrame() {
         ESP.restart();
         break;
     case HA_MSG_SELECT_GAME:
-        if(rxLen >= 1) {
+        // v21 selection is inseparable from its content transaction. Silently
+        // selecting here could expose a zero-pack lobby, so old hosts get an
+        // explicit failure and leave the live game untouched.
+        uartStatus("select_deprecated");
+        break;
+    case HA_MSG_CONTENT_BEGIN: {
+        bool ok = false;
+        uint8_t target = rxLen ? rxBuf[0] : 0xFF;
+        contentRequestGame = target;
+        if(rxLen >= 1 && rxLen <= 8) {
+            char lang[8];
+            size_t n = rxLen - 1;
+            memcpy(lang, rxBuf + 1, n);
+            lang[n] = '\0';
             ENGINE_LOCK();
-            engine.selectGame(rxBuf[0]);
+            ok = engine.contentBegin(rxBuf[0], lang);
+            ENGINE_UNLOCK();
+        } else {
+            // Any BEGIN frame supersedes staging. A malformed one must not leave
+            // an older transaction available to an unrelated later COMMIT.
+            ENGINE_LOCK();
+            engine.contentAbort();
             ENGINE_UNLOCK();
         }
+        // BEGIN/PACK/ITEM diagnostics are deliberately nonterminal. Only COMMIT
+        // emits content_ok/content_error, so a delayed intermediate failure cannot
+        // cancel a later same-game retry on the host.
+        uartContentStatus(ok ? "content_begin" : "content_invalid", target);
         break;
-    case HA_MSG_CONTENT_CLEAR:
-        ENGINE_LOCK();
-        engine.contentClear();
-        ENGINE_UNLOCK();
-        break;
+    }
     case HA_MSG_CONTENT_PACK:
         // payload: game byte, then the pack name (not NUL-terminated on the wire).
-        if(rxLen >= 2) {
+        if(rxLen >= 2 && rxLen <= 64) {
             char name[64];
-            size_t n = rxLen - 1 < sizeof(name) - 1 ? (size_t)(rxLen - 1) : sizeof(name) - 1;
+            size_t n = rxLen - 1;
             memcpy(name, rxBuf + 1, n);
             name[n] = '\0';
+            bool ok;
             ENGINE_LOCK();
-            engine.contentPack(rxBuf[0], name);
+            ok = engine.contentPack(rxBuf[0], name);
             ENGINE_UNLOCK();
+            if(!ok) uartContentStatus("content_invalid", contentRequestGame);
+        } else {
+            // Poison an existing stage as well as reporting the malformed frame;
+            // truncating an overlong name could otherwise commit different content
+            // than the host counted and displayed.
+            ENGINE_LOCK();
+            engine.contentPack(rxLen ? rxBuf[0] : 0, "");
+            ENGINE_UNLOCK();
+            uartContentStatus("content_invalid", contentRequestGame);
         }
         break;
-    case HA_MSG_CONTENT_ITEM:
+    case HA_MSG_CONTENT_ITEM: {
+        bool ok;
         ENGINE_LOCK();
-        engine.contentItem((const char*)rxBuf);
+        ok = engine.contentItem((const char*)rxBuf);
         ENGINE_UNLOCK();
+        if(!ok) uartContentStatus("content_invalid", contentRequestGame);
         break;
+    }
+    case HA_MSG_CONTENT_COMMIT: {
+        bool ok = false;
+        uint8_t target = contentRequestGame;
+        if(rxLen == 4) {
+            uint16_t packs = (uint16_t)rxBuf[0] | ((uint16_t)rxBuf[1] << 8);
+            uint16_t items = (uint16_t)rxBuf[2] | ((uint16_t)rxBuf[3] << 8);
+            ENGINE_LOCK();
+            ok = engine.contentCommit(packs, items, millis());
+            ENGINE_UNLOCK();
+        } else {
+            // A malformed commit terminates the transaction; retaining its stage
+            // could let an unrelated later COMMIT publish stale content.
+            ENGINE_LOCK();
+            engine.contentAbort();
+            ENGINE_UNLOCK();
+        }
+        if(ok) {
+            // Include the committed id so delayed/back-to-back host requests cannot
+            // misassociate an acknowledgement with a newer pending selection.
+            uartContentStatus("content_ok", target);
+        } else {
+            uartContentStatus("content_error", target);
+        }
+        contentRequestGame = 0xFF;
+        break;
+    }
+    case HA_MSG_CONTENT_ABORT:
+        ENGINE_LOCK();
+        engine.contentAbort();
+        ENGINE_UNLOCK();
+        contentRequestGame = 0xFF;
+        uartStatus("content_abort");
+        break;
+    case HA_MSG_TRANSPORT_PAUSE: {
+        HaTransportResult result = HA_TRANSPORT_BAD_ARGUMENT;
+        if(ha_json_flat_object_valid((const char*)rxBuf)) {
+            char reasonText[16] = "", ssid[33] = "";
+            int reconnect = -1;
+            bool haveReason = ha_json_str((const char*)rxBuf, "reason", reasonText, sizeof(reasonText));
+            const char* ssidValue = ha_json_find((const char*)rxBuf, "ssid");
+            bool haveSsid = !ssidValue || ha_json_str((const char*)rxBuf, "ssid", ssid, sizeof(ssid));
+            bool haveReconnect = ha_json_int((const char*)rxBuf, "reconnect_ms", &reconnect);
+            HaTransportReason reason = strcmp(reasonText, "ssid_change") == 0
+                                           ? HA_TRANSPORT_SSID_CHANGE
+                                           : HA_TRANSPORT_AP_OFF;
+            bool validReason = haveReason &&
+                               (strcmp(reasonText, "ssid_change") == 0 ||
+                                strcmp(reasonText, "ap_off") == 0);
+            if(validReason && haveSsid && haveReconnect && reconnect >= 0 && reconnect <= 600000 &&
+               (reason != HA_TRANSPORT_SSID_CHANGE || ssid[0])) {
+                ENGINE_LOCK();
+                result = engine.pauseTransport(reason, ssid, (uint32_t)reconnect, millis());
+                if(result == HA_TRANSPORT_OK) {
+                    // Publish non-ready before releasing the same mutex used by WS
+                    // callbacks. A ping racing this command can therefore never emit
+                    // a paused-but-ready snapshot in the gap before shutdown is armed.
+                    networkSuspendPending = portalRunning;
+                    networkSuspendAt = millis() + 200;
+                }
+                ENGINE_UNLOCK();
+                if(result == HA_TRANSPORT_OK) {
+                    strlcpy(previousApName, apName, sizeof(previousApName));
+                    if(reason == HA_TRANSPORT_SSID_CHANGE) {
+                        strlcpy(pendingApName, ssid, sizeof(pendingApName));
+                        strlcpy(apName, ssid, sizeof(apName));
+                    } else {
+                        pendingApName[0] = '\0';
+                    }
+                }
+            }
+        }
+        uartStatus(result == HA_TRANSPORT_OK ? "transport_pausing" :
+                   result == HA_TRANSPORT_ALREADY ? "transport_already" :
+                   result == HA_TRANSPORT_CONFLICT ? "transport_conflict" :
+                                                     "transport_error");
+        uartTransportState();
+        break;
+    }
+    case HA_MSG_TRANSPORT_RESUME: {
+        HaTransportResult result = HA_TRANSPORT_CONFLICT;
+        bool validPayload = rxLen == 0 ||
+                            (rxLen == 1 &&
+                             (rxBuf[0] & ~HA_TRANSPORT_RESUME_EXPIRE_MISSING) == 0);
+        bool expireMissing = rxLen == 1 &&
+                             (rxBuf[0] & HA_TRANSPORT_RESUME_EXPIRE_MISSING) != 0;
+        // Do not accept resume during the pre-shutdown flush window. The host must wait
+        // for a genuine post-restart transport snapshot with network-ready set.
+        if(validPayload && portalRunning && !networkSuspendPending) {
+            ENGINE_LOCK();
+            result = engine.resumeTransport(millis(), expireMissing);
+            ENGINE_UNLOCK();
+        }
+        uartStatus(result == HA_TRANSPORT_OK ? "transport_resumed" :
+                   result == HA_TRANSPORT_NOT_PAUSED ? "transport_not_paused" :
+                                                      "transport_network_down");
+        uartTransportState();
+        break;
+    }
     case HA_MSG_ROUND_END:
         ENGINE_LOCK();
-        engine.roundEnd();
+        engine.roundEnd(millis());
         ENGINE_UNLOCK();
         break;
     case HA_MSG_CONFIG: {
@@ -564,13 +824,12 @@ static void dispatchFrame() {
         int v;
         if(ha_json_int(configJson, "max", &v) && v >= 1 && v <= HA_MAX_PLAYERS)
             apMaxConn = (uint8_t)v;
-        char lang[8];
-        bool hasLang = ha_json_str(configJson, "lang", lang, sizeof(lang));
         // The async WebSocket path reads admission state only while holding the
-        // engine mutex. Update the code and locale in that same synchronization
-        // domain so a hello cannot race a partial CONFIG transition.
+        // engine mutex. Update admission state in that same synchronization
+        // domain so a hello cannot race a partial CONFIG transition. Locale is
+        // committed transactionally with the selected content bank and CONFIG
+        // cannot change it ahead of a content commit that may fail.
         ENGINE_LOCK();
-        if(hasLang) engine.setLang(lang);
         if(codeValue) strlcpy(joinCode, code, sizeof(joinCode));
         ENGINE_UNLOCK();
         break;
@@ -659,6 +918,9 @@ void setup() {
     engineMutex = xSemaphoreCreateRecursiveMutex();
     WiFi.onEvent(onWiFiEvent, ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED);
     WiFi.onEvent(onWiFiEvent, ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
+    ws.onEvent(onWsEvent);
+    server.addHandler(&ws);
+    server.addHandler(new ArcadeHandler()).setFilter(ON_AP_FILTER);
     Serial.setRxBufferSize(4096);
     Serial.begin(HA_UART_BAUD);
     delay(100);
@@ -675,8 +937,16 @@ void loop() {
     if(portalRunning) {
         dnsServer.processNextRequest();
         ws.cleanupClients();
+    }
+    ENGINE_LOCK();
+    engine.tick(millis());
+    ENGINE_UNLOCK();
+    if(networkSuspendPending && (int32_t)(millis() - networkSuspendAt) >= 0) {
+        // Keep pending asserted while closeAll invokes disconnect callbacks; their
+        // transport snapshots must not briefly advertise resume-ready mid-shutdown.
+        suspendPortalNetwork();
         ENGINE_LOCK();
-        engine.tick(millis());
+        networkSuspendPending = false;
         ENGINE_UNLOCK();
     }
     pumpSerial();
@@ -687,8 +957,8 @@ void loop() {
         lastPing = now;
         // Identity beacon: magic + version + the CRC of the web bundle we hold in flash +
         // the current game id. Version flags an outdated board; the CRC lets the Flipper skip
-        // re-streaming an unchanged bundle; the game id lets it mirror phone-vote game changes
-        // reliably. Bytes 6-10 are new in v19; bytes 11-14 (free heap KB, free PSRAM KB, LE
+        // re-streaming an unchanged bundle; the game id lets it recover the last host-committed
+        // selection reliably. Bytes 6-10 are new in v19; bytes 11-14 (free heap KB, free PSRAM KB, LE
         // uint16 each) are new in v1.7.1 for the Flipper's memory readout. Older Flippers read
         // only the bytes they know and ignore the rest, so growing this stays compatible.
         uint32_t bcrc = fsReady ? assets.bundleCrc() : 0;
@@ -711,5 +981,10 @@ void loop() {
             (uint8_t)(psramKb & 0xFF),
             (uint8_t)(psramKb >> 8)};
         uartSend(HA_MSG_PING, beacon, sizeof(beacon));
+        // Lifecycle STATUS and state frames are individually CRC-protected but not
+        // acknowledged. Repeat the authoritative snapshot with the existing beacon
+        // so dropping any single `up`, `network_suspended`, or TRANSPORT_STATE frame
+        // converges within two seconds (including an empty expected-player mask).
+        uartTransportState();
     }
 }

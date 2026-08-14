@@ -44,9 +44,9 @@ silently corrupts a neighbour; under ASan it aborts at the line.
 No WiFi, no ESP heap accounting, no UART timing — the 8-phone scale test still needs
 hardware. The Flipper panel shows UART traffic, not the real 1-bit screens.
 
-`loadSamplePacks()` (`flipper.js`) has a hardcoded pack list (`general`, `movies`,
-`science`). A new file dropped into `packs/trivia/` will not show up in the "Load
-trivia packs" button until that list is updated by hand.
+The simulated host resolves the selected game's hardcoded pack manifest in
+`trivia-packs.js`. A new file dropped into `packs/<game>/` will not show up in the
+transaction until that manifest is updated too.
 
 ## Fidelity
 
@@ -56,6 +56,8 @@ are still hand-copied from the firmware and can drift if only one side is update
 - The pack block parser (`trivia-packs.js`), which mirrors the generic `Key: value`
   block streamer in `ha_session.c`. Since the Flipper no longer interprets game content,
   this is now a copy of a much smaller grammar than before.
+- The selected-game `CONTENT_BEGIN`/`CONTENT_COMMIT` flow in `flipper.js`, which mirrors
+  the host's active-game-only transaction and English-per-game locale fallback.
 - The `HA_GAME_*` id table (`flipper.js`'s `GAMES` array), copied from
   `flipper/hotspot-arcade/ha_proto.h`. Adding a game to the firmware means adding it
   to `GAMES` too, or the Flipper panel's game picker won't offer it.

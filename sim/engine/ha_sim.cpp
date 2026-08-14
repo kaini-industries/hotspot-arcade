@@ -25,6 +25,9 @@ static std::vector<std::string> g_outbox;
 static std::vector<std::string> g_knownIdentities;
 static bool g_admissionFull = false;
 static std::string g_drained; // return buffer; must outlive the call
+static int g_contentFailAfter = -1;
+static int g_contentBanks = 0;
+static int g_contentBanksMax = 0;
 
 // Escape a C string for embedding as a JSON string value. Only nicknames and score
 // reasons need this; every other payload is already JSON text and is spliced raw.
@@ -70,6 +73,34 @@ void haWsBroadcast(const String& msg) {
     g_outbox.push_back("{\"to\":\"all\",\"msg\":" + msg.str() + "}");
 }
 
+void* haContentAlloc(size_t bytes) {
+    void* memory = malloc(bytes);
+    if(memory) {
+        g_contentBanks++;
+        g_contentBanksMax = std::max(g_contentBanksMax, g_contentBanks);
+    }
+    return memory;
+}
+
+void haContentFree(void* memory) {
+    if(!memory) return;
+    g_contentBanks--;
+    free(memory);
+}
+
+bool haContentAllocationAllowed() {
+    if(g_contentFailAfter < 0) return true;
+    if(g_contentFailAfter == 0) return false;
+    g_contentFailAfter--;
+    return true;
+}
+
+bool haPhoneGameChangeAllowed(uint8_t fromGame, uint8_t toGame) {
+    (void)fromGame;
+    (void)toGame;
+    return false;
+}
+
 uint8_t haAuthorizeIdentity(
     uint32_t wsId, const char* identity, const char* code, uint32_t* retryMs) {
     (void)wsId;
@@ -109,12 +140,19 @@ void haUartScore(uint8_t pid, int delta, const char* reason) {
         ",\"delta\":" + std::to_string(delta) + ",\"reason\":\"" + esc(reason) + "\"}");
 }
 
-void haUartEvent(const String& json) {
-    g_outbox.push_back("{\"to\":\"uart\",\"kind\":\"event\",\"json\":" + json.str() + "}");
-}
-
-void haUartRoundResult(const String& json) {
-    g_outbox.push_back("{\"to\":\"uart\",\"kind\":\"round\",\"json\":" + json.str() + "}");
+void haUartHostEvent(
+    uint8_t kind,
+    uint8_t game,
+    uint8_t actor,
+    uint8_t target,
+    int16_t value,
+    const char* text) {
+    g_outbox.push_back(
+        "{\"to\":\"uart\",\"kind\":\"host_event\",\"event\":" +
+        std::to_string((int)kind) + ",\"game\":" + std::to_string((int)game) +
+        ",\"actor\":" + std::to_string((int)actor) + ",\"target\":" +
+        std::to_string((int)target) + ",\"value\":" + std::to_string((int)value) +
+        ",\"text\":\"" + esc(text ? text : "") + "\"}");
 }
 
 // The 8th sink: the identity trace the firmware prints to its serial console. It is
@@ -145,12 +183,16 @@ void ha_reset() {
     g_knownIdentities.clear();
     g_admissionFull = false;
     engine.reset(g_millis);
+    g_contentFailAfter = -1;
+    g_contentBanksMax = g_contentBanks;
 }
 void ha_reset_at(uint32_t now) {
     g_millis = now;
     g_knownIdentities.clear();
     g_admissionFull = false;
     engine.reset(g_millis);
+    g_contentFailAfter = -1;
+    g_contentBanksMax = g_contentBanks;
 }
 void ha_set_admission_full(int full) { g_admissionFull = full != 0; }
 
@@ -165,21 +207,53 @@ void ha_input_at(uint32_t wsId, const char* json, uint32_t now) {
     engine.onInput(wsId, json, g_millis);
 }
 void ha_disconnect(uint32_t wsId) { engine.onWsDisconnect(wsId, g_millis); }
+int ha_transport_pause(int reason, const char* ssid, uint32_t reconnectMs) {
+    return (int)engine.pauseTransport(
+        (HaTransportReason)reason, ssid ? ssid : "", reconnectMs, g_millis);
+}
+int ha_transport_resume(int expireMissing) {
+    return (int)engine.resumeTransport(g_millis, expireMissing != 0);
+}
+void ha_transport_detach_sockets() { engine.detachTransportSockets(g_millis); }
+int ha_transport_fallback_ssid(const char* ssid) {
+    return engine.replacePausedTransportSsid(ssid) ? 1 : 0;
+}
+int ha_transport_paused() { return engine.transportPaused() ? 1 : 0; }
+uint32_t ha_transport_expected() { return engine.transportExpectedMask(); }
+uint32_t ha_transport_online_expected() { return engine.transportOnlineExpectedMask(); }
+uint32_t ha_session_now() { return engine.sessionNow(); }
+uint32_t ha_game_now() { return engine.gameNow(); }
 int ha_time_reached(uint32_t now, uint32_t deadline) { return haTimeReached(now, deadline); }
 uint32_t ha_time_remaining(uint32_t now, uint32_t deadline) {
     return haTimeRemaining(now, deadline);
 }
-void ha_select_game(int id) { engine.selectGame((uint8_t)id); }
-void ha_trivia_clear() { engine.triviaTopicsClear(); }
-void ha_trivia_add_topic(const char* name) { engine.triviaAddTopic(name); }
-void ha_trivia_add_q(const char* json) { engine.triviaAddQ(json); }
-void ha_content_clear() { engine.contentClear(); }
-void ha_content_pack(int game, const char* name) { engine.contentPack((uint8_t)game, name); }
-void ha_content_item(const char* json) { engine.contentItem(json); }
-void ha_round_end() { engine.roundEnd(); }
+int ha_select_game(int id) { return engine.selectGame((uint8_t)id, g_millis) ? 1 : 0; }
+int ha_content_begin(int game, const char* lang) {
+    return engine.contentBegin((uint8_t)game, lang) ? 1 : 0;
+}
+int ha_content_pack(int game, const char* name) {
+    return engine.contentPack((uint8_t)game, name) ? 1 : 0;
+}
+int ha_content_item(const char* json) { return engine.contentItem(json) ? 1 : 0; }
+int ha_content_commit(int packs, int items) {
+    if(packs < 0 || packs > 65535 || items < 0 || items > 65535) return 0;
+    return engine.contentCommit((uint16_t)packs, (uint16_t)items, g_millis) ? 1 : 0;
+}
+void ha_content_abort() { engine.contentAbort(); }
+void ha_content_fail_after(int checkpoints) { g_contentFailAfter = checkpoints; }
+int ha_content_bank_count() { return engine.contentBankCount(); }
+int ha_content_bank_max() { return g_contentBanksMax; }
+int ha_content_active_game() { return engine.contentActiveGame(); }
+const char* ha_content_active_lang() { return engine.contentActiveLang(); }
+void ha_round_end() { engine.roundEnd(g_millis); }
 void ha_reset_scores() { engine.resetScores(); }
-void ha_set_lang(const char* l) { engine.setLang(l); }
-
+void ha_test_set_score(int pid, int32_t score) { engine.hostTestSetScore((uint8_t)pid, score); }
+void ha_test_award_score(int pid, int delta) {
+    engine.hostTestAwardScore((uint8_t)pid, delta);
+}
+void ha_test_host_event(int kind, const char* text) {
+    engine.hostTestEvent((uint8_t)kind, text);
+}
 // Test-only chess hooks (HA_CHESS_TEST), for positions the opening moves can't reach
 // quickly and for perft ground truth against the real move generator.
 void ha_chess_load(const char* board64, int stm, int rights, int ep, int halfmove,

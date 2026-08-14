@@ -112,4 +112,65 @@ assert.equal(onlineStates.filter((m) => m.iam).length, 1,
 assert.notEqual(onlineStates[0].chooser, "OFFLINE",
   "reserved offline seat cannot deadlock the round");
 
+// A noncritical guesser who submits and then drops no longer blocks online quorum, but
+// the exact submitted assignment remains in the reveal and keeps its award.
+{
+  const g = await newEngine();
+  g.reset();
+  for (const pid of [1, 2, 3, 4]) g.join(pid, `P${pid}`);
+  g.loadContent(KMK, [{
+    name: "Grace",
+    items: ["A", "B", "C", "D"].map((name) => ({ name })),
+  }]);
+  for (const pid of [1, 2, 3, 4]) g.input(pid, { t: "ready", ready: true });
+  const begun = g.tick(3000);
+  const chooserPid = [1, 2, 3, 4].find((pid) => lastToWs(begun, pid, "kmk").msg.iam);
+  const liveGuessers = [1, 2, 3, 4].filter((pid) => pid !== chooserPid);
+  g.input(chooserPid, { t: "assign", kiss: 0, marry: 1, kill: 2 });
+  const droppedPid = liveGuessers[0];
+  g.input(droppedPid, { t: "assign", kiss: 0, marry: 1, kill: 2 });
+  g.disconnect(droppedPid);
+  g.input(liveGuessers[1], { t: "assign", kiss: 1, marry: 0, kill: 2 });
+  const revealed = g.input(liveGuessers[2], { t: "assign", kiss: 2, marry: 1, kill: 0 });
+  const state = lastToWs(revealed, chooserPid, "kmk").msg;
+  const dropped = state.guesses.find((x) => x.nick === `P${droppedPid}`);
+  assert.ok(dropped && dropped.pts === 3,
+    "submitted KMK guess survives grace and scores");
+  assert.ok(revealed.some((x) => x.to === "uart" && x.kind === "score" && x.pid === droppedPid),
+    "offline reserved guesser receives the submitted-work score event");
+}
+
+// Replay keeps the committed people pack but resets per-game phone scores when the
+// next countdown completes.
+{
+  const g = await newEngine();
+  g.reset();
+  for (const pid of [1, 2, 3]) g.join(pid, `R${pid}`);
+  g.loadContent(KMK, [{
+    name: "Replay", items: ["A", "B", "C", "D"].map((name) => ({ name })),
+  }]);
+  for (const pid of [1, 2, 3]) g.input(pid, { t: "ready", ready: true });
+  let now = 3000;
+  let stateOut = g.tick(now);
+  for (let round = 1; round <= 6; round++) {
+    const chooserPid = [1, 2, 3].find((pid) => lastToWs(stateOut, pid, "kmk").msg.iam);
+    g.input(chooserPid, { t: "assign", kiss: 0, marry: 1, kill: 2 });
+    let reveal = [];
+    for (const pid of [1, 2, 3].filter((p) => p !== chooserPid))
+      reveal = g.input(pid, { t: "assign", kiss: 0, marry: 1, kill: 2 });
+    assert.equal(lastToWs(reveal, 1, "kmk").msg.stage, "reveal");
+    now += 7000;
+    stateOut = g.tick(now);
+  }
+  assert.equal(lastToWs(stateOut, 1, "kmk").msg.phase, "final");
+  g.input(1, { t: "again" });
+  g.testSetScore(1, 777);
+  for (const pid of [1, 2, 3]) g.input(pid, { t: "ready", ready: true });
+  stateOut = g.tick(now + 3000);
+  const replay = lastToWs(stateOut, 1, "kmk").msg;
+  assert.equal(replay.phase, "play");
+  assert.equal(replay.scores.find((p) => p.pid === 1).score, 0,
+    "KMK replay starts with a fresh phone scoreboard");
+}
+
 console.log("kmk: all checks passed");

@@ -263,12 +263,16 @@ assert.equal(lob.need, 3);
     o = g.e.input(3, { t: "done" });
   }
   assert.equal(view(o, 99).phase, "show");
+  let rawNow = 124000;
   while (view(o, 99).n !== oldSheet) {
-    const deadline = view(o, 99).deadline;
-    o = g.e.tick(deadline);
+    rawNow += view(o, 99).remaining_ms;
+    o = g.e.tick(rawNow);
   }
   o = g.e.input(99, { t: "thumb", sheet: oldSheet, v: 1 });
-  for (let i = 0; i < 3; i++) o = o.concat(g.e.tick(view(o, 99).deadline));
+  for (let i = 0; i < 3; i++) {
+    rawNow += view(o, 99).remaining_ms;
+    o = o.concat(g.e.tick(rawNow));
+  }
   const inheritedAwards = o.filter((item) =>
     item.to === "uart" && item.kind === "score" && item.pid === 1 && item.reason === "frankendraw");
   assert.equal(inheritedAwards.length, 0,
@@ -296,7 +300,7 @@ assert.equal(lob.need, 3);
   assert.equal(view(o, 2).used, 0);
 }
 
-// --- reachable from the phone-side game vote -----------------------------------
+// --- recognized by the phone-side host-policy request ---------------------------
 // gameIdByName() used to stop at the highest id it knew about, which made a game
 // numbered above that bound impossible to propose from a phone at all.
 {
@@ -306,9 +310,10 @@ assert.equal(lob.need, 3);
   g.join(2, "BOB");
   g.selectGame(13); // start somewhere else, then propose this game by name
   const o = g.input(1, { t: "proposeGame", game: "frankendraw" });
-  const gv = lastToWs(o, 2, "gamevote");
-  assert.ok(gv, "a phone can propose this game (its id is inside the name lookup)");
-  assert.equal(gv.msg.game, "frankendraw", "proposed by its wire name, not its label");
+  const result = lastToWs(o, 1, "result");
+  assert.ok(result, "the high-numbered game is recognized by the policy path");
+  assert.equal(result.msg.game, "frankendraw", "requested by its wire name, not its label");
+  assert.equal(result.msg.status, "policy_denied", "no synchronous content switch occurs");
 }
 
 console.log("frankendraw: all checks passed");

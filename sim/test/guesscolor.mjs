@@ -77,4 +77,27 @@ assert.equal(fin.msg.board[0].nick, "ALICE", "Alice tops the podium");
 const again = e.input(1, { t: "again" });
 assert.equal(lastToWs(again, 1, "gc").msg.phase, "lobby", "play again returns to the lobby");
 
+// Normal grace removes a seat from the completion quorum, but it does not erase a
+// valid guess already submitted. That guess remains in the reveal and earns points.
+{
+  const g = await newEngine();
+  g.reset();
+  for (const pid of [1, 2, 3]) g.join(pid, `P${pid}`);
+  g.selectGame(GC);
+  for (const pid of [1, 2, 3]) g.input(pid, { t: "ready", ready: true });
+  let started = g.tick(3000);
+  const m = lastToWs(started, 1, "gc").msg;
+  const [R, G, B] = [1, 3, 5].map((i) => parseInt(m.color.slice(i, i + 2), 16));
+  g.input(3, { t: "guess", r: R, g: G, b: B });
+  g.disconnect(3);
+  g.input(1, { t: "guess", r: far(R), g: far(G), b: far(B) });
+  const reveal = g.input(2, { t: "guess", r: far(R), g: far(G), b: far(B) });
+  const state = lastToWs(reveal, 1, "gc").msg;
+  const dropped = state.guesses.find((x) => x.pid === 3);
+  assert.ok(dropped && dropped.dist === 0 && dropped.points > 0,
+    "a submitted guess remains earned during transient grace");
+  assert.ok(reveal.some((x) => x.to === "uart" && x.kind === "score" && x.pid === 3),
+    "the reserved identity receives its submitted-work award");
+}
+
 console.log("guesscolor: all checks passed");

@@ -5,9 +5,7 @@
 import { engine, subscribeUart } from "./harness.js";
 import { loadGamePacks, LANGS, resolvePacks } from "./trivia-packs.js";
 
-// What the real Flipper streams: every packs/<game>/ directory, tagged with its game
-// id. Mirrors ha_content_stream_packs in ha_session.c so the sim exercises all four
-// content games, not just trivia.
+// What the real Flipper streams: only the selected game's typed ContentBank.
 
 // Ids copied verbatim from flipper/hotspot-arcade/ha_proto.h (HA_GAME_*).
 const GAMES = [
@@ -16,16 +14,16 @@ const GAMES = [
   ["Would You Rather", 8], ["Word Scramble", 9], ["Reversi", 10],
   ["Guess the Color", 11], ["Battleship", 12], ["Spectrum", 13],
   ["Kiss Marry Kill", 14], ["Chess", 15], ["Secrets", 16], ["Fill the Blank", 17],
-  ["Kiss Marry Kill", 14], ["Chess", 15], ["Werewolf", 18],
-  ["Kiss Marry Kill", 14], ["Chess", 15], ["Spyfall", 19],
-  ["Kiss Marry Kill", 14], ["Chess", 15], ["Secrets", 16],
-  ["Draw a Monster", 20],
+  ["Werewolf", 18], ["Spyfall", 19], ["Draw a Monster", 20],
 ];
 
 const players = new Map(); // pid -> { nick, score }
 const feed = [];
+const HOST_EVENT_NAMES = [
+  "unknown", "match", "chat", "role", "win", "draw", "round", "final",
+];
 
-// Nicknames (and anything spliced from engine event/round JSON) are user-supplied and
+// Nicknames and typed host-event text are user-supplied and
 // reach us unescaped: the phone's maxlength is client-side only, the engine truncates
 // without escaping, and ha_sim.cpp's esc() only JSON-escapes quotes/backslashes/control
 // chars, not `<`/`>`. Escape at render time so a crafted nickname can't inject markup.
@@ -57,8 +55,13 @@ subscribeUart((it) => {
     const p = players.get(it.pid);
     if (p) p.score += it.delta;
     feed.push(`SCORE ${it.pid} ${it.delta > 0 ? "+" : ""}${it.delta} (${it.reason})`);
-  } else if (it.kind === "event") feed.push(`EVENT ${JSON.stringify(it.json)}`);
-  else if (it.kind === "round") feed.push(`ROUND ${JSON.stringify(it.json)}`);
+  } else if (it.kind === "host_event") {
+    const name = HOST_EVENT_NAMES[it.event] || "unknown";
+    feed.push(
+      `EVENT ${name} game=${it.game} actor=${it.actor} target=${it.target} value=${it.value}` +
+      (it.text ? ` ${it.text}` : ""),
+    );
+  }
   // Draw a Monster artwork. The real host writes an SVG per sheet; here we just note the
   // sheet boundaries -- one line per segment would drown the feed.
   else if (it.kind === "art" && it.op === 0) feed.push(`ART begin sheet ${it.json.id}`);
@@ -81,8 +84,35 @@ export async function mountFlipper(el) {
     <h3>Event feed</h3>
     <div id="feed" class="feed"></div>`;
 
-  document.getElementById("game").onchange = (e) =>
-    engine.selectGame(Number(e.target.value));
+  async function switchGame(game, lang) {
+    if (!engine.contentBegin(game, lang)) throw new Error("content begin failed");
+    const source = resolvePacks(lang).find((g) => g.game === game);
+    let loaded = [];
+    if (source) loaded = await loadGamePacks(engine, source.game, source.dir, source.names, source.sub);
+    const items = loaded.reduce((n, p) => n + p.count, 0);
+    const ok = engine.contentCommit(loaded.length, items);
+    const label = lang && LANGS[lang] ? lang : "en";
+    document.getElementById("packstate").textContent = ok
+      ? `${loaded.length} packs, ${items} items (${label})`
+      : "transaction rejected; previous game preserved";
+  }
+
+  // Fetching several pack files is asynchronous. Serialize UI requests so a second
+  // BEGIN cannot abort the first transaction midway through its fetch/ingest loop.
+  let switchQueue = Promise.resolve();
+  function queueSwitch(game) {
+    const lang = document.getElementById("lang").value;
+    switchQueue = switchQueue
+      .then(() => switchGame(game, lang))
+      .catch((error) => {
+        console.error("content transaction:", error);
+        document.getElementById("packstate").textContent =
+          "transaction failed; previous game preserved";
+      });
+    return switchQueue;
+  }
+
+  document.getElementById("game").onchange = (e) => queueSwitch(Number(e.target.value));
   document.getElementById("round").onclick = () => engine.roundEnd();
   document.getElementById("zero").onclick = () => {
     engine.resetScores();
@@ -90,31 +120,12 @@ export async function mountFlipper(el) {
     render();
   };
   document.getElementById("packs").onclick = async () => {
-    engine.contentClear();
-    const lang = document.getElementById("lang").value; // "" = English
-    let packCount = 0;
-    let itemCount = 0;
-    // resolvePacks applies the host's per-game English fallback for the chosen language.
-    for (const g of resolvePacks(lang)) {
-      const loaded = await loadGamePacks(engine, g.game, g.dir, g.names, g.sub);
-      packCount += loaded.length;
-      itemCount += loaded.reduce((n, p) => n + p.count, 0);
-    }
-    const label = lang && LANGS[lang] ? lang : "en";
-    document.getElementById("packstate").textContent =
-      `${packCount} packs, ${itemCount} items (${label})`;
+    await queueSwitch(Number(document.getElementById("game").value));
   };
 
-  // Language also drives the phone UI: the ESP echoes it in `welcome`, so new joiners
-  // get it. Apply it to already-connected phones directly (a sim shortcut; on hardware
-  // a phone picks it up when it joins).
-  document.getElementById("lang").onchange = (e) => {
-    const lang = e.target.value;
-    engine.setLang(lang);
-    for (const f of document.querySelectorAll("iframe")) {
-      const w = f.contentWindow;
-      if (w && w.A && w.A.setLang) w.A.setLang(lang);
-    }
-  };
+  // Same-game locale replacement is the same transaction as a game switch. The
+  // engine broadcasts one config update to existing phones after the atomic swap.
+  document.getElementById("lang").onchange = () =>
+    queueSwitch(Number(document.getElementById("game").value));
   render();
 }

@@ -47,7 +47,7 @@ async function table(n) {
     e, pids, t: 0,
     out: [],
     tick(ms) { g.t = ms; g.out = e.tick(ms); return g.out; },
-    tickTo(deadline) { return g.tick(deadline); },
+    tickTo(remaining) { return g.tick(g.t + remaining); },
     in(pid, obj) { g.out = e.input(pid, obj); return g.out; },
     views() {
       const v = {};
@@ -75,7 +75,7 @@ async function table(n) {
       g.in(pids[pids.length - 1], { t: "seen" });
       const w = g.views();
       for (const p of pids) assert.equal(w[p].stage, "talk", "last OK opens the questioning");
-      assert.equal(w[pids[0]].deadline, before + 360000,
+      assert.equal(w[pids[0]].remaining_ms, 360000,
         "the 6-minute clock starts when the cards are away, not at round start");
       return info;
     },
@@ -147,14 +147,14 @@ function checkReveal(g, spy, loc, outcome, gain) {
 // Walk the talk clock out into the hush, then into the first nomination turn.
 function toNominations(g) {
   const v0 = g.views();
-  g.tickTo(v0[g.pids[0]].deadline);
+  g.tickTo(v0[g.pids[0]].remaining_ms);
   let v = g.views();
   for (const p of g.pids) {
     assert.equal(v[p].stage, "nominate", "the clock running out starts nominations");
     assert.equal(v[p].nomStage, "hush", "'Time's up. Stop discussing!' first");
     assert.equal(v[p].need, g.pids.length - 1, "the threshold is the non-spy count");
   }
-  g.tickTo(v[g.pids[0]].deadline);
+  g.tickTo(v[g.pids[0]].remaining_ms);
   v = g.views();
   for (const p of g.pids) assert.equal(v[p].nomStage, "pick", "then somebody nominates");
   return v;
@@ -174,7 +174,7 @@ function toNominations(g) {
   checkReveal(g, spy, loc, "caught", gain);
 
   // The spy rotates: let the reveal lapse and check round 2 has a different spy.
-  g.tickTo(g.views()[spy].deadline);
+  g.tickTo(g.views()[spy].remaining_ms);
   v = g.views();
   for (const p of g.pids) assert.equal(v[p].round, 2, "on to round 2");
   const spy2 = g.pids.filter((p) => v[p].spy);
@@ -324,7 +324,7 @@ function toNominations(g) {
 
   // The next round ends by location solve, which has no blamed player. A condemned
   // name from the previous round must not bleed into this reveal.
-  g.tickTo(firstReveal[spy].deadline);
+  g.tickTo(firstReveal[spy].remaining_ms);
   const round2 = g.readCards();
   const solve = g.views()[round2.spy].locs.indexOf(round2.loc);
   g.in(round2.spy, { t: "solve", loc: solve });
@@ -362,7 +362,7 @@ function toNominations(g) {
   // Nobody taps OK: the card stage times out into the questioning by itself.
   let v = g.views();
   assert.equal(v[1].stage, "card");
-  g.tickTo(v[1].deadline);
+  g.tickTo(v[1].remaining_ms);
   v = g.views();
   for (const p of g.pids) assert.equal(v[p].stage, "talk", "the card stage times out");
   const spy = g.pids.find((p) => v[p].spy);
@@ -373,7 +373,7 @@ function toNominations(g) {
   for (let turn = 0; turn < 3; turn++) {
     v = g.views();
     if (v[g.pids[0]].stage === "reveal") break;
-    g.tickTo(v[g.pids[0]].deadline); // nomination turn expires
+    g.tickTo(v[g.pids[0]].remaining_ms); // nomination turn expires
   }
   const gain = {};
   gain[spy] = 1;

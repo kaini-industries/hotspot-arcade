@@ -2,6 +2,7 @@
 #include "ha_storage.h"
 #include "../hotspot_arcade_i.h"
 #include "../ha_json.h"
+#include "ha_content_flow.h"
 #include "ha_roster.h"
 
 // Everything here runs on the GUI thread (RX drained from the global custom event
@@ -23,7 +24,7 @@ static void feedback_blip(HotspotArcadeApp* app) {
     if(app->vibro_on) notification_message(app->notifications, &sequence_single_vibro);
 }
 
-// A success cue for a scored moment (trivia reveal, a Connect Four win).
+// A success cue for a typed win/draw/final milestone.
 static void feedback_success(HotspotArcadeApp* app) {
     if(app->vibro_on) notification_message(app->notifications, &sequence_single_vibro);
     if(app->sound_on) notification_message(app->notifications, &sequence_success);
@@ -36,6 +37,109 @@ static void console_add(HotspotArcadeApp* app, const char* line) {
     furi_string_cat_str(app->console, "\n");
     size_t sz = furi_string_size(app->console);
     if(sz > HA_CONSOLE_MAX) furi_string_right(app->console, sz - HA_CONSOLE_MAX / 2);
+}
+
+static const char* host_event_game_name(uint8_t game) {
+    switch(game) {
+    case HA_GAME_TRIVIA: return "Trivia";
+    case HA_GAME_CONNECT4: return "Connect 4";
+    case HA_GAME_TICTACTOE: return "Tic-Tac-Toe";
+    case HA_GAME_DOTS: return "Dots & Boxes";
+    case HA_GAME_DRAW: return "Drawing";
+    case HA_GAME_PONG: return "Pong";
+    case HA_GAME_REACT: return "Reaction Duel";
+    case HA_GAME_WYR: return "Would You Rather";
+    case HA_GAME_SCRAMBLE: return "Word Scramble";
+    case HA_GAME_REVERSI: return "Reversi";
+    case HA_GAME_GUESSCOLOR: return "Guess the Color";
+    case HA_GAME_BATTLESHIP: return "Battleship";
+    case HA_GAME_SPECTRUM: return "Spectrum";
+    case HA_GAME_KMK: return "Kiss Marry Kill";
+    case HA_GAME_CHESS: return "Chess";
+    case HA_GAME_SECRETS: return "Secrets";
+    case HA_GAME_FILLBLANK: return "Fill the Blank";
+    case HA_GAME_WEREWOLF: return "Werewolf";
+    case HA_GAME_SPYFALL: return "Spyfall";
+    case HA_GAME_FRANKENDRAW: return "Draw a Monster";
+    default: return "Arcade";
+    }
+}
+
+static const char* host_event_player_name(HotspotArcadeApp* app, uint8_t pid) {
+    int index = haRosterFind(app->players, pid);
+    return index >= 0 ? app->players[index].nick : "?";
+}
+
+static void host_event_dispatch(HotspotArcadeApp* app, const uint8_t* payload, uint16_t len) {
+    if(len < HA_HOST_EVENT_HEADER_SIZE || payload[0] != HA_HOST_EVENT_VERSION) return;
+    uint8_t kind = payload[1], game = payload[2], actor = payload[3], target = payload[4];
+    // Game 0 is the party lobby before the first content selection; CHAT events
+    // there are valid and are formatted with the "Arcade" fallback name.
+    if(game > HA_GAME_FRANKENDRAW || actor > HA_MAX_PLAYERS || target > HA_MAX_PLAYERS)
+        return;
+    int16_t value = (int16_t)((uint16_t)payload[5] | ((uint16_t)payload[6] << 8));
+    size_t text_len = len - HA_HOST_EVENT_HEADER_SIZE;
+    if(text_len > HA_HOST_EVENT_TEXT_MAX) return;
+    if(text_len && !haContentFileBytesValid(payload + HA_HOST_EVENT_HEADER_SIZE, text_len)) return;
+    for(size_t i = 0; i < text_len; i++)
+        if(payload[HA_HOST_EVENT_HEADER_SIZE + i] < 0x20) return;
+    char detail[HA_HOST_EVENT_TEXT_MAX + 1];
+    if(text_len) memcpy(detail, payload + HA_HOST_EVENT_HEADER_SIZE, text_len);
+    detail[text_len] = '\0';
+    const char* game_name = host_event_game_name(game);
+    const char* actor_name = host_event_player_name(app, actor);
+    const char* target_name = host_event_player_name(app, target);
+    FuriString* line = furi_string_alloc();
+    bool status = true;
+    switch(kind) {
+    case HA_HOST_EVT_MATCH_STARTED:
+        furi_string_printf(line, "%s: %s vs %s", game_name, actor_name, target_name);
+        break;
+    case HA_HOST_EVT_CHAT:
+        furi_string_printf(line, "%s: %s", actor_name, detail);
+        status = false;
+        break;
+    case HA_HOST_EVT_ROLE:
+        furi_string_printf(line, "%s: %s %s", game_name, actor_name, detail);
+        break;
+    case HA_HOST_EVT_ROUND_WIN:
+        if(detail[0])
+            furi_string_printf(
+                line, "%s: %s beat %s (%s)", game_name, actor_name, target_name, detail);
+        else
+            furi_string_printf(line, "%s: %s beat %s", game_name, actor_name, target_name);
+        break;
+    case HA_HOST_EVT_ROUND_DRAW:
+        if(detail[0])
+            furi_string_printf(
+                line, "%s: %s / %s draw (%s)", game_name, actor_name, target_name, detail);
+        else
+            furi_string_printf(line, "%s: %s / %s draw", game_name, actor_name, target_name);
+        break;
+    case HA_HOST_EVT_ROUND_COMPLETE:
+        if(detail[0])
+            furi_string_printf(line, "%s: round %d complete (%s)", game_name, value, detail);
+        else
+            furi_string_printf(line, "%s: round %d complete", game_name, value);
+        break;
+    case HA_HOST_EVT_GAME_FINAL:
+        if(detail[0])
+            furi_string_printf(line, "%s: game complete (%s)", game_name, detail);
+        else
+            furi_string_printf(line, "%s: game complete", game_name);
+        break;
+    default:
+        furi_string_free(line);
+        return;
+    }
+    console_add(app, furi_string_get_cstr(line));
+    if(status) {
+        furi_string_set(app->last_event, line);
+        if(kind == HA_HOST_EVT_ROUND_WIN || kind == HA_HOST_EVT_ROUND_DRAW ||
+           kind == HA_HOST_EVT_GAME_FINAL)
+            feedback_success(app);
+    }
+    furi_string_free(line);
 }
 
 // ---------------- roster ----------------
@@ -69,7 +173,7 @@ static void roster_clear(HotspotArcadeApp* app) {
 
 // ---------------- trivia pack streaming ----------------
 // The Flipper no longer hosts trivia; it just streams every pack on the SD card to
-// the ESP as votable topics at session start, and the ESP orchestrates the game.
+// the ESP as votable topics when Trivia is selected, and the ESP orchestrates the game.
 
 static void copy_trim(const char* start, const char* end, FuriString* out) {
     while(start < end && (*start == ' ' || *start == '\t'))
@@ -100,7 +204,11 @@ static void json_escape_cat(FuriString* out, const char* s) {
 // names the pack and is not part of an item. Everything else is shipped verbatim as
 // a JSON object of the file's own (lowercased) keys — this app deliberately does not
 // know what a question, prompt or word is. The ESP owns all of that.
-static void content_send_item(HotspotArcadeApp* app, FuriString* obj, bool* any) {
+static void content_send_item(
+    HotspotArcadeApp* app,
+    FuriString* obj,
+    bool* any,
+    uint16_t* item_count) {
     if(!*any) return; // nothing accumulated
     furi_string_cat_str(obj, "}");
     ha_proto_send(
@@ -108,15 +216,17 @@ static void content_send_item(HotspotArcadeApp* app, FuriString* obj, bool* any)
         HA_MSG_CONTENT_ITEM,
         (const uint8_t*)furi_string_get_cstr(obj),
         furi_string_size(obj));
+    (*item_count)++;
     furi_string_set(obj, "{");
     *any = false;
 }
 
-static void content_stream_pack(
+static bool content_stream_pack(
     HotspotArcadeApp* app,
     uint8_t game,
     const char* content,
-    const char* fallback) {
+    const char* fallback,
+    uint16_t* item_count) {
     // Pass one: find the pack name so CONTENT_PACK can go first.
     FuriString* name = furi_string_alloc_set_str(fallback);
     for(const char* p = content; p && *p;) {
@@ -145,6 +255,7 @@ static void content_stream_pack(
     FuriString* key = furi_string_alloc();
     FuriString* val = furi_string_alloc();
     bool any = false;
+    bool valid = true;
     for(const char* p = content; p && *p;) {
         const char* eol = strchr(p, '\n');
         if(!eol) eol = p + strlen(p);
@@ -159,7 +270,7 @@ static void content_stream_pack(
 
         bool sep = (s == e) || (e - s == 3 && strncmp(s, "---", 3) == 0);
         if(sep) {
-            content_send_item(app, obj, &any);
+            content_send_item(app, obj, &any, item_count);
         } else {
             const char* colon = memchr(s, ':', (size_t)(e - s));
             if(colon) {
@@ -170,7 +281,9 @@ static void content_stream_pack(
                 char* k = (char*)furi_string_get_cstr(key);
                 for(char* c = k; *c; c++)
                     if(*c >= 'A' && *c <= 'Z') *c += 32;
-                if(furi_string_size(key) && strcmp(k, "pack") != 0) {
+                if(!furi_string_size(key)) {
+                    valid = false;
+                } else if(strcmp(k, "pack") != 0) {
                     if(any) furi_string_cat_str(obj, ",");
                     furi_string_cat_str(obj, "\"");
                     json_escape_cat(obj, k);
@@ -179,32 +292,41 @@ static void content_stream_pack(
                     furi_string_cat_str(obj, "\"");
                     any = true;
                 }
+            } else {
+                // Non-empty records must be Key: value lines. We may already have
+                // streamed earlier blocks, but the caller will abort the staging bank,
+                // so malformed input can never publish a valid-looking prefix.
+                valid = false;
             }
         }
         p = (*eol) ? eol + 1 : eol;
     }
-    content_send_item(app, obj, &any);
+    content_send_item(app, obj, &any, item_count);
     furi_string_free(obj);
     furi_string_free(key);
     furi_string_free(val);
+    return valid;
 }
 
 #define HA_MAX_TOPICS (8) // must match TRIVIA_MAX_TOPICS on the ESP (raised from 6 in v19)
 
 // Stream every .txt pack in one dir as votable topics, skipping names already streamed.
 // `seen` holds the filenames taken so far; *topics is the running total across dirs.
-static void ha_content_stream_dir(
+static bool ha_content_stream_dir(
     HotspotArcadeApp* app,
     Storage* storage,
     const char* dir_path,
     uint8_t game,
     char seen[HA_MAX_TOPICS][80],
-    int* topics) {
+    int* topics,
+    int pack_cap,
+    uint16_t* item_count) {
+    bool ok = true;
     File* dir = storage_file_alloc(storage);
     if(storage_dir_open(dir, dir_path)) {
         FileInfo info;
         char name[80];
-        while(*topics < HA_MAX_TOPICS && storage_dir_read(dir, &info, name, sizeof(name))) {
+        while(storage_dir_read(dir, &info, name, sizeof(name))) {
             if(info.flags & FSF_DIRECTORY) continue;
             size_t nl = strlen(name);
             const char* e = name + (nl >= 4 ? nl - 4 : 0);
@@ -215,98 +337,172 @@ static void ha_content_stream_dir(
             for(int i = 0; i < *topics && !dup; i++)
                 dup = (strcmp(seen[i], name) == 0);
             if(dup) continue; // same filename in apps_data already won
+            if(*topics >= pack_cap) {
+                // Keep scanning semantics fail-closed: never silently ignore a valid
+                // unique pack merely because the typed bank's pack cap was reached.
+                ok = false;
+                break;
+            }
             FuriString* path = furi_string_alloc();
             furi_string_printf(path, "%s/%s", dir_path, name);
             FuriString* content = furi_string_alloc();
-            if(ha_storage_read_file(furi_string_get_cstr(path), content, 16384)) {
+            bool read_ok =
+                ha_storage_read_file(furi_string_get_cstr(path), content, HA_PACK_FILE_MAX + 1U);
+            size_t content_size = furi_string_size(content);
+            bool pack_ok = read_ok && info.size == (uint64_t)content_size &&
+                           haContentFileBytesValid(
+                               (const uint8_t*)furi_string_get_cstr(content), content_size);
+            if(pack_ok) {
                 FuriString* fb = furi_string_alloc_set_str(name);
                 furi_string_left(fb, nl - 4); // drop ".txt"
-                content_stream_pack(
-                    app, game, furi_string_get_cstr(content), furi_string_get_cstr(fb));
+                pack_ok = content_stream_pack(
+                    app, game, furi_string_get_cstr(content), furi_string_get_cstr(fb), item_count);
                 furi_string_free(fb);
-                strlcpy(seen[*topics], name, sizeof(seen[0]));
-                (*topics)++;
+                if(pack_ok) {
+                    strlcpy(seen[*topics], name, sizeof(seen[0]));
+                    (*topics)++;
+                }
             }
             furi_string_free(content);
             furi_string_free(path);
+            if(!pack_ok) {
+                ok = false;
+                break;
+            }
         }
         storage_dir_close(dir);
     }
     storage_file_free(dir);
+    return ok;
 }
 
 // Stream one game's packs from packs/<sub> (user before bundled), into its per-game cap.
 // `sub` is the game dir, optionally with a "/<lang>" suffix for a translated set.
-static void ha_stream_subdir(
+static bool ha_stream_subdir(
     HotspotArcadeApp* app,
     Storage* storage,
     uint8_t game,
     const char* sub,
     char seen[HA_MAX_TOPICS][80],
-    int* topics) {
+    int* topics,
+    int pack_cap,
+    uint16_t* item_count) {
     FuriString* d = furi_string_alloc();
     furi_string_printf(d, "%s/%s", HA_USER_PACKS_DIR, sub);
-    ha_content_stream_dir(app, storage, furi_string_get_cstr(d), game, seen, topics);
-    furi_string_printf(d, "%s/%s", HA_BUNDLED_PACKS_DIR, sub);
-    ha_content_stream_dir(app, storage, furi_string_get_cstr(d), game, seen, topics);
+    bool ok = ha_content_stream_dir(
+        app, storage, furi_string_get_cstr(d), game, seen, topics, pack_cap, item_count);
+    if(ok) {
+        furi_string_printf(d, "%s/%s", HA_BUNDLED_PACKS_DIR, sub);
+        ok = ha_content_stream_dir(
+            app, storage, furi_string_get_cstr(d), game, seen, topics, pack_cap, item_count);
+    }
     furi_string_free(d);
+    return ok;
 }
 
-// Stream every content game's packs to the ESP. User packs win over bundled (name clash
-// and the topic cap). If a language is selected, each game prefers packs/<game>/<lang>/
-// and falls back to English (packs/<game>/) when that language has none, so a partly
-// translated language still plays. English content is the unchanged root.
-static void ha_content_stream_packs(HotspotArcadeApp* app) {
-    ha_proto_send(app->uart, HA_MSG_CONTENT_CLEAR, NULL, 0);
-    furi_delay_ms(2);
-    Storage* storage = furi_record_open(RECORD_STORAGE);
-    // `seen`/`topics` de-duplicate and cap packs PER GAME (each game stores its own set
-    // on the ESP), so every game restarts `topics` at 0. Only the dir and game byte differ.
-    char seen[HA_MAX_TOPICS][80];
-    const char* lang = app->lang; // "" = English
+static const char* content_game_subdir(uint8_t game) {
+    switch(game) {
+    case HA_GAME_TRIVIA:
+        return "trivia";
+    case HA_GAME_WYR:
+        return "wyr";
+    case HA_GAME_SCRAMBLE:
+        return "scramble";
+    case HA_GAME_DRAW:
+        return "draw";
+    case HA_GAME_SPECTRUM:
+        return "spectrum";
+    case HA_GAME_KMK:
+        return "kmk";
+    case HA_GAME_SECRETS:
+        return "secrets";
+    case HA_GAME_FILLBLANK:
+        return "fillblank";
+    case HA_GAME_SPYFALL:
+        return "spyfall";
+    default:
+        return NULL; // packless game: zero/zero is the complete transaction
+    }
+}
 
-    static const struct {
-        uint8_t game;
-        const char* sub;
-    } games[] = {
-        {HA_GAME_TRIVIA, "trivia"},
-        {HA_GAME_WYR, "wyr"},
-        {HA_GAME_SCRAMBLE, "scramble"},
-        {HA_GAME_DRAW, "draw"},
-        {HA_GAME_SPECTRUM, "spectrum"},
-        {HA_GAME_KMK, "kmk"},
-        {HA_GAME_SECRETS, "secrets"},
-        {HA_GAME_FILLBLANK, "fillblank"},
-        {HA_GAME_SPYFALL, "spyfall"},
-    };
-    for(unsigned g = 0; g < sizeof(games) / sizeof(games[0]); g++) {
-        int topics = 0;
-        // Prefer the selected language's packs...
-        if(lang[0]) {
-            FuriString* s = furi_string_alloc();
-            furi_string_printf(s, "%s/%s", games[g].sub, lang);
-            ha_stream_subdir(app, storage, games[g].game, furi_string_get_cstr(s), seen, &topics);
-            furi_string_free(s);
+// Stream only the target game's content. The BEGIN/COMMIT pair makes selection and
+// locale replacement atomic on the ESP: until the final count-checked commit succeeds,
+// the previous game, round, scores, identities, and reconnect deadlines remain live.
+static bool ha_content_stream_game(HotspotArcadeApp* app, uint8_t game) {
+    // Mark the target before BEGIN so even an immediate error from any transaction
+    // frame is correlated to this request. Callers serialize requests with this flag.
+    app->pending_game = game;
+    app->content_pending = true;
+    uint8_t begin[1 + sizeof(app->lang) - 1];
+    begin[0] = game;
+    size_t lang_len = strlen(app->lang);
+    if(lang_len > sizeof(begin) - 1) lang_len = sizeof(begin) - 1;
+    memcpy(begin + 1, app->lang, lang_len);
+    ha_proto_send(app->uart, HA_MSG_CONTENT_BEGIN, begin, 1 + lang_len);
+
+    uint16_t item_count = 0;
+    int topics = 0;
+    bool ok = true;
+    const char* sub = content_game_subdir(game);
+    if(sub) {
+        int pack_cap = (game == HA_GAME_FILLBLANK || game == HA_GAME_SPYFALL) ? 3 : HA_MAX_TOPICS;
+        char seen[HA_MAX_TOPICS][80] = {{0}};
+        Storage* storage = furi_record_open(RECORD_STORAGE);
+
+        // Prefer the selected locale, falling back transactionally to the English root.
+        if(app->lang[0]) {
+            FuriString* localized = furi_string_alloc();
+            furi_string_printf(localized, "%s/%s", sub, app->lang);
+            ok = ha_stream_subdir(
+                app,
+                storage,
+                game,
+                furi_string_get_cstr(localized),
+                seen,
+                &topics,
+                pack_cap,
+                &item_count);
+            furi_string_free(localized);
         }
-        // ...falling back to the English root when the language has none for this game.
-        if(topics == 0) ha_stream_subdir(app, storage, games[g].game, games[g].sub, seen, &topics);
-        // Trivia also sweeps the legacy trivia-only dirs (English, pre-packs/ layout),
-        // but only when it's on the English set.
-        if(games[g].game == HA_GAME_TRIVIA && (!lang[0] || topics == 0)) {
-            ha_content_stream_dir(app, storage, HA_USER_TRIVIA_DIR, HA_GAME_TRIVIA, seen, &topics);
-            ha_content_stream_dir(app, storage, HA_BUNDLED_TRIVIA_DIR, HA_GAME_TRIVIA, seen, &topics);
+        if(ok && topics == 0)
+            ok = ha_stream_subdir(app, storage, game, sub, seen, &topics, pack_cap, &item_count);
+
+        // Preserve support for the pre-packs/ trivia layout on the English fallback.
+        if(ok && game == HA_GAME_TRIVIA && (!app->lang[0] || topics == 0)) {
+            ok = ha_content_stream_dir(
+                app, storage, HA_USER_TRIVIA_DIR, game, seen, &topics, pack_cap, &item_count);
+            if(ok)
+                ok = ha_content_stream_dir(
+                    app, storage, HA_BUNDLED_TRIVIA_DIR, game, seen, &topics, pack_cap, &item_count);
         }
+        furi_record_close(RECORD_STORAGE);
     }
 
-    furi_record_close(RECORD_STORAGE);
+    if(!ok) {
+        ha_proto_send(app->uart, HA_MSG_CONTENT_ABORT, NULL, 0);
+        app->content_pending = false;
+        furi_string_set(app->status, "content_file_error");
+        return false;
+    }
+
+    uint8_t commit[4] = {
+        (uint8_t)(topics & 0xFF),
+        (uint8_t)((uint16_t)topics >> 8),
+        (uint8_t)(item_count & 0xFF),
+        (uint8_t)(item_count >> 8),
+    };
+    ha_proto_send(app->uart, HA_MSG_CONTENT_COMMIT, commit, sizeof(commit));
+    return true;
 }
 
 // ---------------- game selection ----------------
 
 void ha_select_game(HotspotArcadeApp* app, uint8_t game) {
-    app->active_game = game;
-    uint8_t g = game;
-    ha_proto_send(app->uart, HA_MSG_SELECT_GAME, &g, 1);
+    if(app->content_pending) {
+        furi_string_set(app->status, "content_busy");
+        return;
+    }
+    (void)ha_content_stream_game(app, game);
 }
 
 void ha_reset_scores(HotspotArcadeApp* app) {
@@ -319,22 +515,22 @@ void ha_reset_scores(HotspotArcadeApp* app) {
 
 static void send_config(HotspotArcadeApp* app) {
     FuriString* j = furi_string_alloc();
-    // `lang` is the phone-UI language; the ESP echoes it to each phone in `welcome`.
-    furi_string_printf(
-        j, "{\"max\":%d,\"lang\":\"%s\"}", HA_MAX_PLAYERS < 8 ? HA_MAX_PLAYERS : 8, app->lang);
+    // Locale belongs to CONTENT_BEGIN/COMMIT; CONFIG cannot publish it ahead
+    // of a replacement transaction that may still fail.
+    furi_string_printf(j, "{\"max\":%d}", HA_MAX_PLAYERS < 8 ? HA_MAX_PLAYERS : 8);
     ha_proto_send(
         app->uart, HA_MSG_CONFIG, (const uint8_t*)furi_string_get_cstr(j), furi_string_size(j));
     furi_string_free(j);
 }
 
-// Stream file asset[file_idx], or advance to SET_AP when all files are sent.
+// Stream file asset[file_idx], or advance to the content-restore gate when complete.
 static void send_next_file(HotspotArcadeApp* app) {
     if(app->file_idx >= app->asset_count) {
-        // All files streamed: stream the content packs (as votable topics), then
-        // name the AP and start.
-        ha_content_stream_packs(app);
-        ha_proto_send_str(app->uart, HA_MSG_SET_AP, furi_string_get_cstr(app->ssid));
-        app->hs = HaHsSetAp;
+        // All files streamed: restore just the selected game's content bank and wait
+        // for its exact correlated acknowledgement before naming/starting the AP. On
+        // a new session this is NONE (a valid zero/zero bank).
+        app->hs = HaHsContent;
+        if(!ha_content_stream_game(app, app->active_game)) app->hs = HaHsErr;
         return;
     }
     HaAsset* a = &app->assets[app->file_idx];
@@ -389,6 +585,8 @@ static void start_handshake(HotspotArcadeApp* app) {
     roster_clear(app);
     app->portal_running = false; // show progress, not "Broadcasting", while (re)streaming
     app->file_idx = 0;
+    app->pending_game = HA_GAME_NONE;
+    app->content_pending = false;
     ha_storage_load_manifest(app);
     furi_string_set(app->status, "starting");
     // Discard stale bytes and reset the frame parser.
@@ -398,10 +596,10 @@ static void start_handshake(HotspotArcadeApp* app) {
     }
     if(app->web_bundle_crc != 0 && app->web_bundle_crc == app->board_bundle_crc) {
         // The ESP already holds this exact bundle in flash (CRC from its PING beacon):
-        // skip CLEAR_FILES and the whole file stream, go straight to packs + SET_AP. We
+        // skip CLEAR_FILES and the whole file stream, go straight to the content gate. We
         // must NOT send CLEAR_FILES here, or the ESP would wipe the bundle we're relying on.
         app->file_idx = app->asset_count;
-        send_next_file(app); // streams content packs, sends SET_AP, sets HaHsSetAp
+        send_next_file(app); // streams content packs, waits in HaHsContent for exact ACK
         return;
     }
     ha_proto_send(app->uart, HA_MSG_CLEAR_FILES, NULL, 0);
@@ -414,6 +612,18 @@ void ha_session_start(HotspotArcadeApp* app) {
     app->link_lost = false;
     app->last_rx_tick = furi_get_tick();
     app->active_game = HA_GAME_NONE;
+    app->transport_paused = false;
+    app->transport_network_ready = false;
+    app->transport_wait_expired = false;
+    app->transport_reason = 0;
+    app->transport_expected_mask = 0;
+    app->transport_online_mask = 0;
+    app->transport_reconnect_ms = 0;
+    app->transport_host_deadline_set = false;
+    app->transport_host_deadline = 0;
+    app->transport_pending_ssid[0] = '\0';
+    app->pending_game = HA_GAME_NONE;
+    app->content_pending = false;
     furi_string_reset(app->console);
     start_handshake(app);
 }
@@ -423,8 +633,72 @@ void ha_session_stop(HotspotArcadeApp* app) {
     ha_proto_send(app->uart, HA_MSG_STOP, NULL, 0);
     app->session_active = false;
     app->portal_running = false;
+    app->transport_paused = false;
+    app->transport_network_ready = false;
+    app->transport_wait_expired = false;
+    app->transport_reason = 0;
+    app->transport_expected_mask = 0;
+    app->transport_online_mask = 0;
+    app->transport_reconnect_ms = 0;
+    app->transport_host_deadline_set = false;
+    app->transport_host_deadline = 0;
+    app->transport_pending_ssid[0] = '\0';
     app->hs = HaHsIdle;
     furi_string_set(app->status, "stopped");
+}
+
+void ha_session_transport_pause(
+    HotspotArcadeApp* app, uint8_t reason, const char* ssid, uint32_t reconnect_ms) {
+    if(!app || !app->session_active || app->hs != HaHsUp || !app->portal_running ||
+       !app->transport_network_ready || app->transport_paused || reconnect_ms > 600000)
+        return;
+    FuriString* json = furi_string_alloc_set_str("{\"reason\":\"");
+    furi_string_cat_str(
+        json, reason == HA_TRANSPORT_SSID_CHANGE ? "ssid_change" : "ap_off");
+    furi_string_cat_str(json, "\",\"ssid\":\"");
+    json_escape_cat(json, ssid ? ssid : "");
+    furi_string_cat_printf(json, "\",\"reconnect_ms\":%lu}", (unsigned long)reconnect_ms);
+    ha_proto_send(
+        app->uart,
+        HA_MSG_TRANSPORT_PAUSE,
+        (const uint8_t*)furi_string_get_cstr(json),
+        furi_string_size(json));
+    furi_string_free(json);
+    app->transport_reason = reason;
+    app->transport_reconnect_ms = reconnect_ms;
+    app->transport_host_deadline_set = false;
+    app->transport_host_deadline = 0; // starts only after the network is healthy again
+    app->transport_network_ready = false; // the 200 ms server_pause flush is not healthy
+    app->transport_wait_expired = false;
+    furi_string_set(app->status, "transport_pausing");
+}
+
+void ha_session_network_restart(HotspotArcadeApp* app) {
+    if(!app || !app->session_active || !app->transport_paused || app->portal_running) return;
+    app->transport_network_ready = false;
+    furi_string_set(app->status, "network_starting");
+    ha_proto_send(app->uart, HA_MSG_START, NULL, 0);
+}
+
+void ha_session_transport_resume(HotspotArcadeApp* app) {
+    if(!app || !app->session_active || !app->transport_paused || !app->portal_running ||
+       !app->transport_network_ready)
+        return;
+    // RESUME is idempotent at the engine. Permit an explicit retry if a UART frame
+    // or acknowledgement is lost instead of leaving the host stuck forever in a
+    // locally optimistic "transport_resuming" state.
+    furi_string_set(app->status, "transport_resuming");
+    if(app->transport_wait_expired) {
+        const uint8_t flags = HA_TRANSPORT_RESUME_EXPIRE_MISSING;
+        ha_proto_send(app->uart, HA_MSG_TRANSPORT_RESUME, &flags, 1);
+    } else {
+        ha_proto_send(app->uart, HA_MSG_TRANSPORT_RESUME, NULL, 0);
+    }
+}
+
+bool ha_session_transport_wait_elapsed(const HotspotArcadeApp* app) {
+    return app && app->transport_host_deadline_set &&
+           (int32_t)(furi_get_tick() - app->transport_host_deadline) >= 0;
 }
 
 // ---------------- STATUS handling (drives the handshake) ----------------
@@ -449,19 +723,83 @@ static void on_status(HotspotArcadeApp* app, const char* tok) {
     } else if(strncmp(tok, "ap_set", 6) == 0) {
         if(app->hs == HaHsSetAp) {
             send_config(app);
-            ha_proto_send(app->uart, HA_MSG_START, NULL, 0);
             app->hs = HaHsStart;
+            ha_proto_send(app->uart, HA_MSG_START, NULL, 0);
         }
+    } else if(strncmp(tok, "content_ok", 10) == 0) {
+        uint8_t committed_game = HA_GAME_NONE;
+        bool matches =
+            haContentStatusGame(tok, "content_ok", HA_GAME_FRANKENDRAW, &committed_game) &&
+            app->content_pending && committed_game == app->pending_game;
+        if(!matches) {
+            // Leave a newer transaction pending; stale/unidentified ACKs cannot
+            // advance the boot handshake or overwrite the displayed active game.
+            furi_string_set(app->status, "content_wait");
+            return;
+        }
+        app->active_game = committed_game;
+        app->content_pending = false;
+        if(app->hs == HaHsContent) {
+            app->hs = HaHsSetAp;
+            ha_proto_send_str(app->uart, HA_MSG_SET_AP, furi_string_get_cstr(app->ssid));
+        }
+    } else if(strncmp(tok, "content_error", 13) == 0) {
+        uint8_t failed_game = HA_GAME_NONE;
+        bool matches =
+            haContentStatusGame(tok, "content_error", HA_GAME_FRANKENDRAW, &failed_game) &&
+            app->content_pending && failed_game == app->pending_game;
+        if(!matches) {
+            furi_string_set(app->status, "content_wait");
+            return;
+        }
+        // The ESP preserved the previous live bank. During startup there is no safe
+        // fallback after reboot, so fail closed instead of exposing a NONE lobby.
+        app->content_pending = false;
+        if(app->hs == HaHsContent) app->hs = HaHsErr;
     } else if(strncmp(tok, "up", 2) == 0) {
         app->portal_running = true;
-        app->hs = HaHsUp;
-        // Restore the selected game if the ESP had rebooted mid-session.
-        if(app->active_game != HA_GAME_NONE) {
-            uint8_t g = app->active_game;
-            ha_proto_send(app->uart, HA_MSG_SELECT_GAME, &g, 1);
+        // STATUS up is immediately followed by TRANSPORT_STATE. Do not use stale masks
+        // from before shutdown to auto-resume in this gap; only the fresh snapshot may
+        // mark the restarted network ready and start the host reconnect window.
+        app->transport_network_ready = false;
+        app->transport_host_deadline_set = false;
+        app->transport_host_deadline = 0;
+        if(app->transport_paused && app->transport_reason == HA_TRANSPORT_SSID_CHANGE &&
+           app->transport_pending_ssid[0]) {
+            furi_string_set(app->ssid, app->transport_pending_ssid);
+            ha_storage_save_config(app);
+            app->transport_pending_ssid[0] = '\0';
         }
+        app->hs = HaHsUp;
+        // The handshake already restored selection through CONTENT_BEGIN..COMMIT.
     } else if(strncmp(tok, "stopped", 7) == 0) {
         app->portal_running = false;
+    } else if(strncmp(tok, "network_suspended", 17) == 0) {
+        app->portal_running = false;
+        app->transport_network_ready = false;
+        app->transport_host_deadline_set = false;
+        app->transport_host_deadline = 0;
+        if(app->transport_reason == HA_TRANSPORT_SSID_CHANGE)
+            ha_session_network_restart(app);
+    } else if(strncmp(tok, "ap_fallback", 11) == 0 ||
+              ((strncmp(tok, "ap_error", 8) == 0 || strncmp(tok, "dns_error", 9) == 0) &&
+               app->transport_paused && app->transport_reason == HA_TRANSPORT_SSID_CHANGE)) {
+        // The old app->ssid was intentionally kept until success. AP/DNS failure
+        // precedes `ap_fallback`, so either framed signal independently discards
+        // the candidate; a lost fallback token cannot let the later old-SSID `up`
+        // accidentally persist the failed name.
+        app->transport_pending_ssid[0] = '\0';
+    } else if(strncmp(tok, "transport_error", 15) == 0 ||
+              strncmp(tok, "transport_conflict", 18) == 0) {
+        app->transport_pending_ssid[0] = '\0';
+    } else if(strncmp(tok, "transport_resumed", 17) == 0) {
+        app->transport_paused = false;
+        app->transport_wait_expired = false;
+        app->transport_expected_mask = 0;
+        app->transport_online_mask = 0;
+        app->transport_host_deadline_set = false;
+        app->transport_host_deadline = 0;
+        furi_string_set(app->status, "up");
     } else if(strncmp(tok, "boot", 4) == 0) {
         // ESP rebooted: it lost the AP + all clients. Redo the handshake, but
         // rate-limit so a board stuck rebooting can't tight-loop the handshake.
@@ -493,9 +831,8 @@ static void dispatch_frame(HotspotArcadeApp* app) {
                 (len >= 10) ? (uint32_t)((uint32_t)p[6] | ((uint32_t)p[7] << 8) |
                                          ((uint32_t)p[8] << 16) | ((uint32_t)p[9] << 24))
                             : 0;
-            // v19+: byte 10 is the ESP's current game id. While hosting, mirror it so a
-            // phone-vote game change is reflected on the dashboard reliably (the beacon always
-            // arrives, unlike a one-off EVENT). Skip 0 (NONE): the ESP reports NONE for a beat
+            // v19+: byte 10 is the ESP's last committed game id. Mirror it as a
+            // recovery/diagnostic backstop. Skip 0 (NONE): the ESP reports NONE for a beat
             // after a reboot, before the "up" handler re-pushes the game to restore it -- don't
             // clobber the game we're about to restore.
             if(len >= 11 && app->session_active && p[10] != 0 && p[10] != app->active_game)
@@ -547,9 +884,8 @@ static void dispatch_frame(HotspotArcadeApp* app) {
         }
         break;
     case HA_MSG_ROUND_RESULT:
-        furi_string_set_str(app->last_event, (const char*)p);
-        console_add(app, (const char*)p);
-        feedback_success(app); // trivia reveal scored, or a Connect Four win
+        // Legacy v21-and-older JSON result. Current v22 firmware emits only the
+        // bounded typed HA_MSG_EVENT frame below.
         break;
     case HA_MSG_ART:
         // Finished Frankendraw artwork: op byte + JSON. Straight through to the SVG
@@ -564,29 +900,70 @@ static void dispatch_frame(HotspotArcadeApp* app) {
                 ha_art_end(app);
         }
         break;
-    case HA_MSG_EVENT: {
-        // Game-specific host-facing status line for the console / duel feed.
-        char ev[64];
-        if(ha_json_str((const char*)p, "duel", ev, sizeof(ev)) ||
-           ha_json_str((const char*)p, "pong", ev, sizeof(ev)) ||
-           ha_json_str((const char*)p, "draw", ev, sizeof(ev)) ||
-           ha_json_str((const char*)p, "chess", ev, sizeof(ev)) ||
-           ha_json_str((const char*)p, "bs", ev, sizeof(ev)) ||
-           ha_json_str((const char*)p, "spyfall", ev, sizeof(ev))) {
-            furi_string_set_str(app->last_event, ev);
-            console_add(app, ev);
-        } else if(ha_json_str((const char*)p, "gamevote", ev, sizeof(ev))) {
-            // A phone-initiated game change the ESP approved. Update our displayed active game
-            // immediately if this EVENT arrives; the PING beacon carries the current game as a
-            // reliable backstop regardless. Do NOT resend SELECT_GAME -- keeping active_game in
-            // sync is also what stops the "up" handler from reverting the vote after a reboot.
-            int id;
-            if(strcmp(ev, "approved") == 0 && ha_json_int((const char*)p, "id", &id) && id >= 0 &&
-               id <= HA_GAME_SECRETS)
-                app->active_game = (uint8_t)id;
-        } else if(ha_json_str((const char*)p, "chat", ev, sizeof(ev))) {
-            console_add(app, ev); // lobby chatter, not a game status line
+    case HA_MSG_TRANSPORT_STATE:
+        if(len == 10) {
+            bool was_network_ready = app->transport_network_ready;
+            app->portal_running = (p[0] & 0x08) != 0;
+            app->transport_paused = (p[0] & 0x01) != 0;
+            app->transport_network_ready = (p[0] & 0x02) != 0;
+            app->transport_reason = p[1];
+            app->transport_expected_mask = (uint16_t)p[2] | ((uint16_t)p[3] << 8);
+            app->transport_online_mask = (uint16_t)p[4] | ((uint16_t)p[5] << 8);
+            app->transport_reconnect_ms = (uint32_t)p[6] | ((uint32_t)p[7] << 8) |
+                                          ((uint32_t)p[8] << 16) | ((uint32_t)p[9] << 24);
+            // A periodic snapshot may describe an old still-live portal while a
+            // fresh handshake is streaming files/content. Only START is waiting
+            // for portal confirmation; never skip an in-flight handshake phase.
+            if(app->portal_running && app->transport_network_ready && app->hs == HaHsStart)
+                app->hs = HaHsUp;
+            if(app->transport_paused && app->portal_running &&
+               app->transport_network_ready &&
+               app->transport_reason == HA_TRANSPORT_SSID_CHANGE &&
+               app->transport_pending_ssid[0]) {
+                // A healthy authoritative snapshot is a redundant replacement for
+                // a dropped `up` STATUS. Failure tokens clear this candidate before
+                // a fallback snapshot can arrive.
+                furi_string_set(app->ssid, app->transport_pending_ssid);
+                ha_storage_save_config(app);
+                app->transport_pending_ssid[0] = '\0';
+            }
+            // TRANSPORT_STATE is authoritative even if the preceding STATUS frame was
+            // lost or failed its CRC. In particular, a successful explicit resume must
+            // dismiss the ten-minute Resume/End prompt without depending on the
+            // best-effort `transport_resumed` token.
+            if(!app->transport_paused) {
+                app->transport_wait_expired = false;
+                app->transport_expected_mask = 0;
+                app->transport_online_mask = 0;
+                app->transport_reason = 0;
+                app->transport_reconnect_ms = 0;
+                app->transport_host_deadline_set = false;
+                app->transport_host_deadline = 0;
+                if(app->portal_running) furi_string_set(app->status, "up");
+            }
+            if(app->transport_paused && app->portal_running &&
+               app->transport_network_ready && !was_network_ready &&
+               app->transport_reconnect_ms) {
+                app->transport_host_deadline = furi_get_tick() + app->transport_reconnect_ms;
+                app->transport_host_deadline_set = true;
+            }
+            if(app->transport_paused && !app->transport_wait_expired &&
+               ha_session_transport_wait_elapsed(app)) {
+                app->transport_wait_expired = true;
+                furi_string_set(app->status, "transport_wait_expired");
+            }
+            if(app->transport_paused && app->portal_running &&
+               app->transport_network_ready && !app->transport_wait_expired &&
+               app->transport_online_mask == app->transport_expected_mask)
+                ha_session_transport_resume(app);
+            else if(app->transport_paused && !app->portal_running &&
+                    app->transport_reason == HA_TRANSPORT_SSID_CHANGE)
+                // The down snapshot recovers a dropped `network_suspended` STATUS.
+                ha_session_network_restart(app);
         }
+        break;
+    case HA_MSG_EVENT: {
+        host_event_dispatch(app, p, len);
         break;
     }
     default:

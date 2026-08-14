@@ -36,7 +36,7 @@
   function renderCount(m) {
     sub("count");
     A.hideLead();
-    A.countdown("scr-count-num", m.sec);
+    A.countdown("scr-count-num", m.remaining_ms, m.paused);
   }
 
   function renderPlay(m) {
@@ -46,7 +46,7 @@
     var letters = $("scr-letters");
     var form = $("scr-form"), status = $("scr-status");
     if (reveal) {
-      A.timebarStop("scr-bar"); hide("scr-bar");
+      A.timebar("scr-bar", m.remaining_ms, m.duration_ms, m.paused, false);
       letters.className = "scr-letters answer";
       // Upper-case ASCII only: "ß".toUpperCase() is "SS" (two chars) and umlauts would
       // show a case the ASCII-folding answer check doesn't accept, so the tiles would
@@ -56,11 +56,12 @@
       status.textContent = t("scr.answer");
       solvedFor = -1;
     } else {
-      noteDeadline(m.deadline, m.dur); A.timebar("scr-bar", m.deadline, m.dur, false);
+      A.timebar("scr-bar", m.remaining_ms, m.duration_ms, m.paused, false);
       letters.className = "scr-letters";
       letters.textContent = upTiles(m.scram).split("").join(" ");
       var solved = !!m.solved;
       form.classList.toggle("hide", solved);
+      $("scr-input").disabled = !!m.paused;
       status.textContent = solved ? t("scr.solved") : t("scr.letters", { n: m.len });
       if (solved && solvedFor !== m.round) { solvedFor = m.round; A.sfx("correct"); A.vibe([25, 40, 25]); }
     }
@@ -96,6 +97,7 @@
   });
   $("scr-form").addEventListener("submit", function (e) {
     e.preventDefault();
+    if (A.inputsPaused()) return;
     var inp = $("scr-input");
     var g = inp.value.trim().slice(0, 24);
     inp.value = "";

@@ -26,7 +26,7 @@ reactions that float up on everyone's screen mid-game.
 **Whole-group** (scale to everyone in the room, ready-up lobby, shared live leaderboard):
 
 - **Trivia** — Kahoot-style and fully self-organizing. Players ready up and vote a topic
-  in the lobby; an all-ready 5-second countdown starts it; phones buzz in A/B/C/D with
+  in the lobby; an all-ready 3-second countdown starts it; phones buzz in A/B/C/D with
   points for correct and fast; a collapsible leaderboard rides along and a podium ends
   it. Topics are the trivia packs on the SD card.
 - **Would You Rather** — a live A/B poll; tap your pick, watch the split reveal. Prompts
@@ -99,8 +99,8 @@ the Flipper leaderboard):
 
 - **Drawing & guessing** — one player draws on their phone canvas, everyone else guesses
   in a chat; points for the drawer and the first correct guess; rounds rotate the drawer.
-  Words are the draw packs on the SD card (no vote strip — the first pack streamed is
-  the one played).
+  Words come from every non-empty draw pack on the SD card in round-robin order, with a
+  shuffled no-repeat cursor per pack that persists across replays.
 
 All games run on one pluggable engine on the ESP (the real-time referee), and the web
 client shares one implementation of the lobby, countdown, timer, leaderboard, and podium,
@@ -192,13 +192,21 @@ the games stay in sync.
 - The captive page hands off to the game web app at `http://192.168.4.1` (captive
   mini-browsers are too limited for WebSockets, so it is a "tap to open in your browser"
   handoff).
-- The Flipper streams the (gzipped) web bundle and content packs to the ESP over a
-  framed UART protocol, then orchestrates rounds. The web bundle is stored in a **LittleFS
-  flash partition** on the ESP and served from flash (so it costs no RAM and survives a
+- The Flipper streams the (gzipped) web bundle and the **selected game's** content to the
+  ESP over a framed UART protocol, then mirrors the authoritative engine state. The ESP
+  engine orchestrates rounds. Game/locale changes use a
+  count-checked transaction: a malformed or failed load leaves the prior game untouched,
+  and the ESP holds one live typed content bank plus at most one staged bank. The web bundle
+  is stored in a **LittleFS flash partition** on the ESP and served from flash (so it costs no RAM and survives a
   reboot); the Flipper re-streams it only when it changes — the board reports the bundle's
   CRC in its beacon and the Flipper skips the transfer when it already matches. Real-time
   game traffic stays on the ESP and never crosses the slow UART. Protocol:
   [docs/PROTOCOL.md](docs/PROTOCOL.md).
+- Timers use nested rollover-safe logical clocks. A normal phone disconnect reserves its
+  seat for exactly two minutes and pauses only an affected match or role-critical round;
+  planned AP downtime freezes the entire session. **Pause Hotspot** keeps the game intact,
+  and changing the SSID uses the same non-destructive pause/restart path with a ten-minute
+  return window. The host may resume early or stop the session explicitly.
 
 ## Install
 
@@ -308,11 +316,16 @@ On the Flipper: **Apps → GPIO → [ESP32] Hotspot Arcade**.
    up; the duels (Connect Four / Tic-Tac-Toe / Dots & Boxes / Reversi), **Drawing**, and
    **Pong** organize themselves too. The dashboard **Feed** watches events.
 5. **Leaderboard** shows live scores; **Console** shows the raw event log.
+6. Use **Pause Hotspot** for planned radio downtime, **Restart Hotspot** to bring it back,
+   and **Resume Now** if you do not want to wait for every expected phone. If the ten-minute
+   SSID-change window expires, the dashboard offers **Resume** / **End** directly and no late
+   reconnect can silently resume the game. **Stop Session** remains destructive.
 
 ## Content packs
 
-Seven games are content-driven from plain-text files under `packs/`, one directory per
-game (`trivia/`, `wyr/`, `scramble/`, `draw/`, `spectrum/`, `kmk/`, `spyfall/`). Format:
+Nine games are content-driven from plain-text files under `packs/`, one directory per
+game (`trivia/`, `wyr/`, `scramble/`, `draw/`, `spectrum/`, `kmk/`, `secrets/`,
+`fillblank/`, `spyfall/`). Format:
 `Key: value` lines, blocks split by `---` or a blank line, `Pack:` names the pack. The
 keys are per game — e.g. Trivia uses `Q:`, `A:`-`D:` and `Answer:`; Would You Rather uses
 `A:` / `B:`; Word Scramble and Draw &amp; Guess use `Word:`; Spyfall uses `Loc:` plus one
@@ -324,7 +337,9 @@ clash). See [packs/README.md](packs/README.md).
 content follow it. English is the default; **Brazilian Portuguese** ships as the first
 translation — the phone UI is fully localized, with a starter content pack per game.
 Translated packs live in a `<lang>/` subdirectory (`packs/<game>/pt-br/`), falling back to
-English per game, and content is UTF-8. The Flipper's own host menus stay English.
+English per game, and content is UTF-8. A language change transaction returns the current
+game to a fresh lobby while preserving its phone scoreboard. The Flipper's own host menus
+stay English.
 
 ## Responsible use
 

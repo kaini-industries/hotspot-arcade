@@ -17,13 +17,55 @@ All notable changes to Hotspot Arcade are documented here. The format is based o
   and in-memory game data for 120 seconds. Reconnecting within that window resumes the
   seat; expiry performs the game's leave/forfeit path exactly once and scrubs every
   game-specific pid role before that number can be reused. Lobby rosters expose `online`,
-  and offline players do not count toward quorum or accept challenges. Game clocks still
-  advance during this foundation release; host-pausable logical time lands in the next
-  Kaini integration slice.
+  and offline players do not count toward quorum or accept challenges. Accepted submitted
+  work remains earned during grace; live pack votes, connected polls, and Secrets reveal
+  cohorts use explicit online snapshots.
+- **Firmware v22 logical time and planned AP pause.** Nested session/game clocks freeze
+  the whole session across an SSID rename or manual AP pause, freeze only an affected
+  Pong/Chess/board match for ordinary disconnect grace, and freeze role-critical party
+  rounds without revealing which hidden role caused it. The host tracks the expected and
+  returned identity masks, starts the optional ten-minute window only after the AP returns,
+  and resumes automatically when everyone is back or explicitly when the host chooses. At
+  the exact rollover-safe window boundary, automatic resume stops and the dashboard presents
+  direct Resume/End controls; late reconnects cannot override that host decision.
+- Phone timer payloads now use bounded relative `remaining_ms`/`duration_ms` snapshots plus
+  `paused`; raw ESP deadlines and Chess `run`/`oms` are gone. Browsers animate from
+  `performance.now()`, block game input during pauses, and retain the planned-pause overlay
+  across socket reconnection. Reaction's random red-light deadline remains secret.
+- UART v22 adds `TRANSPORT_PAUSE`, `TRANSPORT_RESUME`, and fixed-size `TRANSPORT_STATE`;
+  content commit/abort move to `0x21`/`0x22`. Failed content transactions preserve both
+  clocks and all live state, while a successful atomic replacement starts a fresh lobby
+  and resets only the game clock.
 - Simulator coverage for protocol rejection, admission, identity hashing, token takeover,
-  the exact reconnect boundary, rollover-safe deadline helpers, and disconnect behavior in
-  role-critical and 1v1 games. The WebAssembly build explicitly uses the Emscripten C++
-  driver (`em++`) and is exercised under ASan/UBSan.
+  the exact reconnect boundary, rollover-safe clock helpers, planned transport recovery,
+  relative timer contracts, and disconnect behavior in role-critical and 1v1 games. The
+  WebAssembly build explicitly uses the Emscripten C++ driver (`em++`) and is exercised
+  under ASan/UBSan.
+- Content is now loaded with an active-game-only transaction. The ESP holds one live typed
+  content bank plus at most one staged bank, validates exact pack/item counts and per-game
+  caps, and swaps game and locale only after the complete replacement is valid. A failed
+  load preserves the prior game, round, roster, identities, scores, and reconnect grace.
+  Same-game locale replacement starts a fresh lobby without clearing phone scores.
+- Session startup now waits for an exact game-correlated content acknowledgement before
+  starting the hotspot. Oversized, unreadable, malformed, or over-cap pack sets abort the
+  staged bank instead of silently publishing a valid-looking truncated prefix.
+- Phone-initiated game changes now return a typed host-policy result instead of opening a
+  vote that could switch into an unloaded content game. Host selection remains immediate
+  through `CONTENT_BEGIN`…`CONTENT_COMMIT`.
+- Bounded typed host events now carry semantic milestones for all twenty games while
+  preserving the generic/art UART surfaces used by existing hosts. Lobby chat is valid
+  before a game is selected, and event text is validated UTF-8 capped at 96 bytes.
+- All score changes now pass through one saturating award path. Battleship awards its
+  winner exactly once, and Spectrum and Kiss Marry Kill clear per-game phone scores on
+  replay while cumulative host session scores remain available to the adapter.
+- Drawing & Guessing now rotates every non-empty pack, shuffles without replacement,
+  avoids a repeat across reshuffle boundaries, and persists pack/word/drawer cursors so
+  short replays remain fair to every seat.
+- The English Spectrum Wild Card pack adds 32 Left/Right pairs. It is intentionally
+  English-only; locale selection never synthesizes translations or mixes pack languages.
+- Planned AP shutdown now atomically detaches live transport sockets while preserving
+  expected identities, roles, challenges, and frozen clocks. At the exact ten-minute
+  boundary, still-missing seats are finalized once before the session resumes.
 
 ## [1.8.0] - 2026-08-11
 

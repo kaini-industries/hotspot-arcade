@@ -9,6 +9,7 @@
   var lastX = 0, lastY = 0;
   var lastSent = 0;             // throttle stroke sends
   var role = "";                // "drawer" | "guesser"
+  var paused = false;
   var revealedRound = -1;       // reveal sound guard
   var finaledFor = false;       // played the final win/lose cue once
 
@@ -53,16 +54,16 @@
   }
 
   function down(e) {
-    if (role !== "drawer") return;
+    if (role !== "drawer" || paused) return;
     e.preventDefault();
     drawing = true;
     var p = norm(e); lastX = p.x; lastY = p.y;
   }
   function moveEvt(e) {
-    if (role !== "drawer" || !drawing) return;
+    if (role !== "drawer" || paused || !drawing) return;
     e.preventDefault();
-    var now = Date.now();
-    if (now - lastSent < 20) return;        // ~50/s cap
+    var now = performance.now();
+    if (now - lastSent < 30) return;        // protocol-v22 Draw bucket cadence
     lastSent = now;
     var p = norm(e);
     seg(lastX, lastY, p.x, p.y);            // draw locally
@@ -100,6 +101,7 @@
     route("draw");
     if (A.view !== "draw") return;
     if (!canvas) ready();
+    paused = !!m.paused;
 
     var status = $("draw-status"), word = $("draw-word");
     var reveal = $("draw-reveal");
@@ -119,7 +121,7 @@
     finaledFor = false;
 
     if (m.phase === "reveal") {
-      role = ""; A.timebarStop("draw-bar"); hide("draw-bar");
+      role = ""; A.timebar("draw-bar", m.remaining_ms, m.duration_ms, m.paused, false);
       hide("draw-tools"); hide("draw-guess"); show("draw-reveal");
       var who = m.winner == null ? t("draw.nobody") : t("draw.got_it", { nick: esc(nickOf(m.winner)) });
       reveal.innerHTML = t("draw.word_label") + " <b>" + esc(m.word || "") + "</b><br>" + who;
@@ -146,16 +148,17 @@
     show("draw-word");
     role = m.role;
     revealedRound = -1;
+    $("draw-clear").disabled = paused;
+    $("draw-input").disabled = paused;
     status.textContent = t("common.round", { n: (m.round || 1), total: (m.rounds || m.round || 1) });
-    noteDeadline(m.deadline, m.dur);
-    A.timebar("draw-bar", m.deadline, m.dur, false);
+    A.timebar("draw-bar", m.remaining_ms, m.duration_ms, m.paused, false);
 
     if (role === "drawer") {
       word.className = "draw-word";
       word.textContent = m.word || "";
       show("draw-tools"); hide("draw-guess");
       sizeCanvas();
-      canvas.classList.add("drawable");
+      canvas.classList.toggle("drawable", !paused);
     } else {
       word.className = "draw-word blanks";
       word.textContent = blanks(m.len || 0);
@@ -185,12 +188,13 @@
     window.addEventListener("touchend", up);
 
     $("draw-clear").addEventListener("click", function () {
-      if (role !== "drawer") return;
+      if (role !== "drawer" || paused) return;
       clearCanvas(); A.sfx("buzz"); send({ t: "clear" });
     });
 
     $("draw-form").addEventListener("submit", function (e) {
       e.preventDefault();
+      if (paused) return;
       var inp = $("draw-input");
       var text = inp.value.trim();
       if (!text) return;

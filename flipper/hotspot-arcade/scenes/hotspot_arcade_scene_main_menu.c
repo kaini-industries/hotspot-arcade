@@ -7,6 +7,7 @@ typedef enum {
     MenuSelectGame,
     MenuLeaderboard,
     MenuConsole,
+    MenuTransport,
     MenuStop,
     MenuSsid,
     MenuFlashFirmware,
@@ -28,6 +29,22 @@ static void ha_show_message(HotspotArcadeApp* app, const char* header, const cha
     dialog_message_free(m);
 }
 
+static bool ha_menu_signature_matches(const HotspotArcadeApp* app) {
+    return app->main_menu_signature_valid &&
+           app->main_menu_session_active == app->session_active &&
+           app->main_menu_transport_paused == app->transport_paused &&
+           app->main_menu_portal_running == app->portal_running &&
+           strcmp(app->main_menu_ssid, furi_string_get_cstr(app->ssid)) == 0;
+}
+
+static void ha_menu_signature_capture(HotspotArcadeApp* app) {
+    app->main_menu_signature_valid = true;
+    app->main_menu_session_active = app->session_active;
+    app->main_menu_transport_paused = app->transport_paused;
+    app->main_menu_portal_running = app->portal_running;
+    strlcpy(app->main_menu_ssid, furi_string_get_cstr(app->ssid), sizeof(app->main_menu_ssid));
+}
+
 static void ha_menu_build(HotspotArcadeApp* app) {
     submenu_reset(app->submenu);
     submenu_set_header(app->submenu, app->session_active ? "Arcade  [ON]" : "Hotspot Arcade");
@@ -37,6 +54,14 @@ static void ha_menu_build(HotspotArcadeApp* app) {
         submenu_add_item(app->submenu, "Select Game", MenuSelectGame, ha_menu_cb, app);
         submenu_add_item(app->submenu, "Leaderboard", MenuLeaderboard, ha_menu_cb, app);
         submenu_add_item(app->submenu, "Console", MenuConsole, ha_menu_cb, app);
+        submenu_add_item(
+            app->submenu,
+            app->transport_paused ?
+                (app->portal_running ? "Resume Now" : "Restart Hotspot") :
+                "Pause Hotspot",
+            MenuTransport,
+            ha_menu_cb,
+            app);
         submenu_add_item(app->submenu, "Stop Session", MenuStop, ha_menu_cb, app);
     } else {
         submenu_add_item(app->submenu, "Start Session", MenuStartOrDash, ha_menu_cb, app);
@@ -52,7 +77,7 @@ static void ha_menu_build(HotspotArcadeApp* app) {
     submenu_add_item(app->submenu, "Settings", MenuSettings, ha_menu_cb, app);
     submenu_add_item(app->submenu, "About", MenuAbout, ha_menu_cb, app);
 
-    app->menu_shows_active = app->session_active;
+    ha_menu_signature_capture(app);
 }
 
 void hotspot_arcade_scene_main_menu_on_enter(void* context) {
@@ -68,8 +93,13 @@ bool hotspot_arcade_scene_main_menu_on_event(void* context, SceneManagerEvent ev
     if(event.type != SceneManagerEventTypeCustom) return false;
 
     if(event.event == HaEventRefreshView) {
-        if(app->session_active != app->menu_shows_active) {
+        // Transport state changes asynchronously while this menu is open, but ordinary
+        // PING/score/event traffic must not move its cursor. Rebuild only when a displayed
+        // input changes, and preserve the row the user is highlighting right now.
+        if(!ha_menu_signature_matches(app)) {
+            uint32_t selected = submenu_get_selected_item(app->submenu);
             ha_menu_build(app);
+            submenu_set_selected_item(app->submenu, selected);
             view_dispatcher_switch_to_view(app->view_dispatcher, HaViewSubmenu);
         }
         return true;
@@ -94,6 +124,16 @@ bool hotspot_arcade_scene_main_menu_on_event(void* context, SceneManagerEvent ev
         return true;
     case MenuConsole:
         scene_manager_next_scene(app->scene_manager, HaSceneTextView);
+        return true;
+    case MenuTransport:
+        if(!app->transport_paused)
+            ha_session_transport_pause(app, HA_TRANSPORT_AP_OFF, "", 0);
+        else if(!app->portal_running)
+            ha_session_network_restart(app);
+        else
+            ha_session_transport_resume(app);
+        ha_menu_build(app);
+        view_dispatcher_switch_to_view(app->view_dispatcher, HaViewSubmenu);
         return true;
     case MenuStop:
         ha_session_stop(app);

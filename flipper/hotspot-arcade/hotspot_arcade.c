@@ -44,6 +44,15 @@ static void ha_tick_callback(void* context) {
     }
     if(!app->session_active) return;
 
+    if(app->transport_paused && !app->transport_wait_expired &&
+       ha_session_transport_wait_elapsed(app)) {
+        // The deadline is a host prompt boundary, never a destructive action. The
+        // frozen engine remains intact until the host explicitly resumes or ends.
+        app->transport_wait_expired = true;
+        furi_string_set(app->status, "transport_wait_expired");
+        scene_manager_handle_custom_event(app->scene_manager, HaEventRefreshView);
+    }
+
     // Handshake watchdog: we got past board-detection but the ESP isn't acking our
     // protocol (wrong or absent firmware). Don't hang on "Preparing board..." forever;
     // drop to the "no board -> Install firmware" prompt so the user can flash the

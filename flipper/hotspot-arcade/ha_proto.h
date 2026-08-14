@@ -10,6 +10,18 @@
 #define HA_SYNC        (0xA5)
 #define HA_MAX_PAYLOAD (4096)
 #define HA_IDENTITY_BYTES (16) // first 128 bits of SHA-256(browser resume token)
+#define HA_HOST_EVENT_VERSION (1)
+#define HA_HOST_EVENT_TEXT_MAX (96)
+#define HA_HOST_EVENT_HEADER_SIZE (7)
+#define HA_TRANSPORT_RESUME_EXPIRE_MISSING (0x01)
+
+#define HA_HOST_EVT_MATCH_STARTED 1
+#define HA_HOST_EVT_CHAT          2
+#define HA_HOST_EVT_ROLE          3
+#define HA_HOST_EVT_ROUND_WIN     4
+#define HA_HOST_EVT_ROUND_DRAW    5
+#define HA_HOST_EVT_ROUND_COMPLETE 6
+#define HA_HOST_EVT_GAME_FINAL    7
 
 // Firmware identity in the PING beacon (must match the ESP's ha_proto.h). MAGIC
 // tells our board from another project's; VERSION lets us flag an outdated board.
@@ -17,7 +29,7 @@
 #define HA_FW_MAGIC_1 0x41
 #define HA_FW_MAGIC_2 0x52
 #define HA_FW_MAGIC_3 0x43
-#define HA_FW_VERSION 21 // v21: v1.8 games + browser protocol v2 resumable identities
+#define HA_FW_VERSION 22 // v22: logical clocks + planned transport pause/resume
 
 // Flipper -> ESP
 #define HA_MSG_CLEAR_FILES   0x10
@@ -26,25 +38,33 @@
 #define HA_MSG_START         0x13
 #define HA_MSG_STOP          0x14
 #define HA_MSG_RESET         0x15
-#define HA_MSG_SELECT_GAME   0x16
+#define HA_MSG_SELECT_GAME   0x16 // deprecated in v21: use CONTENT_BEGIN..COMMIT
 #define HA_MSG_QUESTION      0x17
 #define HA_MSG_REVEAL        0x18
 #define HA_MSG_ROUND_END     0x19
 #define HA_MSG_CONFIG        0x1A
 #define HA_MSG_RESET_SCORES  0x1B
-#define HA_MSG_CONTENT_CLEAR 0x1C // drop all packs, for every game
-#define HA_MSG_CONTENT_PACK  0x1D // payload = game byte + pack name; begins a pack
+#define HA_MSG_CONTENT_BEGIN 0x1C // payload = target game byte + locale ("" = English)
+#define HA_MSG_CONTENT_PACK  0x1D // payload = target game byte + pack name
 #define HA_MSG_CONTENT_ITEM  0x1E // payload = JSON object of the file's own keys
+#define HA_MSG_TRANSPORT_PAUSE 0x1F // JSON: reason, ssid, reconnect_ms
+#define HA_MSG_TRANSPORT_RESUME 0x20 // optional one-byte HA_TRANSPORT_RESUME_* flags
+#define HA_MSG_CONTENT_COMMIT 0x21 // payload = expected pack/item counts, uint16 LE each
+#define HA_MSG_CONTENT_ABORT 0x22 // discard staged bank; live game remains untouched
 
 // ESP -> Flipper
 #define HA_MSG_STATUS       0x80
 #define HA_MSG_JOIN         0x81
 #define HA_MSG_LEAVE        0x82
 #define HA_MSG_SCORE        0x83
-#define HA_MSG_ROUND_RESULT 0x84
-#define HA_MSG_EVENT        0x85
+#define HA_MSG_ROUND_RESULT 0x84 // reserved legacy JSON result (v21 and older)
+#define HA_MSG_EVENT        0x85 // typed HA_HOST_EVENT_VERSION frame
 #define HA_MSG_PING         0x86
 #define HA_MSG_ART          0x87 // finished artwork, streamed: op byte + JSON (see HA_ART_*)
+#define HA_MSG_TRANSPORT_STATE 0x88 // fixed 10-byte binary snapshot; flags bit3 = portal live
+
+#define HA_TRANSPORT_SSID_CHANGE 1
+#define HA_TRANSPORT_AP_OFF      2
 
 // HA_MSG_ART op byte. A completed picture is streamed as BEGIN, one STROKE per line
 // segment, then END, so neither side ever has to hold a whole drawing in RAM.
@@ -71,13 +91,9 @@
 #define HA_GAME_CHESS    15 // chess (1v1, full FIDE rules)
 #define HA_GAME_SECRETS  16 // secrets (party, hidden yes/no vote + prediction)
 #define HA_GAME_FILLBLANK 17 // fill the blank (party, judge picks the funniest answer)
-// 16 is Secrets (already on master) and 17 is reserved for a game in flight on another
-// branch; this game is trivially renumbered down to 17 if that one is dropped or lands
-// after it.
 #define HA_GAME_WEREWOLF 18 // werewolf (party, hidden roles + night/day phases)
 #define HA_GAME_SPYFALL  19 // spyfall (party, one player doesn't know the location)
-// 17..19 are claimed by games in flight on other branches (Werewolf took 19), so this
-// one starts at 20; the id renumbers trivially (it is not persisted anywhere).
+// v22 catalog ids are persisted in manifests/history and must never be renumbered.
 #define HA_GAME_FRANKENDRAW 20 // "Draw a Monster": head/torso/legs by three hands (party)
 
 static inline uint8_t ha_crc8_upd(uint8_t crc, uint8_t b) {

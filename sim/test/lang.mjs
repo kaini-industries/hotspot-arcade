@@ -31,14 +31,12 @@ import { PACK_DIRS, LANGS, resolvePacks, parseGenericPack } from "../web/trivia-
 // --- end to end: pt-BR content flows through the engine ---
 {
   const e = await newEngine();
-  e.reset(); e.contentClear();
+  e.reset();
   // Load the pt-BR trivia pack the way the host streams it: read file, parse, contentPack/Item.
   const text = readFileSync(new URL("../../packs/trivia/pt-br/geral.txt", import.meta.url), "utf8");
   const pk = parseGenericPack(text, "geral");
   assert.ok(pk.items.length >= 4, "the pt-BR trivia pack parsed some questions");
-  e.contentPack(1, pk.name);
-  for (const it of pk.items) e.contentItem(JSON.stringify(it));
-  e.selectGame(1);
+  e.loadContent(1, [{ name: pk.name, items: pk.items }], "pt-br");
   e.join(1, "ANA"); e.join(2, "BO");
   e.input(1, { t: "ready", ready: true });
   e.input(2, { t: "ready", ready: true });
@@ -55,7 +53,7 @@ import { PACK_DIRS, LANGS, resolvePacks, parseGenericPack } from "../web/trivia-
 {
   const e = await newEngine();
   e.reset();
-  e.setLang("pt-br");
+  e.loadContent(0, [], "pt-br");
   const w = e.join(1, "ANA").find((o) => o.to === "ws" && o.msg && o.msg.t === "welcome");
   assert.ok(w, "a welcome is sent on join");
   assert.equal(w.msg.lang, "pt-br", "welcome carries the host UI language");

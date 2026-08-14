@@ -51,6 +51,13 @@ static const char* game_name(uint8_t g) {
 static void ha_lobby_button_cb(GuiButtonType result, InputType type, void* context) {
     HotspotArcadeApp* app = context;
     if(type != InputTypeShort) return;
+    if(app->transport_wait_expired) {
+        if(result == GuiButtonTypeLeft)
+            view_dispatcher_send_custom_event(app->view_dispatcher, HaEventTransportResume);
+        else if(result == GuiButtonTypeRight)
+            view_dispatcher_send_custom_event(app->view_dispatcher, HaEventTransportEnd);
+        return;
+    }
     if(result == GuiButtonTypeLeft) {
         view_dispatcher_send_custom_event(app->view_dispatcher, HaEventPickGame);
     } else if(result == GuiButtonTypeRight) {
@@ -82,6 +89,8 @@ static const char* ha_stage_label(HotspotArcadeApp* app) {
         return "Preparing board...";
     case HaHsFiles:
         return "Uploading game...";
+    case HaHsContent:
+        return "Loading content...";
     case HaHsSetAp:
         return "Naming hotspot...";
     case HaHsStart:
@@ -97,10 +106,12 @@ static int ha_stage_progress(HotspotArcadeApp* app) {
         return 8;
     case HaHsFiles: {
         int n = app->asset_count ? app->asset_count : 1;
-        return 12 + (73 * app->file_idx) / n;
+        return 12 + (68 * app->file_idx) / n;
     }
+    case HaHsContent:
+        return 84;
     case HaHsSetAp:
-        return 88;
+        return 90;
     case HaHsStart:
         return 96;
     case HaHsUp:
@@ -133,8 +144,10 @@ static void ha_dashboard(HotspotArcadeApp* app) {
     FuriString* tmp = furi_string_alloc();
 
     // Header: a filled dot + the live status on the left, the player count on the right.
-    bool live = app->portal_running && !app->link_lost;
-    const char* state = app->link_lost ? "Reconnecting" : live ? "Broadcasting" : "Starting...";
+    bool live = app->portal_running && !app->link_lost && !app->transport_paused;
+    const char* state = app->transport_wait_expired ? "Resume or end" :
+                        app->transport_paused ? (app->portal_running ? "Waiting phones" : "AP paused") :
+                        app->link_lost ? "Reconnecting" : live ? "Broadcasting" : "Starting...";
     widget_add_circle_element(app->widget, 5, 6, 3, live);
     widget_add_string_element(app->widget, 13, 0, AlignLeft, AlignTop, FontPrimary, state);
     furi_string_printf(tmp, "%dP", ha_player_count(app));
@@ -147,8 +160,19 @@ static void ha_dashboard(HotspotArcadeApp* app) {
     furi_string_printf(tmp, "Join: %s", furi_string_get_cstr(app->ssid));
     widget_add_string_element(
         app->widget, 0, 17, AlignLeft, AlignTop, FontSecondary, furi_string_get_cstr(tmp));
-    widget_add_string_element(
-        app->widget, 0, 28, AlignLeft, AlignTop, FontSecondary, "Open 192.168.4.1");
+    if(app->transport_paused) {
+        int expected = 0, online = 0;
+        for(int bit = 0; bit < 16; bit++) {
+            if(app->transport_expected_mask & (1U << bit)) expected++;
+            if(app->transport_online_mask & (1U << bit)) online++;
+        }
+        furi_string_printf(tmp, "Rejoined %d/%d", online, expected);
+        widget_add_string_element(
+            app->widget, 0, 28, AlignLeft, AlignTop, FontSecondary, furi_string_get_cstr(tmp));
+    } else {
+        widget_add_string_element(
+            app->widget, 0, 28, AlignLeft, AlignTop, FontSecondary, "Open 192.168.4.1");
+    }
     widget_add_string_element(
         app->widget, 127, 28, AlignRight, AlignTop, FontSecondary, game_name(app->active_game));
 
@@ -171,8 +195,18 @@ static void ha_dashboard(HotspotArcadeApp* app) {
 
     // Left picks the game; Right shows scores. Games are player-driven, so there is no
     // host-side game screen — the main menu's Console shows the live event feed.
-    widget_add_button_element(app->widget, GuiButtonTypeLeft, "Games", ha_lobby_button_cb, app);
-    widget_add_button_element(app->widget, GuiButtonTypeRight, "Scores", ha_lobby_button_cb, app);
+    widget_add_button_element(
+        app->widget,
+        GuiButtonTypeLeft,
+        app->transport_wait_expired ? "Resume" : "Games",
+        ha_lobby_button_cb,
+        app);
+    widget_add_button_element(
+        app->widget,
+        GuiButtonTypeRight,
+        app->transport_wait_expired ? "End" : "Scores",
+        ha_lobby_button_cb,
+        app);
 
     furi_string_free(tmp);
 }
@@ -202,7 +236,7 @@ static void ha_lobby_render(HotspotArcadeApp* app) {
             app->widget, GuiButtonTypeCenter, "Update fw", ha_noboard_button_cb, app);
         return;
     }
-    if(app->portal_running || app->link_lost) {
+    if(app->portal_running || app->link_lost || app->transport_paused) {
         ha_dashboard(app);
         return;
     }
@@ -267,6 +301,14 @@ bool hotspot_arcade_scene_lobby_on_event(void* context, SceneManagerEvent event)
         return true;
     case HaEventShowLeaderboard:
         scene_manager_next_scene(app->scene_manager, HaSceneLeaderboard);
+        return true;
+    case HaEventTransportResume:
+        ha_session_transport_resume(app);
+        ha_lobby_render(app);
+        return true;
+    case HaEventTransportEnd:
+        ha_session_stop(app);
+        scene_manager_previous_scene(app->scene_manager);
         return true;
     default:
         return false;
