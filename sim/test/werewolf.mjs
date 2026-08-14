@@ -365,15 +365,18 @@ async function toNight(n) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. The last werewolf walks out mid-game: the village wins by default
+// 5. The last werewolf walks out: grace preserves the role, then the village wins
 // ---------------------------------------------------------------------------
 {
   const g = await toNight(5);
   const wolf = g.of(WOLF)[0];
   g.drop(wolf);
+  assert.equal(g.view[g.pids().find((p) => p !== wolf)].phase, "play",
+    "the hidden role remains reserved during reconnect grace");
+  g.tick(g.ms + 120000);
   const left = g.pids().filter((p) => p !== wolf);
   for (const p of left) {
-    assert.equal(g.view[p].phase, "final", "the game ends the moment the pack is gone");
+    assert.equal(g.view[p].phase, "final", "the game ends when the absent role expires");
     assert.equal(g.view[p].winner, "villagers", "villagers win when the last wolf leaves");
   }
   // The vacated pid is genuinely gone, not a ghost still holding a role.
@@ -449,11 +452,11 @@ for (const N of [4, 5, 6, 8]) {
   g.drop(5);
   assert.equal(g.view[1].phase, "lobby", "a leaver during the countdown disarms it");
   assert.equal(g.view[1].enough, false, "and the lobby says the room is too small again");
-  g.join(9, "LATE"); // a new socket, handed the vacated pid 5
+  g.join(9, "LATE"); // a different identity gets another seat while pid 5 is reserved
   assert.equal(g.view[1].phase, "lobby", "the newcomer has not readied yet");
   assert.equal(g.view[1].enough, true, "but the room is big enough once more");
-  assert.equal(g.view[1].players.filter((p) => p.ready).length, 4,
-    "the leaver's ready flag did not carry over to whoever took their pid");
+  assert.equal(g.view[1].players.filter((p) => p.online !== false && p.ready).length, 4,
+    "the offline seat's old ready flag does not satisfy current quorum");
   g.send(9, { t: "ready", ready: true });
   assert.equal(g.view[1].phase, "countdown", "and the fifth ready re-arms it");
   for (let ms = 1000; ms <= 4000; ms += 1000) g.tick(ms);

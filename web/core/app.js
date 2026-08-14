@@ -6,11 +6,15 @@ var A = {
   pid: null,
   nick: "",
   avatar: "🙂",   // emoji avatar, picked on the landing screen
+  resume: "",     // browser-only 128-bit bearer token, persisted per phone
+  code: "",       // six-digit party admission code; deliberately not persisted
   view: "landing",     // landing | lobby | trivia | duel | draw | pong
   joined: false,       // true once the user committed a nick (Play) or is rejoining
+  authenticated: false,
   offset: 0,           // serverMillis - localNow, learned from first timed msg
   offsetSet: false,
   retry: 0,
+  takeover: false,     // displaced by a newer socket using the same resume token
   handlers: {},        // messageType -> fn(msg), filled by game modules
 };
 
@@ -241,10 +245,12 @@ A.readyLobby = function (cfg) {
   (cfg.players || []).forEach(function (p) {
     var li = document.createElement("li");
     if (p.pid === A.pid) { li.className = "self"; mine = !!p.ready; }
+    if (p.online === false) li.className += (li.className ? " " : "") + "offline";
     li.innerHTML =
       '<span class="av">' + esc(p.avatar || "🙂") + "</span>" +
       '<span class="pn">' + esc(p.nick) + "</span>" +
-      '<span class="rdy' + (p.ready ? " on" : "") + '">' + (p.ready ? "Ready" : "...") + "</span>";
+      '<span class="rdy' + (p.ready ? " on" : "") + '">' +
+      (p.online === false ? t("common.offline") : (p.ready ? t("common.ready_short") : "...")) + "</span>";
     ul.appendChild(li);
   });
   var rb = $(cfg.readyId);
@@ -339,6 +345,22 @@ A.timebarStop = function (barId) {
 function send(obj) {
   if (A.ws && A.ws.readyState === 1) A.ws.send(JSON.stringify(obj));
 }
+function sendHello() {
+  var hello = {
+    t: "hello", proto: 2, nick: A.nick, avatar: A.avatar, resume: A.resume,
+  };
+  if (A.code) hello.code = A.code;
+  send(hello);
+}
+
+function createResumeToken() {
+  if (!window.crypto || !window.crypto.getRandomValues) return "";
+  var bytes = new Uint8Array(16);
+  window.crypto.getRandomValues(bytes);
+  var token = "";
+  for (var i = 0; i < bytes.length; i++) token += bytes[i].toString(16).padStart(2, "0");
+  return token;
+}
 
 /* Header status dot: "" connected (orange), "warn" reconnecting, "bad" down. */
 function setDot(cls) { $("dot").className = "dot" + (cls ? " " + cls : ""); }
@@ -380,23 +402,21 @@ function storeKey(name) {
   return h ? name + "_" + h : name;
 }
 
-/* Stable per-phone id so a returning player keeps their score even when iOS hands out a
-   fresh randomized Wi-Fi MAC (a "forget network" or OS change makes the phone look new to
-   the host). Generated once, kept in localStorage, and sent in every hello; the host keys
-   parked players on it instead of the MAC. */
-function clientId() {
+/* The raw resume credential never leaves this browser except in a protocol-v2 hello.
+   The engine hashes it immediately and hosts persist only the derived identity. */
+function resumeToken() {
+  var v = "";
   try {
-    var k = storeKey("ha_cid"), v = localStorage.getItem(k);
-    if (!v) {
-      v = Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
-      localStorage.setItem(k, v);
+    var k = storeKey("ha_resume");
+    v = localStorage.getItem(k) || "";
+    if (!/^[0-9a-f]{32}$/.test(v)) {
+      v = createResumeToken();
+      if (v) localStorage.setItem(k, v);
     }
-    return v;
-  } catch (e) {
-    return "";
-  }
+  } catch (e) { v = createResumeToken(); }
+  return v;
 }
-A.cid = clientId();
+A.resume = resumeToken();
 
 /* Is the link actually alive? A socket that dies quietly -- the phone's WiFi drops,
    the host's AP goes away, the phone sleeps -- often produces no "close" event for a
@@ -419,7 +439,7 @@ function stopLiveness() {
 // for minutes with no hint anything is wrong. Two stages: warn at WARN_MS (colour the dot,
 // raise the bar -- free), and close at DEAD_MS so onclose -> scheduleReconnect() actually
 // tears the dead link down. Reconnecting is safe now: the phone restores its own player by
-// its stable client id (clientId()/onHello), and a reconnect while a game-vote is open
+// its protocol-v2 resume token, and a reconnect while a game-vote is open
 // RE-pushes the vote rather than dismissing it -- the host's pushAll short-circuits to the
 // vote while it is active, and the client no longer closes the overlay on stray traffic --
 // so the old "a reconnect ate the vote overlay" behaviour cannot recur.
@@ -448,12 +468,14 @@ function startLiveness() {
 }
 
 function connect() {
+  if (A.takeover) return;
   var ws = harnessSocket();
   if (!ws) {
     try { ws = new WebSocket(wsUrl()); }
     catch (e) { scheduleReconnect(); return; }
   }
   A.ws = ws;
+  A.authenticated = false;
 
   ws.onopen = function () {
     A.retry = 0;
@@ -462,7 +484,7 @@ function connect() {
     setDot("");           // connected
     // Auto (re)join only if we already have a nickname. A first-time visitor
     // stays on the landing screen until they press Play.
-    if (A.joined) send({ t: "hello", nick: A.nick, avatar: A.avatar, cid: A.cid });
+    if (A.joined) sendHello();
   };
 
   ws.onmessage = function (ev) {
@@ -472,11 +494,25 @@ function connect() {
     dispatch(m);
   };
 
-  ws.onclose = function () { stopLiveness(); scheduleReconnect(); };
+  ws.onclose = function (ev) {
+    if (A.ws !== ws) return;
+    stopLiveness();
+    A.ws = null;
+    A.authenticated = false;
+    if (ev && ev.code === 1008 && ev.reason === "identity takeover") {
+      A.takeover = true;
+      setDot("bad");
+      $("netbar").textContent = t("net.identity_takeover");
+      show("netbar");
+      return;
+    }
+    scheduleReconnect();
+  };
   ws.onerror = function () { try { ws.close(); } catch (e) {} };
 }
 
 function scheduleReconnect() {
+  if (A.takeover) return;
   setDot(A.retry > 4 ? "bad" : "warn");   // down after repeated failures
   if (A.view !== "landing") {
     $("netbar").textContent = t("net.reconnecting");
@@ -522,11 +558,9 @@ function dispatch(m) {
   notePlayerCount(m);   // the switcher greys out on the CURRENT count, not the last lobby's
   switch (m.t) {
     case "welcome":
-      // The server owns identity: one phone is one player, recognised by its IP, so
-      // a second browser context on this phone (iOS pops a captive mini-browser with
-      // storage of its own, next to Safari) is handed the player it already has --
-      // same pid, same name, same avatar -- instead of becoming a second player.
-      // Adopting the echo here is what makes that visible in this context's header.
+      A.authenticated = true;
+      A.code = ""; // admission credential is one-shot and is never persisted
+      if ($("join-code")) $("join-code").value = "";
       A.pid = m.pid;
       if (A.setLang) A.setLang(m.lang); // host-chosen UI language; localizes static text
       if (m.avatar) A.avatar = m.avatar;
@@ -542,6 +576,17 @@ function dispatch(m) {
           localStorage.setItem(storeKey("ha_avatar"), A.avatar);
         } catch (e) {}
       }
+      break;
+    case "reject":
+      A.authenticated = false;
+      A.joined = false;
+      screen("landing");
+      if ($("join-code")) $("join-code").focus();
+      if (m.code === "auth_required") toast(t("join.auth_required"));
+      else if (m.code === "bad_code") toast(t("join.bad_code"));
+      else if (m.code === "throttled") toast(t("join.throttled"));
+      else if (m.code === "full") toast(t("join.full"));
+      else toast(t("join.bad_protocol"));
       break;
     case "lobby":
       onLobby(m);
@@ -596,7 +641,9 @@ function lobbyView(incEl, listEl, challenges) {
   var iChallenged = challenges.some(function (c) { return c.from === A.pid; });
   // Exclude yourself and anyone currently in a 1v1 match (playing or still on their
   // over screen) — they can't be challenged until they come back to the lobby.
-  var others = (A.players || []).filter(function (p) { return p.pid !== A.pid && !p.busy; });
+  var others = (A.players || []).filter(function (p) {
+    return p.pid !== A.pid && p.online !== false && !p.busy;
+  });
   listEl.innerHTML = "";
   if (!others.length) {
     var empty = document.createElement("li");
@@ -636,6 +683,7 @@ function onLobby(m) {
   A.players.forEach(function (p) {
     var li = document.createElement("li");
     if (p.pid === A.pid) li.className = "self";
+    if (p.online === false) li.className += (li.className ? " " : "") + "offline";
     li.innerHTML =
       '<span class="av">' + esc(p.avatar || "🙂") + "</span>" +
       '<span class="pn">' + esc(p.nick) + "</span>" +
@@ -666,6 +714,7 @@ function onLobby(m) {
 
 /* Landing flow */
 function startPlay() {
+  A.code = $("join-code") ? $("join-code").value.trim() : "";
   // Uppercase to match how every name is shown (the ESP does the same on hello,
   // so this is just to avoid a flash of the typed casing before the echo lands).
   var n = $("nick").value.trim().slice(0, 12).toUpperCase();
@@ -684,7 +733,7 @@ function startPlay() {
   A.initAudio();          // first gesture: unlock audio for the session
   A.sfx("start"); A.vibe(30);
   try { localStorage.setItem(storeKey("ha_nick"), n); localStorage.setItem(storeKey("ha_avatar"), A.avatar); } catch (e) {}
-  send({ t: "hello", nick: n, avatar: A.avatar, named: 1, cid: A.cid });
+  sendHello();
   screen("lobby");
 }
 
@@ -754,7 +803,7 @@ function saveIdEdit() {
   setNick();
   A.sfx("start"); A.vibe(20);
   try { localStorage.setItem(storeKey("ha_nick"), n); localStorage.setItem(storeKey("ha_avatar"), A.avatar); } catch (e) {}
-  send({ t: "hello", nick: n, avatar: A.avatar, named: 1, cid: A.cid });
+  sendHello();
   closeIdEdit();
 }
 
@@ -1039,4 +1088,12 @@ function initApp() {
   setInterval(function () { send({ t: "ping" }); }, 20000);
 }
 
+if (typeof globalThis !== "undefined" && globalThis.__HA_TEST__) {
+  globalThis.__HA_TEST_API__ = {
+    dispatch: dispatch,
+    sendHello: sendHello,
+    connect: connect,
+    createResumeToken: createResumeToken,
+  };
+}
 document.addEventListener("DOMContentLoaded", initApp);

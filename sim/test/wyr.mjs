@@ -69,4 +69,22 @@ assert.deepEqual(late.rounds, fin.rounds, "a late joiner sees the full round his
 const again = lastToWs(e.input(1, { t: "again" }), 1, "wyr").msg;
 assert.equal(again.phase, "lobby", "again returns everyone to the lobby");
 
+// A disconnected noncritical voter keeps their seat for resume but no longer blocks
+// the online room's quorum. The one remaining vote resolves immediately.
+const grace = await newEngine();
+grace.reset();
+grace.join(1, "ONLINE");
+grace.join(2, "SLEEPING");
+grace.selectGame(WYR);
+grace.contentClear();
+grace.contentPack(WYR, "Grace");
+grace.contentItem(JSON.stringify({ a: "A", b: "B" }));
+grace.input(1, { t: "ready", ready: true });
+grace.input(2, { t: "ready", ready: true });
+grace.tick(3000);
+grace.input(1, { t: "answer", c: 0 });
+const graceOut = grace.disconnect(2);
+const graceState = lastToWs(graceOut, 1, "wyr").msg;
+assert.equal(graceState.phase, "reveal", "offline noncritical player is excluded from quorum");
+
 console.log("wyr: all checks passed");

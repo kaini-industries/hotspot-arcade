@@ -7,20 +7,29 @@ export async function newEngine() {
   const api = {
     drain,
     reset: () => { M.ccall("ha_reset", null, [], []); return drain(); },
+    resetAt: (ms) => { M.ccall("ha_reset_at", null, ["number"], [ms]); return drain(); },
+    setAdmissionFull: (full) => {
+      M.ccall("ha_set_admission_full", null, ["number"], [full ? 1 : 0]);
+      return drain();
+    },
     tick: (ms) => { M.ccall("ha_tick", null, ["number"], [ms]); return drain(); },
     input: (wsId, obj) => {
       M.ccall("ha_input", null, ["number", "string"], [wsId, JSON.stringify(obj)]);
       return drain();
     },
-    disconnect: (wsId) => { M.ccall("ha_disconnect", null, ["number"], [wsId]); return drain(); },
-    // Which phone a socket sits on. Sockets default to one device each (a panel per
-    // phone); give two of them the same key to model two browser contexts on one
-    // phone, or 0 to model a device the firmware couldn't identify. The key is split
-    // into two 32-bit halves because ccall has no 64-bit argument type.
-    setDevice: (wsId, key) => {
-      const hi = Math.floor(key / 2 ** 32) >>> 0;
-      M.ccall("ha_ws_device", null, ["number", "number", "number"], [wsId, hi, key >>> 0]);
+    inputRaw: (wsId, json) => {
+      M.ccall("ha_input", null, ["number", "string"], [wsId, json]);
+      return drain();
     },
+    inputAt: (wsId, obj, ms) => {
+      M.ccall("ha_input_at", null, ["number", "string", "number"], [wsId, JSON.stringify(obj), ms]);
+      return drain();
+    },
+    disconnect: (wsId) => { M.ccall("ha_disconnect", null, ["number"], [wsId]); return drain(); },
+    timeReached: (now, deadline) =>
+      M.ccall("ha_time_reached", "number", ["number", "number"], [now, deadline]) !== 0,
+    timeRemaining: (now, deadline) =>
+      M.ccall("ha_time_remaining", "number", ["number", "number"], [now, deadline]) >>> 0,
     selectGame: (id) => { M.ccall("ha_select_game", null, ["number"], [id]); return drain(); },
     roundEnd: () => { M.ccall("ha_round_end", null, [], []); return drain(); },
     resetScores: () => { M.ccall("ha_reset_scores", null, [], []); return drain(); },
@@ -52,17 +61,14 @@ export async function newEngine() {
         [board64, stm, rights, ep, depth],
       ),
   };
-  api.join = (wsId, nick) => api.input(wsId, { t: "hello", nick, avatar: "🙂" });
+  api.join = (wsId, nick, resume = undefined, code = undefined) => {
+    const token = resume || wsId.toString(16).padStart(32, "0").slice(-32);
+    return api.input(wsId, {
+      t: "hello", proto: 2, nick, avatar: "🙂", resume: token,
+      ...((code === null) ? {} : { code: code === undefined ? "123456" : code }),
+    });
+  };
   return api;
-}
-
-/**
- * A MAC as the opaque device key the engine identifies a phone by. On hardware the
- * firmware builds this from the station's MAC; the exact encoding is its business, so
- * tests only need distinct, stable numbers (48 bits fits a JS integer exactly).
- */
-export function macKey(a, b, c, d, e, f) {
-  return ((((a * 256 + b) * 256 + c) * 256 + d) * 256 + e) * 256 + f;
 }
 
 /** Last broadcast (to:"all") whose msg.t equals `type`, or undefined. */

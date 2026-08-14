@@ -406,11 +406,14 @@ function mv(pid, from, to, promo) {
   assert.equal(score.reason, "chesswin");
 }
 
-// ---- 16. Disconnect forfeit ----------------------------------------------------------------
+// ---- 16. Disconnect grace, then forfeit -----------------------------------------------------
 {
   startGame();
-  const out = e.disconnect(1);
-  const b = lastToWs(out, 2, "chess");
+  let out = e.disconnect(1);
+  let b = lastToWs(out, 2, "chess");
+  assert.equal(b.msg.phase, "playing", "the match seat is reserved during reconnect grace");
+  out = e.tick(121000); // startGame advanced raw millis to 1,000 before disconnect
+  b = lastToWs(out, 2, "chess");
   assert.equal(b.msg.phase, "over");
   assert.equal(b.msg.reason, "left");
   assert.equal(b.msg.result, "win");

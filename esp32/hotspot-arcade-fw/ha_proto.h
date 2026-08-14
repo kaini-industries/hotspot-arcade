@@ -7,6 +7,7 @@
 #define HA_UART_BAUD 921600
 #define HA_SYNC 0xA5
 #define HA_MAX_PAYLOAD 4096
+#define HA_IDENTITY_BYTES 16 // first 128 bits of SHA-256(browser resume token)
 
 // Firmware identity carried in every PING beacon: a 4-byte project MAGIC so a
 // different project's beacon is never mistaken for ours, and a VERSION so the
@@ -16,7 +17,7 @@
 #define HA_FW_MAGIC_1 0x41 // 'A'
 #define HA_FW_MAGIC_2 0x52 // 'R'
 #define HA_FW_MAGIC_3 0x43 // 'C'  ("HARC" = Hotspot ARCade)
-#define HA_FW_VERSION 20 // v20: Frankendraw + ART report, atop v1.7.1 (PSRAM, caching, reconnect id)
+#define HA_FW_VERSION 21 // v21: v1.8 games + browser protocol v2 resumable identities
 
 // Flipper -> ESP
 enum {

@@ -6,7 +6,7 @@
 // is the fidelity boundary: it carries exactly what the firmware would have sent.
 #include "Arduino.h"
 
-#include <map>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -21,6 +21,8 @@ uint32_t millis() { return g_millis; }
 
 static Engine engine;
 static std::vector<std::string> g_outbox;
+static std::vector<std::string> g_knownIdentities;
+static bool g_admissionFull = false;
 static std::string g_drained; // return buffer; must outlive the call
 
 // Escape a C string for embedding as a JSON string value. Only nicknames and score
@@ -57,14 +59,42 @@ void haWsSendWs(uint32_t wsId, const String& msg) {
         "{\"to\":\"ws\",\"id\":" + std::to_string(wsId) + ",\"msg\":" + msg.str() + "}");
 }
 
+void haWsCloseWs(uint32_t wsId) {
+    g_outbox.push_back(
+        "{\"to\":\"ws\",\"id\":" + std::to_string(wsId) +
+        ",\"kind\":\"close\",\"code\":1008,\"reason\":\"identity takeover\"}");
+}
+
 void haWsBroadcast(const String& msg) {
     g_outbox.push_back("{\"to\":\"all\",\"msg\":" + msg.str() + "}");
+}
+
+uint8_t haAuthorizeIdentity(
+    uint32_t wsId, const char* identity, const char* code, uint32_t* retryMs) {
+    (void)wsId;
+    if(retryMs) *retryMs = 0;
+    if(std::find(g_knownIdentities.begin(), g_knownIdentities.end(), identity) !=
+       g_knownIdentities.end())
+        return HA_JOIN_AUTH_KNOWN;
+    if(g_admissionFull) return HA_JOIN_AUTH_FULL;
+    if(!code || !code[0]) return HA_JOIN_AUTH_REQUIRED;
+    return strcmp(code, "123456") == 0 ? HA_JOIN_AUTH_OK : HA_JOIN_AUTH_BAD_CODE;
 }
 
 void haUartJoin(uint8_t pid, const char* nick) {
     g_outbox.push_back(
         "{\"to\":\"uart\",\"kind\":\"join\",\"pid\":" + std::to_string(pid) +
         ",\"nick\":\"" + esc(nick) + "\"}");
+}
+
+void haUartJoinStable(uint8_t pid, const char* identity, const char* nick, const char* avatar) {
+    if(std::find(g_knownIdentities.begin(), g_knownIdentities.end(), identity) ==
+       g_knownIdentities.end())
+        g_knownIdentities.push_back(identity);
+    g_outbox.push_back(
+        "{\"to\":\"uart\",\"kind\":\"join\",\"pid\":" + std::to_string(pid) +
+        ",\"identity\":\"" + esc(identity) + "\",\"nick\":\"" + esc(nick) +
+        "\",\"avatar\":\"" + esc(avatar) + "\"}");
 }
 
 void haUartLeave(uint8_t pid) {
@@ -106,44 +136,38 @@ void haUartArt(uint8_t op, const String& json) {
         ",\"json\":" + json.str() + "}");
 }
 
-// --- stub devices ---------------------------------------------------------------
-// The engine keys a player on the phone, so the sim has to model one. On hardware the
-// key is built from the station's MAC; here each simulated socket gets a synthetic
-// locally-administered MAC of its own by default (02:00:00:00:00:<wsId>), which keeps
-// every panel and every existing test a separate device exactly as before. A test that
-// wants two connections on ONE phone calls ha_ws_device() to give them the same key.
-static std::map<uint32_t, uint64_t> g_devByWs;
-
-static uint64_t simDevice(uint32_t wsId) {
-    auto it = g_devByWs.find(wsId);
-    if(it != g_devByWs.end()) return it->second;
-    return 0x020000000000ull | (wsId & 0xFF); // 02:00:00:00:00:<wsId>; ids stay small
-}
-
 // --- exported C API ------------------------------------------------------------
 extern "C" {
 
 void ha_reset() {
     g_millis = 0;
-    g_devByWs.clear();
-    engine.reset();
+    g_knownIdentities.clear();
+    g_admissionFull = false;
+    engine.reset(g_millis);
 }
-
-// Put a socket on a given device, overriding the default one-device-per-socket above.
-// The key is passed as two 32-bit halves because ccall has no 64-bit argument type.
-// 0 = unknown (what the firmware reports when it cannot identify the peer), which puts
-// that connection back on per-connection identity.
-void ha_ws_device(uint32_t wsId, uint32_t hi, uint32_t lo) {
-    g_devByWs[wsId] = ((uint64_t)hi << 32) | lo;
+void ha_reset_at(uint32_t now) {
+    g_millis = now;
+    g_knownIdentities.clear();
+    g_admissionFull = false;
+    engine.reset(g_millis);
 }
+void ha_set_admission_full(int full) { g_admissionFull = full != 0; }
 
 void ha_tick(uint32_t now) {
     g_millis = now;
     engine.tick(now);
 }
 
-void ha_input(uint32_t wsId, const char* json) { engine.onInput(wsId, simDevice(wsId), json); }
-void ha_disconnect(uint32_t wsId) { engine.onWsDisconnect(wsId); }
+void ha_input(uint32_t wsId, const char* json) { engine.onInput(wsId, json, g_millis); }
+void ha_input_at(uint32_t wsId, const char* json, uint32_t now) {
+    g_millis = now;
+    engine.onInput(wsId, json, g_millis);
+}
+void ha_disconnect(uint32_t wsId) { engine.onWsDisconnect(wsId, g_millis); }
+int ha_time_reached(uint32_t now, uint32_t deadline) { return haTimeReached(now, deadline); }
+uint32_t ha_time_remaining(uint32_t now, uint32_t deadline) {
+    return haTimeRemaining(now, deadline);
+}
 void ha_select_game(int id) { engine.selectGame((uint8_t)id); }
 void ha_trivia_clear() { engine.triviaTopicsClear(); }
 void ha_trivia_add_topic(const char* name) { engine.triviaAddTopic(name); }

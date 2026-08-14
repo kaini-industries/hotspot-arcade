@@ -1,148 +1,88 @@
-// One phone = one player. A phone can reach the portal from more than one browser
-// context at a time -- iOS pops a captive mini-browser whose storage is separate
-// from Safari's, and a second tab is a third context -- and a phone that drops
-// (screen lock, WiFi off) leaves a socket the ESP only notices minutes later, when
-// TCP times out. Both used to mint a fresh player, so one phone showed up in the
-// lobby two or three times.
-//
-// The engine keys identity on the device instead of on the socket: the firmware
-// resolves each connection to the station's MAC and hands the engine an opaque device
-// key, which every browser context on that phone shares. This test covers the three
-// rules that follow (rebind, distinct devices, stale disconnect) plus the
-// unknown-device fallback.
-//
-// Note the two numbering schemes below: SOCK_* are wsIds (connections), pids are the
-// engine's player ids handed out in join order. They are deliberately not aligned
-// here, because the whole point is that one player can outlive one connection.
 import assert from "node:assert/strict";
-import { newEngine, macKey, lastToWs } from "./harness-lib.mjs";
-
-const HA_GAME_C4 = 2; // HA_GAME_CONNECT4 in ha_proto.h
-
-const PHONE_A = macKey(0x02, 0, 0, 0, 0xA1, 0x01); // ANA's phone
-const PHONE_B = macKey(0x02, 0, 0, 0, 0xB0, 0x02); // BO's phone
-const PHONE_C = macKey(0x02, 0, 0, 0, 0xC1, 0x03); // CY's phone
-
-const SOCK_ANA = 1; // ANA's first browser (whichever one she pressed Play in)
-const SOCK_BO = 2;
-const SOCK_ANA_CAPTIVE = 3; // the captive mini-browser on ANA's phone, later
-const SOCK_CY = 4;
-
-const PID_ANA = 1, PID_BO = 2, PID_CY = 3;
-
-/** The roster from the most recent lobby push (pushAll unicasts it per socket). */
-function roster(items) {
-  const lob = items.filter((o) => o.to === "ws" && o.msg && o.msg.t === "lobby").pop();
-  return lob ? lob.msg.players : [];
-}
-const scoreOf = (items, pid) => (roster(items).find((p) => p.pid === pid) || {}).score;
+import { createHash } from "node:crypto";
+import { newEngine, lastToWs } from "./harness-lib.mjs";
 
 const e = await newEngine();
 e.reset();
-e.setDevice(SOCK_ANA, PHONE_A);
-e.setDevice(SOCK_ANA_CAPTIVE, PHONE_A); // same phone as SOCK_ANA
-e.setDevice(SOCK_BO, PHONE_B);
-e.setDevice(SOCK_CY, PHONE_C);
 
-e.selectGame(HA_GAME_C4);
-e.join(SOCK_ANA, "ana");
-e.join(SOCK_BO, "bo");
+// Protocol v2 is explicit. An old cached client cannot silently allocate a seat.
+let out = e.inputRaw(99, '{"t":"hello","nick":"OLD"}');
+assert.equal(lastToWs(out, 99, "reject").msg.code, "bad_protocol");
 
-// Give ANA a score to protect: a vertical four in column 0 (see duel.mjs).
-let won = [];
-e.input(SOCK_ANA, { t: "challenge", to: PID_BO });
-e.input(SOCK_BO, { t: "accept", from: PID_ANA });
-for (let i = 0; i < 4; i++) {
-  won = won.concat(e.input(SOCK_ANA, { t: "move", n: 0 }));
-  if (i < 3) won = won.concat(e.input(SOCK_BO, { t: "move", n: 1 }));
-}
-const earned = scoreOf(won, PID_ANA);
-assert.ok(earned > 0, "setup: winning the duel scored ANA some points");
-assert.equal(roster(won).length, 2, "setup: two phones, two players");
+const token = "0123456789abcdef0123456789abcdef";
+const identity = createHash("sha256").update(token).digest("hex").slice(0, 32);
+out = e.input(98, { t: "hello", proto: 2, nick: "NO CODE", avatar: "🙂", resume: token });
+assert.equal(lastToWs(out, 98, "reject").msg.code, "auth_required");
+out = e.input(98, {
+  t: "hello", proto: 2, nick: "BAD CODE", avatar: "🙂", resume: token, code: "654321",
+});
+assert.equal(lastToWs(out, 98, "reject").msg.code, "bad_code");
+e.setAdmissionFull(true);
+out = e.join(97, "FULL", "97979797979797979797979797979797");
+assert.equal(lastToWs(out, 97, "reject").msg.code, "full");
+e.setAdmissionFull(false);
+out = e.input(96, {
+  t: "hello", proto: 2, nick: "LONG", avatar: "🙂", resume: token, code: "1234567",
+});
+assert.equal(lastToWs(out, 96, "reject").msg.code, "bad_code");
 
-// --- (a) a second context on the same phone rebinds, it does not duplicate ------
-// The captive mini-browser has its own empty storage, so it says hello with a name
-// of its own. It must land on ANA's player anyway.
-const second = e.join(SOCK_ANA_CAPTIVE, "ghost");
+const first = e.join(1, "ALICE", token);
+const welcome = lastToWs(first, 1, "welcome").msg;
+assert.equal(welcome.proto, 2);
+assert.equal(welcome.pid, 1);
+assert.equal(welcome.resumed, false);
+assert.match(welcome.session, /^[0-9a-f]{32}$/);
+assert.equal("resume" in welcome, false, "raw token is never echoed");
+const stableJoin = first.find((x) => x.to === "uart" && x.kind === "join" && x.pid === 1);
+assert.equal(stableJoin.identity, identity);
+assert.equal(JSON.stringify(first).includes(token), false, "raw token never enters host output");
 
-const w = lastToWs(second, SOCK_ANA_CAPTIVE, "welcome");
-assert.ok(w, "the second context gets a welcome on its own socket");
-assert.equal(w.msg.pid, PID_ANA, "it is handed the pid the phone already had");
-assert.equal(w.msg.nick, "ANA", "and the nick, so the new context shows the same name");
-assert.ok(w.msg.avatar, "and the avatar, so it shows the same identity everywhere");
-assert.equal(
-  roster(second).length,
-  2,
-  "the roster still holds two players -- one phone did not become two",
-);
-assert.equal(scoreOf(second, PID_ANA), earned, "the score survives the rebind");
-assert.ok(
-  !second.some((o) => o.to === "uart" && o.kind === "join"),
-  "a rebind is not a new player, so the Flipper is not told anyone joined",
-);
-const logged = second.find((o) => o.to === "log");
-assert.ok(logged, "the consolidation is traced to the serial console");
-assert.equal(logged.kind, "consolidated", "and is traced as a consolidation, not a join");
-assert.equal(logged.pid, PID_ANA, "naming the player the socket was folded into");
-assert.equal(logged.device, PHONE_A, "and the device it came from");
+e.join(2, "BOB");
+out = e.disconnect(1);
+assert.equal(out.some((x) => x.to === "uart" && x.kind === "leave"), false);
+let roster = lastToWs(out, 2, "lobby").msg.players;
+assert.equal(roster.find((p) => p.pid === 1).online, false);
 
-// State now goes to the new socket, and the old context can no longer act.
-const moved = e.input(SOCK_ANA_CAPTIVE, { t: "react", emoji: "🔥" });
-assert.ok(
-  moved.some(
-    (o) => o.to === "ws" && o.id === SOCK_ANA_CAPTIVE && o.msg.t === "emoji" && o.msg.nick === "ANA",
-  ),
-  "the new socket now speaks for the player",
-);
-assert.deepEqual(
-  e.input(SOCK_ANA, { t: "react", emoji: "🎉" }),
-  [],
-  "the superseded socket owns nobody and is ignored",
-);
+// At 119,999ms the token reclaims the same seat and score/state identity.
+e.tick(119999);
+out = e.join(3, "ALICE", token);
+assert.equal(lastToWs(out, 3, "welcome").msg.pid, 1);
+assert.equal(lastToWs(out, 3, "welcome").msg.resumed, true);
 
-// --- (b) two different phones are still two players ----------------------------
-const third = e.join(SOCK_CY, "cy");
-assert.equal(roster(third).length, 3, "a different device is a different player");
-assert.equal(lastToWs(third, SOCK_CY, "welcome").msg.pid, PID_CY, "and gets its own pid");
-assert.equal(lastToWs(third, SOCK_CY, "welcome").msg.nick, "CY", "under its own name");
-assert.deepEqual(
-  third.filter((o) => o.to === "log").map((o) => [o.kind, o.pid, o.device]),
-  [["join", PID_CY, PHONE_C]],
-  "and is traced as a plain join, not a consolidation",
-);
+// A duplicate live token is a deterministic takeover. The old socket is closed
+// and, because it no longer owns the pid, cannot act or detach the new socket.
+out = e.join(4, "ALICE", token);
+assert.equal(lastToWs(out, 4, "welcome").msg.pid, 1);
+const close = out.find((x) => x.to === "ws" && x.id === 3 && x.kind === "close");
+assert.equal(close.code, 1008);
+assert.equal(close.reason, "identity takeover");
+assert.deepEqual(e.input(3, { t: "react", emoji: "🎉" }), []);
+assert.deepEqual(e.disconnect(3), []);
 
-// --- (c) the old socket's late close must not remove the rebound player --------
-// This is the ghost-player half of the bug: iOS reports the dead socket long after
-// the phone has already come back on a new one.
-const closed = e.disconnect(SOCK_ANA);
-assert.ok(
-  !closed.some((o) => o.to === "uart" && o.kind === "leave"),
-  "a stale socket closing does not report a leave",
-);
-// `leaveGame` from a player who is in no match is a no-op that still pushes the
-// lobby -- the cheapest way to ask the engine for a fresh roster snapshot.
-const after = e.input(SOCK_CY, { t: "leaveGame" });
-assert.ok(roster(after).some((p) => p.pid === PID_ANA), "the player is still in the lobby");
-assert.equal(scoreOf(after, PID_ANA), earned, "with their score intact");
+// At exactly 120 seconds detached, the engine finalizes once. The host still
+// recognizes the digest, so the credential can obtain a fresh seat without code.
+e.disconnect(4);
+out = e.tick(239998);
+assert.equal(out.some((x) => x.to === "uart" && x.kind === "leave"), false);
+out = e.tick(239999);
+assert.equal(out.filter((x) => x.to === "uart" && x.kind === "leave" && x.pid === 1).length, 1);
+out = e.join(5, "ALICE", token, null);
+assert.equal(lastToWs(out, 5, "welcome").msg.resumed, false);
+assert.equal(lastToWs(out, 5, "welcome").msg.pid, 1);
 
-// The live socket closing does still remove them, exactly as before.
-const reallyGone = e.disconnect(SOCK_ANA_CAPTIVE);
-assert.ok(
-  reallyGone.some((o) => o.to === "uart" && o.kind === "leave" && o.pid === PID_ANA),
-  "the player's current socket closing still removes them",
-);
-assert.ok(!roster(reallyGone).some((p) => p.pid === PID_ANA), "and drops them from the roster");
+// Hello itself enforces the boundary when loop() has not ticked.
+const boundary = await newEngine();
+boundary.resetAt(0);
+const boundaryToken = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+boundary.join(1, "BOUNDARY", boundaryToken);
+boundary.disconnect(1);
+out = boundary.inputAt(2, {
+  t: "hello", proto: 2, nick: "BOUNDARY", avatar: "🙂", resume: boundaryToken,
+}, 120000);
+assert.equal(lastToWs(out, 2, "welcome").msg.resumed, false);
 
-// --- (d) an unknown device falls back to one player per connection -------------
-// The firmware reports 0 when it cannot identify the phone behind a connection.
-// Those clients must not all collapse into a single player.
-const e2 = await newEngine();
-e2.reset();
-e2.setDevice(1, 0);
-e2.setDevice(2, 0);
-e2.join(1, "ana");
-const anon = e2.join(2, "bo");
-assert.equal(roster(anon).length, 2, "an unknown device keeps the old per-connection behaviour");
-assert.equal(lastToWs(anon, 2, "welcome").msg.nick, "BO", "and each keeps its own name");
+assert.equal(e.timeReached(0xfffffff0, 0x20), false);
+assert.equal(e.timeRemaining(0xfffffff0, 0x20), 48);
+assert.equal(e.timeReached(0x20, 0x20), true);
 
-console.log("identity: OK");
+console.log("identity: protocol v2 checks passed");

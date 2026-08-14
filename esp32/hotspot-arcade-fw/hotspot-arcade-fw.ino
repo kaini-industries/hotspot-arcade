@@ -28,6 +28,9 @@ static AsyncWebServer server(80);
 static AsyncWebSocket ws("/ws");
 static IPAddress apIP(192, 168, 4, 1);
 static char apName[33] = "Hotspot Arcade";
+static char joinCode[7] = ""; // optional here; the Cardputer host always configures one
+static char knownIdentities[32][HA_IDENTITY_LEN + 1] = {};
+static uint8_t knownIdentityCount = 0;
 static bool portalRunning = false;
 static uint8_t apMaxConn = AP_MAX_CONN;
 static bool fsReady = false; // LittleFS mounted (bundle store)
@@ -204,8 +207,30 @@ void haWsSendWs(uint32_t wsId, const String& msg) {
     if(!wsId) return;
     ws.text(wsId, msg);
 }
+void haWsCloseWs(uint32_t wsId) {
+    if(wsId) ws.close(wsId, 1008, "identity takeover");
+}
 void haWsBroadcast(const String& msg) {
     ws.textAll(msg);
+}
+static bool identityKnown(const char* identity) {
+    if(!identity || strlen(identity) != HA_IDENTITY_LEN) return false;
+    for(uint8_t i = 0; i < knownIdentityCount; i++)
+        if(strcmp(knownIdentities[i], identity) == 0) return true;
+    return false;
+}
+static void rememberIdentity(const char* identity) {
+    if(identityKnown(identity) || knownIdentityCount >= 32) return;
+    strlcpy(knownIdentities[knownIdentityCount++], identity, sizeof(knownIdentities[0]));
+}
+uint8_t haAuthorizeIdentity(
+    uint32_t wsId, const char* identity, const char* code, uint32_t* retryMs) {
+    (void)wsId;
+    if(retryMs) *retryMs = 0;
+    if(identityKnown(identity)) return HA_JOIN_AUTH_KNOWN;
+    if(!joinCode[0]) return HA_JOIN_AUTH_OK; // legacy Flipper host: open admission
+    if(!code || !code[0]) return HA_JOIN_AUTH_REQUIRED;
+    return strcmp(code, joinCode) == 0 ? HA_JOIN_AUTH_OK : HA_JOIN_AUTH_BAD_CODE;
 }
 void haUartJoin(uint8_t pid, const char* nick) {
     uint8_t buf[1 + HA_NICK_LEN + 1];
@@ -214,6 +239,14 @@ void haUartJoin(uint8_t pid, const char* nick) {
     if(n > HA_NICK_LEN) n = HA_NICK_LEN;
     memcpy(buf + 1, nick, n);
     uartSend(HA_MSG_JOIN, buf, 1 + n);
+}
+void haUartJoinStable(uint8_t pid, const char* identity, const char* nick, const char* avatar) {
+    (void)avatar;
+    rememberIdentity(identity);
+    // The generic Flipper UI still consumes the legacy pid+nickname payload. The
+    // stable digest is deliberately kept in the host adapter; richer hosts (such
+    // as Cardputer) implement this sink and persist the digest themselves.
+    haUartJoin(pid, nick);
 }
 void haUartLeave(uint8_t pid) {
     uartSend(HA_MSG_LEAVE, &pid, 1);
@@ -336,7 +369,7 @@ static void onWsEvent(
     (void)srv;
     if(type == WS_EVT_DISCONNECT) {
         ENGINE_LOCK();
-        engine.onWsDisconnect(client->id());
+        engine.onWsDisconnect(client->id(), millis());
         ENGINE_UNLOCK();
     } else if(type == WS_EVT_DATA) {
         AwsFrameInfo* info = (AwsFrameInfo*)arg;
@@ -346,7 +379,7 @@ static void onWsEvent(
             memcpy(buf, data, len);
             buf[len] = '\0';
             ENGINE_LOCK();
-            engine.onInput(client->id(), peerDeviceKey(client), buf);
+            engine.onInput(client->id(), buf, millis());
             ENGINE_UNLOCK();
         }
     }
@@ -438,6 +471,19 @@ static void handleFileBegin(const uint8_t* p, size_t len) {
     assets.begin(path, mime, flags & 1, total);
 }
 
+static bool parseJoinCodeExact(const char* json, char out[7]) {
+    const char* value = ha_json_find(json, "code");
+    if(!value || *value != '"') return false;
+    value++;
+    for(int i = 0; i < 6; i++) {
+        if(value[i] < '0' || value[i] > '9') return false;
+        out[i] = value[i];
+    }
+    if(value[6] != '"') return false;
+    out[6] = '\0';
+    return true;
+}
+
 static void dispatchFrame() {
     rxBuf[rxLen] = '\0'; // JSON payloads are text; safe (buf has +1)
     switch(rxType) {
@@ -508,14 +554,27 @@ static void dispatchFrame() {
         ENGINE_UNLOCK();
         break;
     case HA_MSG_CONFIG: {
+        const char* configJson = (const char*)rxBuf;
+        if(!ha_json_flat_object_valid(configJson)) {
+            uartStatus("config_error");
+            break;
+        }
+        const char* codeValue = ha_json_find(configJson, "code");
+        char code[7];
+        if(codeValue && !parseJoinCodeExact(configJson, code)) {
+            uartStatus("config_error");
+            break;
+        }
         int v;
-        if(ha_json_int((const char*)rxBuf, "max", &v) && v >= 1 && v <= 15) apMaxConn = (uint8_t)v;
+        if(ha_json_int(configJson, "max", &v) && v >= 1 && v <= HA_MAX_PLAYERS)
+            apMaxConn = (uint8_t)v;
         char lang[8];
-        if(ha_json_str((const char*)rxBuf, "lang", lang, sizeof(lang))) {
+        if(ha_json_str(configJson, "lang", lang, sizeof(lang))) {
             ENGINE_LOCK();
             engine.setLang(lang);
             ENGINE_UNLOCK();
         }
+        if(codeValue) strlcpy(joinCode, code, sizeof(joinCode));
         break;
     }
     case HA_MSG_RESET_SCORES:

@@ -368,6 +368,9 @@ function toNominations(g) {
   const g = await table(3);
   const { spy, others } = g.readCards();
   g.out = g.e.disconnect(spy);
+  assert.equal(lastToWs(g.out, others[0], "spyfall").msg.stage, "talk",
+    "the spy's seat and hidden role survive transient grace");
+  g.tick(g.t + 120000);
   for (const p of others) {
     const m = lastToWs(g.out, p, "spyfall");
     assert.equal(m.msg.stage, "reveal", "the round ends when the spy walks out");
@@ -387,8 +390,9 @@ function toNominations(g) {
   const dropPid = others[others.length - 1]; // a non-spy leaves mid-round
   const out = [
     ...g.e.disconnect(dropPid),
+    ...g.e.tick(g.t + 120000), // only expiry frees the stable pid
     ...g.e.join(90, "NEWCOMER"), // a fresh device, handed the vacated pid
-    ...g.e.tick(g.t + 50),
+    ...g.e.tick(g.t + 120050),
   ];
   const m = lastToWs(out, 90, "spyfall");
   assert.ok(m, "the newcomer receives a spyfall payload");
