@@ -38,7 +38,7 @@
   function renderCount(m) {
     sub("count");
     stopBar();
-    A.countdown("kmk-count-num", m.sec);
+    A.countdown("kmk-count-num", m.remaining_ms, m.paused);
   }
 
   // Render the three people as tappable rows showing the current label. On reveal a
@@ -89,8 +89,7 @@
     var stage = m.stage; // choose | guess | reveal
     $("kmk-meta").textContent = t("common.round", { n: m.round, total: m.rounds });
     $("kmk-role").textContent = m.iam ? t("kmk.you_choose") : t("kmk.chooser_is", { nick: m.chooser });
-    noteDeadline(m.deadline, m.dur);
-    A.timebar("kmk-bar", m.deadline, m.dur, false);
+    A.timebar("kmk-bar", m.remaining_ms, m.duration_ms, m.paused, false);
 
     var go = $("kmk-go"), note = $("kmk-note");
 
@@ -120,11 +119,11 @@
       if (lastRound !== m.round || lastStage !== "reveal") { A.sfx(g ? "correct" : "buzz"); A.vibe(g ? 25 : 12); }
     } else if (stage === "choose") {
       if (m.iam) {
-        canEdit = true;
+        canEdit = !m.paused;
         renderPeople(m.people, mine, true);
         go.classList.remove("hide");
         go.textContent = t("kmk.lock_picks");
-        go.disabled = !valid(mine);
+        go.disabled = !valid(mine) || !!m.paused;
         note.textContent = t("kmk.tap_tag");
       } else {
         canEdit = false;
@@ -140,11 +139,11 @@
         note.textContent = t("kmk.locked_waiting");
       } else {
         var locked = m.mine && valid(m.mine);
-        canEdit = !locked;
-        renderPeople(m.people, locked ? m.mine : mine, !locked);
+        canEdit = !locked && !m.paused;
+        renderPeople(m.people, locked ? m.mine : mine, !locked && !m.paused);
         go.classList.toggle("hide", locked);
         go.textContent = t("kmk.lock_guess");
-        go.disabled = !valid(mine);
+        go.disabled = !valid(mine) || !!m.paused;
         note.textContent = locked ? t("kmk.guess_locked")
                                   : t("kmk.predict", { nick: m.chooser });
       }
@@ -176,7 +175,7 @@
     send({ t: "ready", ready: !myready });
   });
   $("kmk-go").addEventListener("click", function () {
-    if (!valid(mine)) return;
+    if (!valid(mine) || A.inputsPaused()) return;
     A.sfx("start"); A.vibe(20);
     send({ t: "assign", kiss: mine.indexOf(0), marry: mine.indexOf(1), kill: mine.indexOf(2) });
     canEdit = false;

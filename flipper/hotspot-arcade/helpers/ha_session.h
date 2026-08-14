@@ -15,6 +15,12 @@ bool ha_board_present(HotspotArcadeApp* app, uint32_t wait_ms);
 void ha_session_start(HotspotArcadeApp* app);
 void ha_session_stop(HotspotArcadeApp* app);
 
+void ha_session_transport_pause(
+    HotspotArcadeApp* app, uint8_t reason, const char* ssid, uint32_t reconnect_ms);
+void ha_session_network_restart(HotspotArcadeApp* app);
+void ha_session_transport_resume(HotspotArcadeApp* app);
+bool ha_session_transport_wait_elapsed(const HotspotArcadeApp* app);
+
 // Host controls.
 void ha_select_game(HotspotArcadeApp* app, uint8_t game);
 void ha_reset_scores(HotspotArcadeApp* app);

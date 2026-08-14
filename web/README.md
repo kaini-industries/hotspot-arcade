@@ -77,9 +77,11 @@ One flat JSON object per message, specified per game in `docs/PROTOCOL.md`
 `reject`/`lobby`/per-game payloads). The browser generates and stores a cryptographically
 random 128-bit resume credential; the raw value is sent only in `hello`, while the engine
 and host retain only its SHA-256-derived identity. The ESP is authoritative; the client
-sends intents and renders server state. The trivia countdown is cosmetic: the client learns the server
-clock offset from the first timed message (`deadline` is a server `millis()`
-value) and animates a bar toward the deadline. The server is the real referee.
+sends intents and renders server state. Timed states carry bounded relative
+`remaining_ms`/`duration_ms` snapshots and `paused`; the browser animates cosmetically
+with `performance.now()` while the server remains the referee. Planned AP pauses survive
+socket closure in the browser UI and clear only after `server_resume` plus a fresh
+authoritative game state. Reaction's random red-light delay is never sent.
 
 ## Captive-portal handoff (limitation)
 

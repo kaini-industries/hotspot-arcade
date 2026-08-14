@@ -24,6 +24,7 @@ function element() {
 const elements = new Map();
 const document = {
   hidden: false,
+  body: element(),
   getElementById(id) {
     if (!elements.has(id)) elements.set(id, element());
     return elements.get(id);
@@ -65,6 +66,7 @@ const context = {
   crypto: { getRandomValues(bytes) { bytes.set(random); return bytes; } },
   console,
   Date: { now() { return now; } },
+  performance: { now() { return now; } },
   setTimeout(fn, ms) {
     const timer = { fn, ms, active: true };
     timers.push(timer);
@@ -209,5 +211,40 @@ context.__HA_TEST_API__.dispatch({
   t: "result", event: "game_change", status: "policy_denied", game: "wyr", id: 8,
 });
 assert.equal(elements.get("toast").textContent, "gamevote.host_only");
+
+// A planned-downtime overlay survives the actual close/reconnect path. Generic
+// reconnect UI stays behind it; resume/config/keepalive cannot dismiss it.
+for (const timer of timers) timer.active = false;
+context.A.takeover = false;
+context.A.joined = true;
+context.A.view = "lobby";
+context.__HA_TEST_API__.connect();
+const planned = sockets.at(-1);
+planned.readyState = 1;
+planned.onopen();
+context.__HA_TEST_API__.dispatch({
+  t: "server_pause", reason: "ssid_change", ssid: "ARCADE-NEW", reconnect_ms: 600000,
+});
+assert.equal(elements.get("transport").classList.contains("hide"), false);
+planned.onclose({ code: 1006, reason: "" });
+assert.equal(elements.get("transport").classList.contains("hide"), false);
+assert.equal(elements.get("netbar").classList.contains("hide"), true);
+const retry = activeTimers().find((x) => x.ms === 1000);
+assert.ok(retry, "planned socket loss still retries in the background");
+fire(retry);
+const returned = sockets.at(-1);
+returned.readyState = 1;
+returned.onopen();
+context.__HA_TEST_API__.dispatch({ t: "welcome", pid: 2, lang: "de" });
+assert.equal(context.A.transportRestoring, true);
+assert.equal(elements.get("transport").classList.contains("hide"), false);
+context.__HA_TEST_API__.dispatch({ t: "server_pause", reason: "ssid_change", ssid: "ARCADE-NEW", reconnect_ms: 600000 });
+assert.equal(context.A.transportPaused, true, "a host still paused reasserts the pause after welcome");
+context.__HA_TEST_API__.dispatch({ t: "server_resume" });
+context.__HA_TEST_API__.dispatch({ t: "config", lang: "de" });
+context.__HA_TEST_API__.dispatch({ t: "pong" });
+assert.equal(elements.get("transport").classList.contains("hide"), false);
+context.__HA_TEST_API__.dispatch({ t: "trivia", phase: "lobby", paused: false });
+assert.equal(elements.get("transport").classList.contains("hide"), true);
 
 console.log("web protocol-v2 reconnect policy: OK");

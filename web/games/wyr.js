@@ -29,7 +29,7 @@
   function renderCount(m) {
     sub("count");
     stopBar();
-    A.countdown("wyr-count-num", m.sec);
+    A.countdown("wyr-count-num", m.remaining_ms, m.paused);
   }
 
   var revealedFor = -1;
@@ -37,17 +37,15 @@
     sub("play");
     var reveal = m.phase === "reveal";
     $("wyr-meta").textContent = t("wyr.meta", { n: m.round, total: m.rounds });
-    // Countdown bar: the vote window while asking, the pause before the next prompt
-    // while revealing. Both carry deadline+dur, so the shared timebar drives both.
-    noteDeadline(m.deadline, m.dur);
-    A.timebar("wyr-bar", m.deadline, m.dur, true);
+    // The vote and reveal windows both carry relative timer snapshots.
+    A.timebar("wyr-bar", m.remaining_ms, m.duration_ms, m.paused, true);
     var counts = m.counts || [0, 0];
     var total = counts[0] + counts[1];
     var mine = (typeof m.myvote === "number") ? m.myvote : -1;
     var texts = [m.a, m.b];
     var wrap = $("wyr-opts");
     wrap.innerHTML = "";
-    var locked = reveal || mine >= 0;
+    var locked = reveal || mine >= 0 || m.paused;
     // Reflect THIS prompt's lock state on the container. Rebuilding innerHTML clears
     // the children but not the wrap's own class, so without this a "locked" set on an
     // earlier vote sticks forever and every later prompt silently ignores taps.

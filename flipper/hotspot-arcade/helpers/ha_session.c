@@ -509,6 +509,16 @@ void ha_session_start(HotspotArcadeApp* app) {
     app->link_lost = false;
     app->last_rx_tick = furi_get_tick();
     app->active_game = HA_GAME_NONE;
+    app->transport_paused = false;
+    app->transport_network_ready = false;
+    app->transport_wait_expired = false;
+    app->transport_reason = 0;
+    app->transport_expected_mask = 0;
+    app->transport_online_mask = 0;
+    app->transport_reconnect_ms = 0;
+    app->transport_host_deadline_set = false;
+    app->transport_host_deadline = 0;
+    app->transport_pending_ssid[0] = '\0';
     app->pending_game = HA_GAME_NONE;
     app->content_pending = false;
     furi_string_reset(app->console);
@@ -520,8 +530,67 @@ void ha_session_stop(HotspotArcadeApp* app) {
     ha_proto_send(app->uart, HA_MSG_STOP, NULL, 0);
     app->session_active = false;
     app->portal_running = false;
+    app->transport_paused = false;
+    app->transport_network_ready = false;
+    app->transport_wait_expired = false;
+    app->transport_reason = 0;
+    app->transport_expected_mask = 0;
+    app->transport_online_mask = 0;
+    app->transport_reconnect_ms = 0;
+    app->transport_host_deadline_set = false;
+    app->transport_host_deadline = 0;
+    app->transport_pending_ssid[0] = '\0';
     app->hs = HaHsIdle;
     furi_string_set(app->status, "stopped");
+}
+
+void ha_session_transport_pause(
+    HotspotArcadeApp* app, uint8_t reason, const char* ssid, uint32_t reconnect_ms) {
+    if(!app || !app->session_active || app->hs != HaHsUp || !app->portal_running ||
+       !app->transport_network_ready || app->transport_paused || reconnect_ms > 600000)
+        return;
+    FuriString* json = furi_string_alloc_set_str("{\"reason\":\"");
+    furi_string_cat_str(
+        json, reason == HA_TRANSPORT_SSID_CHANGE ? "ssid_change" : "ap_off");
+    furi_string_cat_str(json, "\",\"ssid\":\"");
+    json_escape_cat(json, ssid ? ssid : "");
+    furi_string_cat_printf(json, "\",\"reconnect_ms\":%lu}", (unsigned long)reconnect_ms);
+    ha_proto_send(
+        app->uart,
+        HA_MSG_TRANSPORT_PAUSE,
+        (const uint8_t*)furi_string_get_cstr(json),
+        furi_string_size(json));
+    furi_string_free(json);
+    app->transport_reason = reason;
+    app->transport_reconnect_ms = reconnect_ms;
+    app->transport_host_deadline_set = false;
+    app->transport_host_deadline = 0; // starts only after the network is healthy again
+    app->transport_network_ready = false; // the 200 ms server_pause flush is not healthy
+    app->transport_wait_expired = false;
+    furi_string_set(app->status, "transport_pausing");
+}
+
+void ha_session_network_restart(HotspotArcadeApp* app) {
+    if(!app || !app->session_active || !app->transport_paused || app->portal_running) return;
+    app->transport_network_ready = false;
+    furi_string_set(app->status, "network_starting");
+    ha_proto_send(app->uart, HA_MSG_START, NULL, 0);
+}
+
+void ha_session_transport_resume(HotspotArcadeApp* app) {
+    if(!app || !app->session_active || !app->transport_paused || !app->portal_running ||
+       !app->transport_network_ready)
+        return;
+    // RESUME is idempotent at the engine. Permit an explicit retry if a UART frame
+    // or acknowledgement is lost instead of leaving the host stuck forever in a
+    // locally optimistic "transport_resuming" state.
+    furi_string_set(app->status, "transport_resuming");
+    ha_proto_send(app->uart, HA_MSG_TRANSPORT_RESUME, NULL, 0);
+}
+
+bool ha_session_transport_wait_elapsed(const HotspotArcadeApp* app) {
+    return app && app->transport_host_deadline_set &&
+           (int32_t)(furi_get_tick() - app->transport_host_deadline) >= 0;
 }
 
 // ---------------- STATUS handling (drives the handshake) ----------------
@@ -581,10 +650,48 @@ static void on_status(HotspotArcadeApp* app, const char* tok) {
         if(app->hs == HaHsContent) app->hs = HaHsErr;
     } else if(strncmp(tok, "up", 2) == 0) {
         app->portal_running = true;
+        // STATUS up is immediately followed by TRANSPORT_STATE. Do not use stale masks
+        // from before shutdown to auto-resume in this gap; only the fresh snapshot may
+        // mark the restarted network ready and start the host reconnect window.
+        app->transport_network_ready = false;
+        app->transport_host_deadline_set = false;
+        app->transport_host_deadline = 0;
+        if(app->transport_paused && app->transport_reason == HA_TRANSPORT_SSID_CHANGE &&
+           app->transport_pending_ssid[0]) {
+            furi_string_set(app->ssid, app->transport_pending_ssid);
+            ha_storage_save_config(app);
+            app->transport_pending_ssid[0] = '\0';
+        }
         app->hs = HaHsUp;
         // The handshake already restored selection through CONTENT_BEGIN..COMMIT.
     } else if(strncmp(tok, "stopped", 7) == 0) {
         app->portal_running = false;
+    } else if(strncmp(tok, "network_suspended", 17) == 0) {
+        app->portal_running = false;
+        app->transport_network_ready = false;
+        app->transport_host_deadline_set = false;
+        app->transport_host_deadline = 0;
+        if(app->transport_reason == HA_TRANSPORT_SSID_CHANGE)
+            ha_session_network_restart(app);
+    } else if(strncmp(tok, "ap_fallback", 11) == 0 ||
+              ((strncmp(tok, "ap_error", 8) == 0 || strncmp(tok, "dns_error", 9) == 0) &&
+               app->transport_paused && app->transport_reason == HA_TRANSPORT_SSID_CHANGE)) {
+        // The old app->ssid was intentionally kept until success. AP/DNS failure
+        // precedes `ap_fallback`, so either framed signal independently discards
+        // the candidate; a lost fallback token cannot let the later old-SSID `up`
+        // accidentally persist the failed name.
+        app->transport_pending_ssid[0] = '\0';
+    } else if(strncmp(tok, "transport_error", 15) == 0 ||
+              strncmp(tok, "transport_conflict", 18) == 0) {
+        app->transport_pending_ssid[0] = '\0';
+    } else if(strncmp(tok, "transport_resumed", 17) == 0) {
+        app->transport_paused = false;
+        app->transport_wait_expired = false;
+        app->transport_expected_mask = 0;
+        app->transport_online_mask = 0;
+        app->transport_host_deadline_set = false;
+        app->transport_host_deadline = 0;
+        furi_string_set(app->status, "up");
     } else if(strncmp(tok, "boot", 4) == 0) {
         // ESP rebooted: it lost the AP + all clients. Redo the handshake, but
         // rate-limit so a board stuck rebooting can't tight-loop the handshake.
@@ -684,6 +791,68 @@ static void dispatch_frame(HotspotArcadeApp* app) {
                 ha_art_stroke(app, js);
             else if(p[0] == HA_ART_END)
                 ha_art_end(app);
+        }
+        break;
+    case HA_MSG_TRANSPORT_STATE:
+        if(len == 10) {
+            bool was_network_ready = app->transport_network_ready;
+            app->portal_running = (p[0] & 0x08) != 0;
+            app->transport_paused = (p[0] & 0x01) != 0;
+            app->transport_network_ready = (p[0] & 0x02) != 0;
+            app->transport_reason = p[1];
+            app->transport_expected_mask = (uint16_t)p[2] | ((uint16_t)p[3] << 8);
+            app->transport_online_mask = (uint16_t)p[4] | ((uint16_t)p[5] << 8);
+            app->transport_reconnect_ms = (uint32_t)p[6] | ((uint32_t)p[7] << 8) |
+                                          ((uint32_t)p[8] << 16) | ((uint32_t)p[9] << 24);
+            // A periodic snapshot may describe an old still-live portal while a
+            // fresh handshake is streaming files/content. Only START is waiting
+            // for portal confirmation; never skip an in-flight handshake phase.
+            if(app->portal_running && app->transport_network_ready && app->hs == HaHsStart)
+                app->hs = HaHsUp;
+            if(app->transport_paused && app->portal_running &&
+               app->transport_network_ready &&
+               app->transport_reason == HA_TRANSPORT_SSID_CHANGE &&
+               app->transport_pending_ssid[0]) {
+                // A healthy authoritative snapshot is a redundant replacement for
+                // a dropped `up` STATUS. Failure tokens clear this candidate before
+                // a fallback snapshot can arrive.
+                furi_string_set(app->ssid, app->transport_pending_ssid);
+                ha_storage_save_config(app);
+                app->transport_pending_ssid[0] = '\0';
+            }
+            // TRANSPORT_STATE is authoritative even if the preceding STATUS frame was
+            // lost or failed its CRC. In particular, a successful explicit resume must
+            // dismiss the ten-minute Resume/End prompt without depending on the
+            // best-effort `transport_resumed` token.
+            if(!app->transport_paused) {
+                app->transport_wait_expired = false;
+                app->transport_expected_mask = 0;
+                app->transport_online_mask = 0;
+                app->transport_reason = 0;
+                app->transport_reconnect_ms = 0;
+                app->transport_host_deadline_set = false;
+                app->transport_host_deadline = 0;
+                if(app->portal_running) furi_string_set(app->status, "up");
+            }
+            if(app->transport_paused && app->portal_running &&
+               app->transport_network_ready && !was_network_ready &&
+               app->transport_reconnect_ms) {
+                app->transport_host_deadline = furi_get_tick() + app->transport_reconnect_ms;
+                app->transport_host_deadline_set = true;
+            }
+            if(app->transport_paused && !app->transport_wait_expired &&
+               ha_session_transport_wait_elapsed(app)) {
+                app->transport_wait_expired = true;
+                furi_string_set(app->status, "transport_wait_expired");
+            }
+            if(app->transport_paused && app->portal_running &&
+               app->transport_network_ready && !app->transport_wait_expired &&
+               app->transport_online_mask == app->transport_expected_mask)
+                ha_session_transport_resume(app);
+            else if(app->transport_paused && !app->portal_running &&
+                    app->transport_reason == HA_TRANSPORT_SSID_CHANGE)
+                // The down snapshot recovers a dropped `network_suspended` STATUS.
+                ha_session_network_restart(app);
         }
         break;
     case HA_MSG_EVENT: {

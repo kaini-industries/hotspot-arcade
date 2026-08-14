@@ -263,12 +263,16 @@ assert.equal(lob.need, 3);
     o = g.e.input(3, { t: "done" });
   }
   assert.equal(view(o, 99).phase, "show");
+  let rawNow = 124000;
   while (view(o, 99).n !== oldSheet) {
-    const deadline = view(o, 99).deadline;
-    o = g.e.tick(deadline);
+    rawNow += view(o, 99).remaining_ms;
+    o = g.e.tick(rawNow);
   }
   o = g.e.input(99, { t: "thumb", sheet: oldSheet, v: 1 });
-  for (let i = 0; i < 3; i++) o = o.concat(g.e.tick(view(o, 99).deadline));
+  for (let i = 0; i < 3; i++) {
+    rawNow += view(o, 99).remaining_ms;
+    o = o.concat(g.e.tick(rawNow));
+  }
   const inheritedAwards = o.filter((item) =>
     item.to === "uart" && item.kind === "score" && item.pid === 1 && item.reason === "frankendraw");
   assert.equal(inheritedAwards.length, 0,

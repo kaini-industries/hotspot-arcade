@@ -61,4 +61,37 @@ assert.ok(score, "a correct answer emits a UART score");
 assert.equal(score.pid, 1);
 assert.ok(score.delta > 0, "correct answers score positive");
 
+// Normal grace changes only the live answer quorum. A valid answer submitted before
+// the socket drops remains part of the revealed answer distribution and keeps its
+// award; the live progress counters still satisfy answered <= total.
+const grace = await newEngine();
+grace.reset();
+grace.loadContent(HA_GAME_TRIVIA, [{ name: "Grace", items: [{
+  q: "Correct is B", a: "A", b: "B", c: "C", d: "D", answer: "B",
+}] }]);
+for (const [pid, nick] of [[1, "A"], [2, "B"], [3, "DROPPED"]]) grace.join(pid, nick);
+for (const pid of [1, 2, 3]) grace.input(pid, { t: "ready", ready: true });
+let graceOut = [];
+for (let ms = 1000; ms <= 4000; ms += 1000) graceOut = graceOut.concat(grace.tick(ms));
+assert.equal(lastToWs(graceOut, 1, "trivia").msg.phase, "question");
+grace.input(1, { t: "answer", c: 1 });
+grace.input(3, { t: "answer", c: 1 });
+graceOut = grace.disconnect(3);
+const progress = lastToWs(graceOut, 1, "trivia").msg;
+assert.equal(progress.answered, 1, "offline submitted answer is excluded from live progress");
+assert.equal(progress.total, 2, "offline reserved seat is excluded from live total");
+graceOut = grace.input(2, { t: "answer", c: 0 });
+const graceReveal = lastToWs(graceOut, 1, "trivia").msg;
+assert.equal(graceReveal.phase, "reveal", "online answer quorum settles the question");
+assert.deepEqual(graceReveal.counts, [1, 2, 0, 0], "submitted answer survives transient grace");
+const rewarded = graceOut.filter((x) => x.to === "uart" && x.kind === "score").map((x) => x.pid);
+assert.deepEqual(rewarded.sort((a, b) => a - b), [1, 3], "both valid correct submissions score");
+const graceResume = grace.join(
+  33,
+  "DROPPED",
+  "00000000000000000000000000000003",
+  null,
+);
+assert.ok(lastToWs(graceResume, 33, "trivia").msg.gained > 0, "returning scorer sees the earned award");
+
 console.log("trivia: OK");

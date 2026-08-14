@@ -155,7 +155,14 @@ typedef struct HotspotArcadeApp {
     FuriString* status;
     bool portal_running;
     bool session_active;
-    bool menu_shows_active;
+    // Inputs that determine the main-menu labels. UART refreshes arrive at least
+    // every two seconds, so the scene only rebuilds when this signature changes;
+    // otherwise a harmless PING would reset the user's highlighted row.
+    bool main_menu_signature_valid;
+    bool main_menu_session_active;
+    bool main_menu_transport_paused;
+    bool main_menu_portal_running;
+    char main_menu_ssid[HA_SSID_MAX];
     HaHandshake hs;
     uint8_t file_idx; // during HaHsFiles
     uint32_t last_handshake_tick; // rate-limits auto-reconnect so a brownout-reboot
@@ -170,6 +177,20 @@ typedef struct HotspotArcadeApp {
     uint16_t board_psram_kb; // ESP free PSRAM, KB (PING bytes 13-14); 0 = none/unknown
     bool link_lost;
     bool awaiting_board;
+
+    // Planned AP downtime is distinct from destructive Stop Session. The ESP owns
+    // the frozen engine; these fields mirror its fixed TRANSPORT_STATE payload and
+    // drive reconnect/host controls without guessing from JOIN/LEAVE traffic.
+    bool transport_paused;
+    bool transport_network_ready;
+    bool transport_wait_expired;
+    uint8_t transport_reason;
+    uint16_t transport_expected_mask;
+    uint16_t transport_online_mask;
+    uint32_t transport_reconnect_ms;
+    bool transport_host_deadline_set;
+    uint32_t transport_host_deadline;
+    char transport_pending_ssid[HA_SSID_MAX]; // committed to config only after a real `up`
 
     // --- ESP flasher (added for the on-device firmware installer) ---
     // The flash worker runs off the GUI thread and posts progress/done events;

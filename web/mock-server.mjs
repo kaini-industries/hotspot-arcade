@@ -86,7 +86,7 @@ function handle(socket) {
   function nextStage() { stage++; lobby("none"); at(700, startStage); }
 
   // ---- trivia (fully phone-driven, self-organizing) -------------------------
-  // The mock plays the ESP referee: it tracks ready/vote state, runs a 5s
+  // The mock plays the ESP referee: it tracks ready/vote state, runs a 3s
   // countdown once everyone is ready, asks a few questions (bots auto-answer),
   // reveals with counts + a moving leaderboard, then a final + `again` restart.
   const QDUR = 8000;
@@ -134,12 +134,15 @@ function handle(socket) {
     let best = 0;
     votes.forEach((t, i) => { if (t.votes > votes[best].votes) best = i; });
     tv.topicName = votes[best].name;
-    tv.secs = 5;
+    tv.secs = 3;
     tickCountdown();
   }
   function tickCountdown() {
     if (tv.phase !== "countdown") return;                 // cancelled by an un-ready
-    send({ t: "trivia", phase: "countdown", secs: tv.secs, topic: tv.topicName });
+    send({
+      t: "trivia", phase: "countdown", secs: tv.secs, topic: tv.topicName,
+      remaining_ms: tv.secs * 1000, duration_ms: 3000, paused: false,
+    });
     if (tv.secs <= 1) { at(1000, startQuestions); return; }
     tv.secs--;
     at(1000, tickCountdown);
@@ -153,7 +156,8 @@ function handle(socket) {
     const Q = QUESTIONS[tv.qi];
     send({
       t: "trivia", phase: "question", i: tv.qi, n: QUESTIONS.length, q: Q.q, o: Q.o,
-      dur: QDUR, deadline: tv.deadline, mine: (ME in tv.answers) ? tv.answers[ME] : -1,
+      remaining_ms: Math.max(0, tv.deadline - Date.now()), duration_ms: QDUR, paused: false,
+      mine: (ME in tv.answers) ? tv.answers[ME] : -1,
       answered: Object.keys(tv.answers).length, total: 3, topic: tv.topicName, board: tvBoard(),
     });
   }
@@ -186,7 +190,7 @@ function handle(socket) {
     send({
       t: "trivia", phase: "reveal", i: tv.qi, n: QUESTIONS.length, q: Q.q, o: Q.o,
       correct: Q.correct, counts, mine: (ME in tv.answers) ? tv.answers[ME] : -1,
-      gained, board: tvBoard(),
+      gained, board: tvBoard(), remaining_ms: 3200, duration_ms: 3200, paused: false,
     });
     at(3200, () => {
       tv.qi++;
@@ -341,9 +345,9 @@ function handle(socket) {
   }
 
   // ---- draw & guess ---------------------------------------------------------
-  // Two rounds with a per-round countdown (deadline + dur), then a final board
+  // Two rounds with a per-round relative timer snapshot, then a final board
   // and `again` restart. Round 1 you draw; round 2 you guess.
-  const DRAW_DUR = 20;   // seconds per round (dur is sent in seconds)
+  const DRAW_DUR = 20;   // seconds per round
   let draw = null;
   function drawScore(p, pts) { scores[p] += pts; }
   function drawBoard() {
@@ -358,18 +362,19 @@ function handle(socket) {
   function drawRound() {
     if (!draw) return;
     draw.done = false;
-    const deadline = Date.now() + DRAW_DUR * 1000;
     if (draw.round === 1) {
       // You draw. A bot "guesses" correctly partway through the window.
       draw.secret = "BANANA";
       send({ t: "draw", phase: "draw", role: "drawer", word: draw.secret,
-        round: draw.round, rounds: draw.rounds, drawer: ME, deadline, dur: DRAW_DUR, scores: sc() });
+        round: draw.round, rounds: draw.rounds, drawer: ME,
+        remaining_ms: DRAW_DUR * 1000, duration_ms: DRAW_DUR * 1000, paused: false, scores: sc() });
       at(7000, () => { if (draw && draw.round === 1 && !draw.done) { drawScore(CATHY, 50); drawReveal(CATHY); } });
     } else {
       // You guess. The bot scribbles; a wrong bot guess lands in chat.
       draw.secret = "ROCKET";
       send({ t: "draw", phase: "draw", role: "guesser", len: draw.secret.length,
-        round: draw.round, rounds: draw.rounds, drawer: nicks[BOT], deadline, dur: DRAW_DUR, scores: sc() });
+        round: draw.round, rounds: draw.rounds, drawer: nicks[BOT],
+        remaining_ms: DRAW_DUR * 1000, duration_ms: DRAW_DUR * 1000, paused: false, scores: sc() });
       at(600, () => send({ t: "ink", clear: true }));
       for (let i = 0; i < 8; i++)
         at(1000 + i * 150, ((k) => () => send({ t: "ink", x0: 0.5, y0: 0.2 + k * 0.06, x1: 0.5, y1: 0.26 + k * 0.06 }))(i));
@@ -382,7 +387,8 @@ function handle(socket) {
     if (!draw) return;
     draw.done = true;
     send({ t: "draw", phase: "reveal", word: draw.secret, winner,
-      round: draw.round, rounds: draw.rounds, scores: sc() });
+      round: draw.round, rounds: draw.rounds,
+      remaining_ms: 3000, duration_ms: 3000, paused: false, scores: sc() });
     at(3000, () => {
       if (!draw) return;
       if (draw.round >= draw.rounds) { send({ t: "draw", phase: "final", board: drawBoard() }); }

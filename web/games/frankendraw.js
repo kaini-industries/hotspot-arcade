@@ -37,7 +37,10 @@
       $("fd-" + id).classList.toggle("hide", id !== name);
     });
   }
-  function stopBar() { A.timebarStop("fd-bar"); hide("fd-bar"); }
+  function stopBar() {
+    A.timebarStop("fd-bar"); hide("fd-bar");
+    A.timebarStop("fd-sbar"); hide("fd-sbar");
+  }
 
   /* Fit a play/gallery column into what is actually left below the header, measured
      rather than guessed (the CSS calc() is only a pre-paint fallback: header height and
@@ -165,14 +168,14 @@
     bar.classList.toggle("hot", frac >= 0.85);
   }
   function dry() { return inkCap > 0 && inkUsed >= inkCap; }
-  function canDraw() { return st && st.panel >= 0 && !st.done && !dry(); }
+  function canDraw() { return st && st.panel >= 0 && !st.done && !st.paused && !dry(); }
 
   function refreshPlay() {
     inkBar();
     var can = canDraw();
     cv.classList.toggle("drawable", !!can);
-    $("fd-undo").disabled = !!(st && st.done) || !mine.length;
-    $("fd-next").disabled = !!(st && st.done);
+    $("fd-undo").disabled = !!(st && (st.done || st.paused)) || !mine.length;
+    $("fd-next").disabled = !!(st && (st.done || st.paused));
     $("fd-note").textContent = st && st.done ? t("fd.waiting", { n: st.waiting })
       : dry() ? t("fd.ink_full")
         : st && st.panel === 0 ? t("fd.hint_head") : t("fd.hint_next");
@@ -200,7 +203,7 @@
   function moveEvt(e) {
     if (!canDraw() || !drawing) return;
     e.preventDefault();
-    var now = Date.now();
+    var now = performance.now();
     if (now - lastSent < 40) return;
     var p = norm(e), y = band(p.y);
     // The budget is finite, so only send a segment once the pen has actually
@@ -228,7 +231,7 @@
 
   function renderCount(m) {
     sub("count"); stopBar();
-    A.countdown("fd-count-num", m.sec);
+    A.countdown("fd-count-num", m.remaining_ms, m.paused);
   }
 
   function renderPlay(m) {
@@ -242,8 +245,7 @@
     slice = quads(m.ink, m.unit);
     $("fd-meta").textContent = t("common.round", { n: m.round, total: m.rounds }) +
       (m.panel >= 0 ? " · " + t(PANEL[m.panel]) : "");
-    noteDeadline(m.deadline, m.dur);
-    A.timebar("fd-bar", m.deadline, m.dur, false);
+    A.timebar("fd-bar", m.remaining_ms, m.duration_ms, m.paused, false);
 
     fitCol("fd-play");
 
@@ -263,9 +265,10 @@
     $("fd-show-meta").textContent = m.final
       ? t("fd.winner_net", { n: m.net })
       : t("fd.gallery", { n: m.n + 1, total: m.total });
-    noteDeadline(m.deadline, m.dur);
-    A.timebar("fd-sbar", m.deadline, m.dur, false);
+    A.timebar("fd-sbar", m.remaining_ms, m.duration_ms, m.paused, false);
     $("fd-thumbs").classList.toggle("hide", !!m.final);
+    $("fd-up").disabled = !!m.paused;
+    $("fd-down").disabled = !!m.paused;
     $("fd-upn").textContent = m.up || 0;
     $("fd-downn").textContent = m.down || 0;
     $("fd-up").classList.toggle("on", m.mine > 0);
@@ -313,7 +316,7 @@
   };
 
   function thumb(v) {
-    if (!art) return;
+    if (!art || A.inputsPaused()) return;
     A.sfx("buzz"); A.vibe(12);
     send({ t: "thumb", sheet: art.n, v: v });
   }
@@ -332,7 +335,7 @@
       send({ t: "ready", ready: !myready });
     });
     $("fd-undo").addEventListener("click", function () {
-      if (!st || st.panel < 0 || st.done || !mine.length) return;
+      if (!st || st.panel < 0 || st.done || st.paused || !mine.length) return;
       A.sfx("buzz"); A.vibe(10);
       mine.pop();
       if (inkUsed > 0) inkUsed--;
@@ -340,7 +343,7 @@
       refreshPlay(); paintPlay();
     });
     $("fd-next").addEventListener("click", function () {
-      if (!st || st.panel < 0 || st.done) return;
+      if (!st || st.panel < 0 || st.done || st.paused) return;
       A.sfx("start"); A.vibe(20);
       send({ t: "done" });
       st.done = true;

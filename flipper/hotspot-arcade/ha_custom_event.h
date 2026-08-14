@@ -15,6 +15,8 @@ typedef enum {
     HaEventPickGame = 105,
     HaEventShowLeaderboard = 106,
     HaEventShowConsole = 107,
+    HaEventTransportResume = 108,
+    HaEventTransportEnd = 109,
     // Flash Firmware (ESP-serial-flasher): start (board detected in download mode),
     // per-block progress, done.
     HaEventFlashStart = 111,

@@ -17,13 +17,30 @@ All notable changes to Hotspot Arcade are documented here. The format is based o
   and in-memory game data for 120 seconds. Reconnecting within that window resumes the
   seat; expiry performs the game's leave/forfeit path exactly once and scrubs every
   game-specific pid role before that number can be reused. Lobby rosters expose `online`,
-  and offline players do not count toward quorum or accept challenges. Game clocks still
-  advance during this foundation release; host-pausable logical time lands in the next
-  Kaini integration slice.
+  and offline players do not count toward quorum or accept challenges. Accepted submitted
+  work remains earned during grace; live pack votes, connected polls, and Secrets reveal
+  cohorts use explicit online snapshots.
+- **Firmware v22 logical time and planned AP pause.** Nested session/game clocks freeze
+  the whole session across an SSID rename or manual AP pause, freeze only an affected
+  Pong/Chess/board match for ordinary disconnect grace, and freeze role-critical party
+  rounds without revealing which hidden role caused it. The host tracks the expected and
+  returned identity masks, starts the optional ten-minute window only after the AP returns,
+  and resumes automatically when everyone is back or explicitly when the host chooses. At
+  the exact rollover-safe window boundary, automatic resume stops and the dashboard presents
+  direct Resume/End controls; late reconnects cannot override that host decision.
+- Phone timer payloads now use bounded relative `remaining_ms`/`duration_ms` snapshots plus
+  `paused`; raw ESP deadlines and Chess `run`/`oms` are gone. Browsers animate from
+  `performance.now()`, block game input during pauses, and retain the planned-pause overlay
+  across socket reconnection. Reaction's random red-light deadline remains secret.
+- UART v22 adds `TRANSPORT_PAUSE`, `TRANSPORT_RESUME`, and fixed-size `TRANSPORT_STATE`;
+  content commit/abort move to `0x21`/`0x22`. Failed content transactions preserve both
+  clocks and all live state, while a successful atomic replacement starts a fresh lobby
+  and resets only the game clock.
 - Simulator coverage for protocol rejection, admission, identity hashing, token takeover,
-  the exact reconnect boundary, rollover-safe deadline helpers, and disconnect behavior in
-  role-critical and 1v1 games. The WebAssembly build explicitly uses the Emscripten C++
-  driver (`em++`) and is exercised under ASan/UBSan.
+  the exact reconnect boundary, rollover-safe clock helpers, planned transport recovery,
+  relative timer contracts, and disconnect behavior in role-critical and 1v1 games. The
+  WebAssembly build explicitly uses the Emscripten C++ driver (`em++`) and is exercised
+  under ASan/UBSan.
 - Content is now loaded with an active-game-only transaction. The ESP holds one live typed
   content bank plus at most one staged bank, validates exact pack/item counts and per-game
   caps, and swaps game and locale only after the complete replacement is valid. A failed

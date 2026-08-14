@@ -44,6 +44,27 @@ export async function newEngine() {
       M.ccall("ha_disconnect", null, ["number"], [wsId]);
       return before.concat(drain());
     },
+    transportPause: (reason, ssid = "", reconnectMs = 0) => {
+      const result = M.ccall(
+        "ha_transport_pause", "number", ["number", "string", "number"],
+        [reason, ssid, reconnectMs],
+      );
+      return { result, out: drain() };
+    },
+    transportResume: () => {
+      const result = M.ccall("ha_transport_resume", "number", [], []);
+      return { result, out: drain() };
+    },
+    transportFallbackSsid: (ssid) => {
+      const ok = M.ccall("ha_transport_fallback_ssid", "number", ["string"], [ssid]) !== 0;
+      return { ok, out: drain() };
+    },
+    transportPaused: () => M.ccall("ha_transport_paused", "number", [], []) !== 0,
+    transportExpected: () => M.ccall("ha_transport_expected", "number", [], []) >>> 0,
+    transportOnlineExpected: () =>
+      M.ccall("ha_transport_online_expected", "number", [], []) >>> 0,
+    sessionNow: () => M.ccall("ha_session_now", "number", [], []) >>> 0,
+    gameNow: () => M.ccall("ha_game_now", "number", [], []) >>> 0,
     timeReached: (now, deadline) =>
       M.ccall("ha_time_reached", "number", ["number", "number"], [now, deadline]) !== 0,
     timeRemaining: (now, deadline) =>
