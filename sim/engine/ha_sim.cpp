@@ -25,6 +25,9 @@ static std::vector<std::string> g_outbox;
 static std::vector<std::string> g_knownIdentities;
 static bool g_admissionFull = false;
 static std::string g_drained; // return buffer; must outlive the call
+static int g_contentFailAfter = -1;
+static int g_contentBanks = 0;
+static int g_contentBanksMax = 0;
 
 // Escape a C string for embedding as a JSON string value. Only nicknames and score
 // reasons need this; every other payload is already JSON text and is spliced raw.
@@ -68,6 +71,34 @@ void haWsCloseWs(uint32_t wsId) {
 
 void haWsBroadcast(const String& msg) {
     g_outbox.push_back("{\"to\":\"all\",\"msg\":" + msg.str() + "}");
+}
+
+void* haContentAlloc(size_t bytes) {
+    void* memory = malloc(bytes);
+    if(memory) {
+        g_contentBanks++;
+        g_contentBanksMax = std::max(g_contentBanksMax, g_contentBanks);
+    }
+    return memory;
+}
+
+void haContentFree(void* memory) {
+    if(!memory) return;
+    g_contentBanks--;
+    free(memory);
+}
+
+bool haContentAllocationAllowed() {
+    if(g_contentFailAfter < 0) return true;
+    if(g_contentFailAfter == 0) return false;
+    g_contentFailAfter--;
+    return true;
+}
+
+bool haPhoneGameChangeAllowed(uint8_t fromGame, uint8_t toGame) {
+    (void)fromGame;
+    (void)toGame;
+    return false;
 }
 
 uint8_t haAuthorizeIdentity(
@@ -145,12 +176,16 @@ void ha_reset() {
     g_knownIdentities.clear();
     g_admissionFull = false;
     engine.reset(g_millis);
+    g_contentFailAfter = -1;
+    g_contentBanksMax = g_contentBanks;
 }
 void ha_reset_at(uint32_t now) {
     g_millis = now;
     g_knownIdentities.clear();
     g_admissionFull = false;
     engine.reset(g_millis);
+    g_contentFailAfter = -1;
+    g_contentBanksMax = g_contentBanks;
 }
 void ha_set_admission_full(int full) { g_admissionFull = full != 0; }
 
@@ -169,17 +204,26 @@ int ha_time_reached(uint32_t now, uint32_t deadline) { return haTimeReached(now,
 uint32_t ha_time_remaining(uint32_t now, uint32_t deadline) {
     return haTimeRemaining(now, deadline);
 }
-void ha_select_game(int id) { engine.selectGame((uint8_t)id); }
-void ha_trivia_clear() { engine.triviaTopicsClear(); }
-void ha_trivia_add_topic(const char* name) { engine.triviaAddTopic(name); }
-void ha_trivia_add_q(const char* json) { engine.triviaAddQ(json); }
-void ha_content_clear() { engine.contentClear(); }
-void ha_content_pack(int game, const char* name) { engine.contentPack((uint8_t)game, name); }
-void ha_content_item(const char* json) { engine.contentItem(json); }
+int ha_select_game(int id) { return engine.selectGame((uint8_t)id) ? 1 : 0; }
+int ha_content_begin(int game, const char* lang) {
+    return engine.contentBegin((uint8_t)game, lang) ? 1 : 0;
+}
+int ha_content_pack(int game, const char* name) {
+    return engine.contentPack((uint8_t)game, name) ? 1 : 0;
+}
+int ha_content_item(const char* json) { return engine.contentItem(json) ? 1 : 0; }
+int ha_content_commit(int packs, int items) {
+    if(packs < 0 || packs > 65535 || items < 0 || items > 65535) return 0;
+    return engine.contentCommit((uint16_t)packs, (uint16_t)items) ? 1 : 0;
+}
+void ha_content_abort() { engine.contentAbort(); }
+void ha_content_fail_after(int checkpoints) { g_contentFailAfter = checkpoints; }
+int ha_content_bank_count() { return engine.contentBankCount(); }
+int ha_content_bank_max() { return g_contentBanksMax; }
+int ha_content_active_game() { return engine.contentActiveGame(); }
+const char* ha_content_active_lang() { return engine.contentActiveLang(); }
 void ha_round_end() { engine.roundEnd(); }
 void ha_reset_scores() { engine.resetScores(); }
-void ha_set_lang(const char* l) { engine.setLang(l); }
-
 // Test-only chess hooks (HA_CHESS_TEST), for positions the opening moves can't reach
 // quickly and for perft ground truth against the real move generator.
 void ha_chess_load(const char* board64, int stm, int rights, int ep, int halfmove,

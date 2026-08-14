@@ -43,6 +43,7 @@ const uartSubscribers = [];
 let nextPhoneId = 1;
 
 const call = (name, argTypes, args) => M.ccall(name, null, argTypes, args);
+const callBool = (name, argTypes, args) => M.ccall(name, "number", argTypes, args) !== 0;
 const drainRaw = () => JSON.parse(M.ccall("ha_drain", "string", [], []));
 
 function routeNow(items) {
@@ -93,15 +94,27 @@ export const engine = {
   selectGame: (id) => { call("ha_select_game", ["number"], [id]); drain(); },
   roundEnd: () => { call("ha_round_end", [], []); drain(); },
   resetScores: () => { call("ha_reset_scores", [], []); drain(); },
-  triviaClear: () => { call("ha_trivia_clear", [], []); drain(); },
-  triviaAddTopic: (n) => { call("ha_trivia_add_topic", ["string"], [n]); drain(); },
-  triviaAddQ: (j) => { call("ha_trivia_add_q", ["string"], [j]); drain(); },
-  // Generic content ingest — the way every pack game (trivia/wyr/scramble/draw) is fed.
-  contentClear: () => { call("ha_content_clear", [], []); drain(); },
-  contentPack: (game, name) => { call("ha_content_pack", ["number", "string"], [game, name]); drain(); },
-  contentItem: (json) => { call("ha_content_item", ["string"], [json]); drain(); },
-  // Phone-UI language the ESP echoes to each phone in `welcome`.
-  setLang: (lang) => { call("ha_set_lang", ["string"], [lang || ""]); drain(); },
+  contentBegin: (game, lang) => {
+    const ok = callBool("ha_content_begin", ["number", "string"], [game, lang || ""]);
+    drain();
+    return ok;
+  },
+  contentPack: (game, name) => {
+    const ok = callBool("ha_content_pack", ["number", "string"], [game, name]);
+    drain();
+    return ok;
+  },
+  contentItem: (json) => {
+    const ok = callBool("ha_content_item", ["string"], [json]);
+    drain();
+    return ok;
+  },
+  contentCommit: (packs, items) => {
+    const ok = callBool("ha_content_commit", ["number", "number"], [packs, items]);
+    drain();
+    return ok;
+  },
+  contentAbort: () => { call("ha_content_abort", [], []); drain(); },
 };
 
 export function subscribeUart(fn) { uartSubscribers.push(fn); }

@@ -95,6 +95,7 @@ typedef enum {
     HaHsIdle,
     HaHsClear, // sent CLEAR_FILES, waiting "cleared"
     HaHsFiles, // streaming files, waiting "fok" per file
+    HaHsContent, // streamed selected content, waiting matching "content_ok game=<id>"
     HaHsSetAp, // sent SET_AP, waiting "ap_set"
     HaHsStart, // sent START, waiting "up"
     HaHsUp, // portal live
@@ -135,6 +136,8 @@ typedef struct HotspotArcadeApp {
 
     // Active game (HA_GAME_*)
     uint8_t active_game;
+    uint8_t pending_game; // target awaiting transactional CONTENT_COMMIT acknowledgement
+    bool content_pending;
 
     // Event feed / console
     FuriString* console; // scrollable raw event log

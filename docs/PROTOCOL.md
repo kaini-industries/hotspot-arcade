@@ -52,15 +52,17 @@ All control messages are framed so the link can resync after noise:
 | 0x13 | START        | (none) — bring up AP + DNS + HTTP + WS |
 | 0x14 | STOP         | (none) |
 | 0x15 | RESET        | (none) — ESP reboots |
-| 0x16 | SELECT_GAME  | `gameid(1)` — 0 lobby, 1 trivia, 2 connect4 |
+| 0x16 | SELECT_GAME  | **Deprecated in v21.** The ESP rejects it with `select_deprecated`; selection must be a content transaction. |
 | 0x17 | QUESTION     | JSON: `{"i":<n>,"q":"..","o":["a","b","c","d"],"c":<0-3>,"dur":<sec>}` (trivia) |
 | 0x18 | REVEAL       | (none) — close the current question, broadcast the correct answer |
 | 0x19 | ROUND_END    | (none) — back to lobby for the active game |
-| 0x1A | CONFIG       | JSON: `{"max":8,"lang":"pt-br","code":"123456"}` — station cap, phone-UI language (`""`/absent = English), and optional six-digit party admission code. `code:""` disables code admission; omitting `code` leaves the current/default policy unchanged. The ESP stores `lang` and echoes it in each `welcome`; the raw code is never sent to a phone after admission. |
+| 0x1A | CONFIG       | JSON: `{"max":8,"code":"123456"}` — station cap and optional six-digit party admission code. `code:""` disables code admission; omitting `code` leaves the current/default policy unchanged. Locale is committed with content, never ahead of it. The raw code is never sent to a phone after admission. |
 | 0x1B | RESET_SCORES | (none) — zero the ESP live score mirror |
-| 0x1C | CONTENT_CLEAR | (none) — drop all packs, for every game |
-| 0x1D | CONTENT_PACK | game byte + pack name — begin a pack for that game |
+| 0x1C | CONTENT_BEGIN | `gameid(1)` + locale bytes (0..7 ASCII bytes; empty = English) — allocate one typed staged bank for the target game |
+| 0x1D | CONTENT_PACK | target game byte + pack name — begin a pack in the staged bank |
 | 0x1E | CONTENT_ITEM | JSON object of the file's own keys — append one item to the current pack |
+| 0x1F | CONTENT_COMMIT | `packCount(2 LE)` + `itemCount(2 LE)` — validate exact counts and atomically select the target game/locale |
+| 0x20 | CONTENT_ABORT | (none) — discard staging; live game/round/roster/scores remain untouched |
 
 > Content is opaque to the Flipper. It parses only `Key: value` blocks and ships them
 > verbatim; every game's interpretation of those keys lives in the ESP firmware, so a new
@@ -68,21 +70,25 @@ All control messages are framed so the link can resync after noise:
 > the ESP expects in each `CONTENT_ITEM` JSON object): trivia `{q,a,b,c,d,answer}`, wyr
 > `{a,b}` (the two options), scramble and draw `{word}` (a single plain word).
 >
-> Content **language** is resolved entirely on the Flipper: for the host's chosen `lang`
-> it streams `packs/<game>/<lang>/` (falling back to the English packs at `packs/<game>/`
-> per game), so the wire opcodes above are language-agnostic. Item text is UTF-8.
+> Content **language** is resolved on the Flipper: for the target game's chosen locale it
+> streams `packs/<game>/<lang>/`, falling back to `packs/<game>/`. The locale is also in
+> `CONTENT_BEGIN`, so the bank and the phone UI configuration become visible together.
+> Only the selected game's content is resident: one live typed bank plus, during loading,
+> at most one staged bank. Packless games commit exact counts `0/0`; content games may not.
+> A malformed item, wrong game, cap violation, allocation failure, or count mismatch aborts
+> the transaction without exposing an empty lobby or changing the old round.
 
 **ESP -> Flipper**
 
 | Type | Name         | Payload |
 |------|--------------|---------|
-| 0x80 | STATUS       | token: `boot` `files_ok` `ap_ok` `up ip=..` `stopped` `err ..` |
+| 0x80 | STATUS       | token, including `boot`, `fok`, `ap_set`, `ap_ok`, `up`, `stopped`, `content_begin game=<id>`, nonterminal `content_invalid game=<id>`, terminal `content_ok game=<id>` / `content_error game=<id>` (emitted only for `CONTENT_COMMIT`), `content_abort`, `select_deprecated`, or `err ..`. The host serializes content requests and accepts a terminal result only when its game id exactly matches the one pending; startup does not proceed to `SET_AP` until that matching `content_ok`. |
 | 0x81 | JOIN         | `pid(1)` `nick` — idempotent roster upsert on first join, resume/takeover, or profile update. A repeated pid updates its profile without resetting the mirrored host score; LEAVE followed by pid reuse creates a fresh zero-score seat. |
 | 0x82 | LEAVE        | `pid(1)` |
 | 0x83 | SCORE        | `pid(1)` `delta(2 LE, signed)` `reason` — authoritative-persist on Flipper |
 | 0x84 | ROUND_RESULT | JSON, game-specific (trivia: `{"correct":[pid..]}`, c4: `{"win":pid,"lose":pid}` or `{"draw":[a,b]}`) |
 | 0x85 | EVENT        | JSON for host display, e.g. `{"answers":3,"total":5}` or `{"c4":"A vs B started"}` |
-| 0x86 | PING         | identity beacon ~every 2s: `magic(4)` + `version(2 LE)` + `bundleCrc(4 LE, v19+)` + `game(1, v19+)` + `heapKb(2 LE, v20+)` + `psramKb(2 LE, v20+)`. `magic` = `48 41 52 43` ("HARC"); the Flipper only treats a magic-matched PING as "our board present", and flags `version < HA_FW_VERSION` as an outdated board to update. `bundleCrc` is the CRC-32/IEEE of the web bundle the ESP holds in flash (0 = none); the Flipper skips re-streaming when it equals the manifest's `crc`. `game` is the ESP's current game id (`HA_GAME_*`); while hosting the Flipper mirrors it (ignoring 0/NONE) so a phone-vote game change reflects on the dashboard reliably — the beacon always arrives, unlike a one-off EVENT. `heapKb`/`psramKb` are the board's free internal heap and free PSRAM in KB (0 = no PSRAM), shown on the dashboard. Older boards send shorter beacons; every field is length-guarded (backward-compatible). |
+| 0x86 | PING         | identity beacon ~every 2s: `magic(4)` + `version(2 LE)` + `bundleCrc(4 LE, v19+)` + `game(1, v19+)` + `heapKb(2 LE, v20+)` + `psramKb(2 LE, v20+)`. `magic` = `48 41 52 43` ("HARC"); the Flipper only treats a magic-matched PING as "our board present", and flags `version < HA_FW_VERSION` as outdated. `bundleCrc` is the CRC-32/IEEE of the flash-resident web bundle (0 = none), used to skip unchanged transfers. `game` is the last committed `HA_GAME_*` and is the host's recovery/diagnostic backstop. `heapKb`/`psramKb` are free internal heap and PSRAM KB. Older boards send shorter beacons; every field is length-guarded. |
 | 0x87 | ART          | finished artwork, streamed: `op(1)` + JSON. `op` 0 = begin a sheet (`{"game":"frankendraw","id":n,"w0":"..","w1":"..","w2":".."}` — the three panels' drawers), 1 = one line segment (`{"p":panel,"x0":..,"y0":..,"x1":..,"y1":..}`, 0..255 sheet units), 2 = end (`{"id":n}`). One frame per segment: the picture is streamed as it is finished, so neither side ever buffers a drawing. The Flipper writes each sheet to `/ext/apps_data/hotspot_arcade/art/fd-<YYMMDD-HHMMSS>-<n>.svg`. |
 
 ### 1.3 Raw-bulk escape (asset upload)
@@ -106,7 +112,9 @@ phone a page whose scripts never arrived. The `bundled-assets` CI job asserts th
 Flipper                         ESP
   |-- CLEAR_FILES -------------->|   (skipped when the bundle is unchanged, see below)
   |-- FILE_BEGIN + bytes -------->|   index.html.gz -> ESP writes it to LittleFS flash
-  |-- (content packs) ---------->|   trivia/party packs (always streamed)
+  |-- CONTENT_BEGIN ------------>|   selected game + locale
+  |-- PACK / ITEM ... ---------->|   only that game's packs (none for packless games)
+  |-- CONTENT_COMMIT ----------->|   exact counts; atomic swap + fresh lobby
   |-- SET_AP ------------------->|
   |-- START -------------------->|
   |<------------- STATUS ap_ok --|
@@ -115,14 +123,14 @@ Flipper                         ESP
 The ESP persists the streamed bundle in flash and serves it from there, so it survives a
 reboot. It advertises the bundle's CRC-32 in every PING (§1.2); when that equals the `crc`
 in the Flipper's `manifest.json`, the Flipper **skips `CLEAR_FILES` and the whole file
-stream**, jumping straight to the content packs + `SET_AP` — the board reuses the copy it
+stream**, jumping straight to the selected-game content transaction + `SET_AP` — the board reuses the copy it
 already holds (no ~47 KB re-transfer per session). A changed bundle, or an
 `apps_data/.../web` override whose manifest carries a different/absent `crc`, streams
 normally and overwrites the stored copy. Skipping is an optimization only: the ESP always
 writes+serves from flash, so an older Flipper that always streams still works.
 
-Then live: JOIN/LEAVE/SCORE/EVENT/ROUND_RESULT flow up; SELECT_GAME/QUESTION/
-REVEAL/ROUND_END flow down as the host drives rounds. PING beacons throughout.
+Then live: JOIN/LEAVE/SCORE/EVENT/ROUND_RESULT flow up; content transactions and
+ROUND_END flow down as the host drives play. PING beacons continue throughout.
 
 ---
 
@@ -172,7 +180,7 @@ persistent leaderboard. Both stay consistent because every delta is reported.
 
 ## 3. v0.2 game expansion
 
-New game ids (UART `SELECT_GAME` / lobby `game`): `3` tictactoe, `4` dots,
+New game ids (content transaction / lobby `game`): `3` tictactoe, `4` dots,
 `5` draw, `6` pong. Lobby `game` string adds: `"tictactoe"`, `"dots"`, `"draw"`,
 `"pong"`.
 
@@ -241,7 +249,7 @@ The final podium is Flipper-side (from its roster scores); no new message.
 
 ## 4. v0.2.0 — identity, reactions, four more games
 
-New game ids (UART `SELECT_GAME` / lobby `game`): `7` react, `8` wyr, `9`
+New game ids (content transaction / lobby `game`): `7` react, `8` wyr, `9`
 scramble, `10` reversi. Lobby `game` string adds `"react"`, `"wyr"`,
 `"scramble"`, `"reversi"`. Firmware **v6** (`HA_FW_VERSION`).
 
@@ -297,7 +305,7 @@ Durations are sent in **seconds**; deadlines in ms (server `millis`).
 ## 5. Guess the Color (`gc`) — game id `11`
 
 Whole-group round game on the same `Party` skeleton (`lobby -> countdown -> play
--> reveal -> ... -> final`, 5 rounds). Select with UART `SELECT_GAME` id `11`;
+-> reveal -> ... -> final`, 5 rounds). Select transactionally with game id `11`;
 lobby `game` string is `"gc"`. Firmware **v12**.
 
 Client intents: `ready{ready:bool}` (lobby), `again` (from final), and
@@ -321,7 +329,7 @@ The round winner is the highest points (ties broken by the faster submit).
 
 A 1v1 match game (like Pong): shares the challenge/lobby flow (`challenge`/`accept`/
 `cancel`, `rematch`, `leaveGame`) but has its own state and screen. 10x10 grid, five ships
-(5,4,3,3,2 = 17 cells). Select with UART `SELECT_GAME` id `12`; lobby `game` string `"bs"`.
+(5,4,3,3,2 = 17 cells). Select transactionally with game id `12`; lobby `game` string `"bs"`.
 Firmware **v13**.
 
 Client intents (besides the shared match ones): `place{ships}` and `fire{n}`.
@@ -346,7 +354,7 @@ ship cell you haven't hit is never in the payload. `oppFleet` appears only in `"
 
 A whole-group party game (Wavelength-style) on the shared party skeleton (lobby with a
 ready-up + pack vote, countdown, reveal). Content reuses the pack pipeline: each item is a
-`Left`/`Right` word pair. Select with UART `SELECT_GAME` id `13`; lobby `game` string
+`Left`/`Right` word pair. Select transactionally with game id `13`; lobby `game` string
 `"spectrum"`. Firmware **v14**.
 
 Each round rotates a **psychic** who sees a hidden target on a 0-100 spectrum and types a
@@ -371,7 +379,7 @@ Server `{t:"spectrum",phase,...}`:
 
 A whole-group party game on the shared party skeleton (lobby with a ready-up + pack vote,
 countdown, reveal). Content reuses the pack pipeline: each item is a `Name` (one person or
-character). Select with UART `SELECT_GAME` id `14`; lobby `game` string `"kmk"`. Firmware
+character). Select transactionally with game id `14`; lobby `game` string `"kmk"`. Firmware
 **v15**.
 
 Each round rotates a **chooser** and draws three people from the pack. The chooser secretly
@@ -398,10 +406,10 @@ Server `{t:"kmk",phase,...}`:
 
 A 1v1 duel (like Pong/Battleship): shares the challenge/lobby flow (`challenge`/`accept`/
 `cancel`, `rematch`, `leaveGame`) but plays full FIDE rules, refereed entirely on the ESP.
-Select with UART `SELECT_GAME` id `15`; lobby `game` string `"chess"`. Firmware **v17**.
+Select transactionally with game id `15`; lobby `game` string `"chess"`. Firmware **v17**.
 Chess has no content packs — its UI strings are localized client-side from the message
-catalog like every game (the host's `lang`, set via `CONFIG` and echoed in `welcome`); the
-per-language `packs/<game>/<lang>/` streaming that content games use does not apply here.
+catalog like every game. Its zero-pack content transaction still commits the host's locale,
+which is echoed in `welcome`; only the `packs/<game>/<lang>/` streaming step is omitted.
 
 Client intents (besides the shared match ones): `move{from,to[,promo]}`, `resign`, `draw`
 (offer, or accept one already pending), `claim`.
@@ -450,7 +458,7 @@ countdown locally between pushes from `deadline`.
 
 A whole-group party game on the shared party skeleton (lobby with a ready-up + pack vote,
 countdown, reveal). Content reuses the pack pipeline: each item is a `Q` (one yes/no
-question). Select with UART `SELECT_GAME` id `16`; lobby `game` string `"secrets"`.
+question). Select transactionally with game id `16`; lobby `game` string `"secrets"`.
 Firmware **v18**.
 
 Each round shows one question and runs **answer → predict → reveal**. First everyone
@@ -519,61 +527,33 @@ integration step; this foundation does not claim exact timed-state restoration.
 
 ---
 
-## 12. Game-change vote (`gamevote`) — cross-cutting, firmware v18
+## 12. Phone game-change policy — cross-cutting, firmware v21
 
-A player can change the active game **from their phone** by majority vote, so the host
-device needs no operation. This is the one sanctioned phone→host action — the engine
-otherwise forbids a phone from selecting a game — and it is gated entirely behind the vote.
-A host-initiated `SELECT_GAME` stays authoritative and immediate (no vote), and cancels any
-pending proposal.
+`proposeGame{game}` remains accepted as a browser intent for compatibility, but it does
+not synchronously switch games. A WebSocket callback cannot read the target packs from SD,
+and selecting before that load would expose a zero-pack content lobby. The engine therefore
+passes the request through `haPhoneGameChangeAllowed(from,to)` and keeps the current bank,
+round, locale, roster, scores, and reconnect deadlines unchanged.
 
-The vote sits **above** the active game (it is not a per-game phase). While a proposal is
-pending the active game is **frozen**: `tick` advances only the vote timeout, `onInput`
-honors only `voteGame` (and `leaveGame`), and `pushAll` sends the `gamevote` overlay to
-every client instead of any game/lobby state. On resolution the previous state resumes
-(reject/timeout) or the new game's lobby appears (approve), both signalled by the next
-normal `lobby` push — the client closes the modal when a `lobby` message arrives.
+The default ESP and simulator adapters decline. The requester receives the typed result:
 
-Client intents:
-- `proposeGame{game}`: `game` is the engine game-name string (e.g. `"wyr"`, `"trivia"`), or
-  `"none"` for "back to the lobby" — leaving the current game is voted on like any other
-  change. Starts a proposal if none is pending and the target is a valid game **other than
-  the active one** (so `"none"` is refused while already in the lobby). The proposer counts
-  as an implicit YES. A second proposal while one is pending is ignored.
-- `voteGame{ok}`: one vote per non-proposer pid (`true` = OK, `false` = No). From the
-  **proposer**, `ok:true` is a no-op (their YES is already implicit) and `ok:false`
-  **withdraws** the proposal — the reject path, resuming the frozen game at once. That is
-  what the Cancel button on the proposer's own overlay sends; no separate intent exists.
+```json
+{"t":"result","event":"game_change","status":"policy_denied","game":"wyr","id":8}
+```
 
-Server `{t:"gamevote",...}` (pushed to every client while pending): `proposer` (nick),
-`avatar` (the proposer's emoji, so the voters' line can lead with it), `game` (target name,
-`"none"` for the lobby), `label` (same as `game`; the client maps it to a pretty label),
-`yes` (count **including** the proposer), `no`, `others` (`playerCount - 1`), `need` (YES
-votes needed from the others = `floor(others/2)+1`), `youproposed`, `youvoted`.
-
-Resolution (recomputed on every vote, join/leave, and tick):
-- **Approve** when YES among the other players is a strict majority — `yesOthers*2 >
-  others` — or immediately if the proposer is the only player. → `selectGame(target)`.
-- **Reject** as soon as that majority is impossible — `noOthers*2 >= others` — or on
-  **timeout** (`GAMEVOTE_SECS` = 25s). → clear and resume the frozen game.
-- **Withdrawn** when the proposer sends `voteGame{ok:false}` (their Cancel button). → same
-  as reject: clear and resume.
-- If the **proposer leaves**, the proposal is cancelled (reject). A non-proposer leaving
-  recomputes the tally (fewer `others` can tip it either way).
-
-On approve the ESP also emits a UART `EVENT` `{"gamevote":"approved","game":"<name>","id":<N>}`
-(the `id` added in v19). The Flipper reads `id` — the numeric `HA_GAME_*` — to update its
-displayed active game to match the vote and to avoid reverting it on an ESP reboot; `game`
-is the short name, for logging. (The Flipper has no name→id map, hence the numeric id.)
-On approve the ESP also emits a UART `EVENT` `{"gamevote":"approved","game":"<name>"}` for
-host-side observability.
+The host receives the corresponding UART event
+`{"gamechange":"policy_denied","game":"wyr","id":8}`. An adapter that later adds a
+bounded loop-task/SD request queue may return true from the policy hook; that reports
+`status:"host_pending"`, but the host must still perform the ordinary
+`CONTENT_BEGIN`…`CONTENT_COMMIT` transaction. No vote overlay or intermediate game state is
+created by either result.
 
 ## 13. Fill the Blank (`fillblank`) — game id `17`
 
 A whole-group party game on the shared party skeleton (ready-up + pack vote lobby,
 countdown, reveal), in the "a judge picks the funniest answer" shape — inspired by Cards
 Against Humanity, with cards written for this project (no affiliation, and none of their
-text). Select with UART `SELECT_GAME` id `17`; lobby `game` string `"fillblank"`. Firmware
+text). Select transactionally with game id `17`; lobby `game` string `"fillblank"`. Firmware
 **v19**.
 
 Content reuses the generic pack pipeline, but a pack carries two decks: a block with a
@@ -644,7 +624,7 @@ Server `{t:"fillblank",phase,...}`:
 ## 10. Werewolf (`werewolf`) — game id `18`
 
 A whole-group party game on the shared party skeleton (ready-up lobby, countdown), but with
-no content packs — the roles are code. Select with UART `SELECT_GAME` id `18`; lobby `game`
+no content packs — the roles are code. Select transactionally with game id `18`; lobby `game`
 string `"werewolf"`. Firmware **v19**. Needs **5 players** minimum; the countdown does not
 arm below that.
 
@@ -748,7 +728,7 @@ Server `{t:"werewolf",phase,...}`:
 
 A whole-group party game on the shared party skeleton (lobby with a ready-up + pack vote,
 countdown, reveal). Content reuses the pack pipeline with a two-key block: a `Loc:` line
-plus one `R:` line per role played there. Select with UART `SELECT_GAME` id `19`; lobby
+plus one `R:` line per role played there. Select transactionally with game id `19`; lobby
 `game` string `"spyfall"`. Firmware **v18**. Minimum **3 players** — the lobby holds until
 three are connected, and the `lobby` message carries `need` so the phone can say so.
 
@@ -844,8 +824,8 @@ immediately as `aborted` with no scoring, and the rotation carries on into the n
 ## 13. Draw a Monster (`frankendraw`) — game id `20`
 
 The exquisite-corpse drawing game, on the shared party skeleton (ready-up lobby,
-countdown, final podium) but with its own three-round body. Select with UART
-`SELECT_GAME` id `20`; lobby `game` string `"frankendraw"`. Firmware **v20**. No content
+countdown, final podium) but with its own three-round body. Select transactionally with
+game id `20`; lobby `game` string `"frankendraw"`. Firmware **v20**. No content
 packs — its UI strings are localized client-side from the message catalog.
 
 Everyone starts a sheet and everyone draws **at the same time**: round 1 the head, round

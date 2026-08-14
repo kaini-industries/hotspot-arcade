@@ -450,7 +450,7 @@ async function toNight(n) {
 for (const N of [4, 5, 6, 8]) {
   const e = await newEngine();
   e.reset();
-  e.selectGame(WW); // host first, exactly like SELECT_GAME arriving over UART
+  e.selectGame(WW); // packless compatibility helper performs the host transaction
   const g = mkGame(e, N);
   for (let i = 1; i <= N; i++) g.join(i, NICKS[i - 1]);
   assert.equal(g.view[1].phase, "lobby", `N=${N}: joins land in the lobby`);

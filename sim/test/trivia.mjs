@@ -27,8 +27,8 @@ e.triviaClear();
 e.triviaAddTopic("Test Pack");
 e.triviaAddQ(JSON.stringify({
   q: "What hosts the AP?",
-  o: ["Flipper", "ESP32", "Phone", "Router"],
-  c: 1,
+  a: "Flipper", b: "ESP32", c: "Phone", d: "Router",
+  answer: "B",
 }));
 e.selectGame(HA_GAME_TRIVIA);
 
