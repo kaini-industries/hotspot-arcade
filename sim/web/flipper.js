@@ -19,8 +19,11 @@ const GAMES = [
 
 const players = new Map(); // pid -> { nick, score }
 const feed = [];
+const HOST_EVENT_NAMES = [
+  "unknown", "match", "chat", "role", "win", "draw", "round", "final",
+];
 
-// Nicknames (and anything spliced from engine event/round JSON) are user-supplied and
+// Nicknames and typed host-event text are user-supplied and
 // reach us unescaped: the phone's maxlength is client-side only, the engine truncates
 // without escaping, and ha_sim.cpp's esc() only JSON-escapes quotes/backslashes/control
 // chars, not `<`/`>`. Escape at render time so a crafted nickname can't inject markup.
@@ -52,8 +55,13 @@ subscribeUart((it) => {
     const p = players.get(it.pid);
     if (p) p.score += it.delta;
     feed.push(`SCORE ${it.pid} ${it.delta > 0 ? "+" : ""}${it.delta} (${it.reason})`);
-  } else if (it.kind === "event") feed.push(`EVENT ${JSON.stringify(it.json)}`);
-  else if (it.kind === "round") feed.push(`ROUND ${JSON.stringify(it.json)}`);
+  } else if (it.kind === "host_event") {
+    const name = HOST_EVENT_NAMES[it.event] || "unknown";
+    feed.push(
+      `EVENT ${name} game=${it.game} actor=${it.actor} target=${it.target} value=${it.value}` +
+      (it.text ? ` ${it.text}` : ""),
+    );
+  }
   // Draw a Monster artwork. The real host writes an SVG per sheet; here we just note the
   // sheet boundaries -- one line per segment would drown the feed.
   else if (it.kind === "art" && it.op === 0) feed.push(`ART begin sheet ${it.json.id}`);

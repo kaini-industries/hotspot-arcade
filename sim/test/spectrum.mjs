@@ -130,4 +130,38 @@ assert.notEqual(onlineStates[0].psychic, "OFFLINE", "reserved offline seat canno
     "offline reserved guesser receives the latched score event");
 }
 
+// Phone scores are per game run: replay keeps the same content bank but the first
+// new round must start from zero rather than carrying the prior final scoreboard.
+{
+  const g = await newEngine();
+  g.reset();
+  for (const pid of [1, 2, 3]) g.join(pid, `R${pid}`);
+  g.loadContent(SP, [{ name: "Replay", items: [{ left: "Cold", right: "Hot" }] }]);
+  for (const pid of [1, 2, 3]) g.input(pid, { t: "ready", ready: true });
+  let now = 3000;
+  let stateOut = g.tick(now);
+  for (let round = 1; round <= 6; round++) {
+    const psychicPid = [1, 2, 3].find(
+      (pid) => lastToWs(stateOut, pid, "spectrum").msg.iam,
+    );
+    const targetValue = lastToWs(stateOut, psychicPid, "spectrum").msg.target;
+    g.input(psychicPid, { t: "clue", text: `round ${round}` });
+    let reveal = [];
+    for (const pid of [1, 2, 3].filter((p) => p !== psychicPid))
+      reveal = g.input(pid, { t: "slide", n: targetValue });
+    assert.equal(lastToWs(reveal, 1, "spectrum").msg.stage, "reveal");
+    now += 6000;
+    stateOut = g.tick(now);
+  }
+  assert.equal(lastToWs(stateOut, 1, "spectrum").msg.phase, "final");
+  g.input(1, { t: "again" });
+  g.testSetScore(1, 777); // prove the countdown transition, not clear(), owns the reset
+  for (const pid of [1, 2, 3]) g.input(pid, { t: "ready", ready: true });
+  stateOut = g.tick(now + 3000);
+  const replay = lastToWs(stateOut, 1, "spectrum").msg;
+  assert.equal(replay.phase, "play");
+  assert.equal(replay.scores.find((p) => p.pid === 1).score, 0,
+    "Spectrum replay starts with a fresh phone scoreboard");
+}
+
 console.log("spectrum: all checks passed");

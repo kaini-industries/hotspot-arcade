@@ -62,7 +62,7 @@ All control messages are framed so the link can resync after noise:
 | 0x1D | CONTENT_PACK | target game byte + pack name — begin a pack in the staged bank |
 | 0x1E | CONTENT_ITEM | JSON object of the file's own keys — append one item to the current pack |
 | 0x1F | TRANSPORT_PAUSE | JSON: `{"reason":"ssid_change|ap_off","ssid":"...","reconnect_ms":0..600000}` — freeze the session before planned AP downtime. `ssid` is required and nonempty for `ssid_change`; `reconnect_ms` starts only after the AP returns. |
-| 0x20 | TRANSPORT_RESUME | (none) — resume only after the AP is live; applies deferred normal-disconnect policy once, then unfreezes the logical clocks |
+| 0x20 | TRANSPORT_RESUME | Empty payload for an early/all-returned resume, or `flags(1)` with bit 0 (`EXPIRE_MISSING`) at the host's exact reconnect-window boundary. Resume is accepted only after the AP is live. |
 | 0x21 | CONTENT_COMMIT | `packCount(2 LE)` + `itemCount(2 LE)` — validate exact counts and atomically select the target game/locale |
 | 0x22 | CONTENT_ABORT | (none) — discard staging; live game/round/roster/scores and both logical clocks remain untouched |
 
@@ -88,11 +88,27 @@ All control messages are framed so the link can resync after noise:
 | 0x81 | JOIN         | `pid(1)` `nick` — idempotent roster upsert on first join, resume/takeover, or profile update. A repeated pid updates its profile without resetting the mirrored host score; LEAVE followed by pid reuse creates a fresh zero-score seat. |
 | 0x82 | LEAVE        | `pid(1)` |
 | 0x83 | SCORE        | `pid(1)` `delta(2 LE, signed)` `reason` — authoritative-persist on Flipper |
-| 0x84 | ROUND_RESULT | JSON, game-specific (trivia: `{"correct":[pid..]}`, c4: `{"win":pid,"lose":pid}` or `{"draw":[a,b]}`) |
-| 0x85 | EVENT        | JSON for host display, e.g. `{"answers":3,"total":5}` or `{"c4":"A vs B started"}` |
+| 0x84 | ROUND_RESULT | Reserved legacy type. v22 does not emit or interpret game-specific result JSON. |
+| 0x85 | EVENT        | Bounded typed semantic event: `version(1)` `kind(1)` `game(1)` `actorPid(1)` `targetPid(1)` `value(2 LE, signed)` `text(0..96 UTF-8 bytes)`. |
 | 0x86 | PING         | identity beacon ~every 2s: `magic(4)` + `version(2 LE)` + `bundleCrc(4 LE, v19+)` + `game(1, v19+)` + `heapKb(2 LE, v20+)` + `psramKb(2 LE, v20+)`. `magic` = `48 41 52 43` ("HARC"); the Flipper only treats a magic-matched PING as "our board present", and flags `version < HA_FW_VERSION` as outdated. `bundleCrc` is the CRC-32/IEEE of the flash-resident web bundle (0 = none), used to skip unchanged transfers. `game` is the last committed `HA_GAME_*` and is the host's recovery/diagnostic backstop. `heapKb`/`psramKb` are free internal heap and PSRAM KB. Older boards send shorter beacons; every field is length-guarded. |
 | 0x87 | ART          | finished artwork, streamed: `op(1)` + JSON. `op` 0 = begin a sheet (`{"game":"frankendraw","id":n,"w0":"..","w1":"..","w2":".."}` — the three panels' drawers), 1 = one line segment (`{"p":panel,"x0":..,"y0":..,"x1":..,"y1":..}`, 0..255 sheet units), 2 = end (`{"id":n}`). One frame per segment: the picture is streamed as it is finished, so neither side ever buffers a drawing. The Flipper writes each sheet to `/ext/apps_data/hotspot_arcade/art/fd-<YYMMDD-HHMMSS>-<n>.svg`. |
 | 0x88 | TRANSPORT_STATE | fixed 10 bytes: `flags(1)` `reason(1)` `expectedMask(2 LE)` `onlineMask(2 LE)` `reconnect_ms(4 LE)`. Flags: bit 0 paused, bit 1 network resume-ready (AP/portal live and no shutdown pending), bit 2 every expected identity online, bit 3 portal live (including the pre-shutdown flush window). Reason: 1 SSID change, 2 AP off. Masks use pid bit `pid-1`. The ESP repeats this authoritative snapshot with its two-second PING so any one lost lifecycle/state frame self-heals. |
+
+`EVENT` version 1 is deliberately not display JSON. The engine supplies the active
+`HA_GAME_*` id and bounded fields; host adapters format them for their own UI and history
+without parsing phone-facing snapshots. Pid 0 means "not applicable". Text is truncated
+only between complete valid UTF-8 code points. Game 0 is valid for party-level events,
+such as lobby chat before the first content selection.
+
+| Kind | Value | Meaning |
+|------|-------|---------|
+| `MATCH_STARTED` | 1 | actor and target began a 1v1 match |
+| `CHAT` | 2 | actor sent `text` |
+| `ROLE` | 3 | actor received/used the semantic role or status in `text`; target/value are game-specific bounded metadata |
+| `ROUND_WIN` | 4 | actor won; target is the opponent/role counterpart when applicable |
+| `ROUND_DRAW` | 5 | actor and target drew |
+| `ROUND_COMPLETE` | 6 | a party round/panel completed; `value` is normally its one-based round |
+| `GAME_FINAL` | 7 | the active game reached its final scoreboard |
 
 ### 1.3 Raw-bulk escape (asset upload)
 
@@ -132,7 +148,7 @@ already holds (no ~47 KB re-transfer per session). A changed bundle, or an
 normally and overwrites the stored copy. Skipping is an optimization only: the ESP always
 writes+serves from flash, so an older Flipper that always streams still works.
 
-Then live: JOIN/LEAVE/SCORE/EVENT/ROUND_RESULT flow up; content transactions and
+Then live: JOIN/LEAVE/SCORE/typed EVENT flow up; content transactions and
 ROUND_END flow down as the host drives play. PING beacons continue throughout.
 
 ### 1.5 Planned transport pause
@@ -151,15 +167,26 @@ optional reconnect window (normally 600,000 ms) begins only after an authoritati
 the portal is live and resume-ready, never while the radio is down. `TRANSPORT_STATE` reports
 portal lifecycle plus the expected and rejoined masks so the host can
 resume automatically when all expected identities return, or offer Resume/End when the
-window expires. Expiry is a prompt, not an automatic destructive action.
+window expires. Expiry is a prompt, not an automatic destructive action; choosing Resume
+at that exact boundary sends `EXPIRE_MISSING`.
 
 Known identities may authenticate while transport is paused and recover their existing
 seat. Unknown identities receive `reject{code:"server_paused"}`. `TRANSPORT_RESUME` is valid
-only while the AP is live. It applies the ordinary disconnect/forfeit/quorum rules once to
-expected identities that did not return, broadcasts `server_resume`, sends locale config
-and one authoritative game state, then advances both clocks again. A successful content
+only while the AP is live. An early empty-payload resume starts the ordinary two-minute
+transient grace for any expected seat still missing. A boundary resume with
+`EXPIRE_MISSING` finalizes still-missing expected seats once, before unfreezing; returned
+seats survive, two simultaneously absent opponents cannot forfeit to each other, and seats
+already offline before the planned snapshot retain their remaining normal grace. Either
+form broadcasts `server_resume`, sends locale config and one authoritative game state,
+then advances both clocks again. A successful content
 commit starts the selected game in a fresh lobby and resets only the game clock; a failed or
 aborted transaction changes neither live state nor either clock.
+
+At actual AP shutdown the adapter must call
+`Engine::detachTransportSockets(rawNow)` under the engine lock before graceful WebSocket,
+server, or radio teardown. This preserves the expected identity snapshot but clears live
+socket presence synchronously, so the first restarted `TRANSPORT_STATE` cannot mistake
+stale asynchronous clients for returned phones. Late disconnect callbacks are idempotent.
 
 ---
 
@@ -207,10 +234,12 @@ so that state deliberately omits both time values and exposes only `paused`.
 
 ### 2.3 Scoring split
 
-The ESP scores the live session (speed+correctness for trivia, win/draw for c4)
+The ESP scores the live run (speed+correctness for trivia, wins for match games)
 and (a) keeps a **live mirror** it broadcasts to phones in `players[].score`, and
 (b) reports each delta to the Flipper via UART `SCORE` for the host display and
-persistent leaderboard. Both stay consistent because every delta is reported.
+persistent leaderboard. Every game award, including Battleship, passes through one
+signed-32-bit saturating path; the UART reports only the delta that actually fit. Phone
+scores reset for a new game run/replay, while the host may keep a cumulative session total.
 
 ---
 
@@ -248,8 +277,10 @@ game-specific. If every match slot is occupied, acceptance returns
 
 ### 3.2 Drawing + guessing (`draw`)
 
-Host selects the game; the ESP runs rounds off its built-in word list, rotating
-the drawer. Server -> client `t:"draw"`:
+Host selects the game transactionally with one to eight word packs. The ESP visits every
+non-empty pack round-robin, shuffles each pack without replacement, prevents a repeat at
+the reshuffle boundary, and preserves the pack/word and drawer cursors across replays.
+Server -> client `t:"draw"`:
 - `phase:"draw"`, `role:"drawer"`: `word`, `round`, `drawer` (pid), `scores`.
 - `phase:"draw"`, `role:"guesser"`: `len` (word length), `round`, `drawer`
   (nick), `scores`.
@@ -269,11 +300,11 @@ ESP ticks the ball + paddles and broadcasts. Server -> client `t:"pong"`:
 (1/2), `opp`, `ball{x,y}` (0..1), `p1`, `p2` (paddle y, 0..1), `s1`, `s2`
 (scores); over: `result`. Client input: `paddle{dir}` with `dir` -1/0/1.
 
-### 3.4 Trivia depth (additive)
+### 3.4 Typed host feed
 
-The in-question `EVENT` (ESP -> Flipper) gains a `counts` array so the host screen
-can show live per-option bars: `{"answers":n,"total":m,"counts":[c0,c1,c2,c3]}`.
-The final podium is Flipper-side (from its roster scores); no new message.
+Phone snapshots remain game-specific, but host-visible milestones use the bounded typed
+`EVENT` frame from section 1.2. Live per-option counts stay in the authoritative Trivia
+phone snapshot; the host never parses that display JSON to recover results.
 
 ### 3.5 Notes
 
@@ -599,6 +630,10 @@ does not start or consume the 120-second grace, keeps challenges and seats intac
 defers all ordinary leave/quorum/forfeit effects until explicit transport resume. This is
 why SSID rename/AP pause must use section 1.5 rather than closing sockets first.
 
+At a planned reconnect deadline the host may explicitly resume with `EXPIRE_MISSING`.
+That finalizes only still-missing identities from the pause snapshot, exactly once and
+while clocks remain frozen. It does not grant those identities another 120 seconds.
+
 ---
 
 ## 12. Phone game-change policy — cross-cutting, firmware v21
@@ -615,8 +650,8 @@ The default ESP and simulator adapters decline. The requester receives the typed
 {"t":"result","event":"game_change","status":"policy_denied","game":"wyr","id":8}
 ```
 
-The host receives the corresponding UART event
-`{"gamechange":"policy_denied","game":"wyr","id":8}`. An adapter that later adds a
+The host receives the corresponding typed UART `ROLE` event (actor=requester,
+value=requested game id, text=`policy_denied`). An adapter that later adds a
 bounded loop-task/SD request queue may return true from the policy hook; that reports
 `status:"host_pending"`, but the host must still perform the ordinary
 `CONTENT_BEGIN`…`CONTENT_COMMIT` transaction. No vote overlay or intermediate game state is

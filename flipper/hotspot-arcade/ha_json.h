@@ -1,7 +1,7 @@
 #pragma once
 #include <furi.h>
 
-// Minimal flat-JSON readers for the small EVENT/ROUND_RESULT/manifest payloads.
+// Minimal flat-JSON readers for the small configuration, artwork, and manifest payloads.
 // Not a general parser; good for our controlled, shallow objects.
 
 static inline const char* ha_json_find(const char* s, const char* key) {

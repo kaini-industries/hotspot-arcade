@@ -9,7 +9,7 @@ Hotspot Arcade is three programs cooperating over two links:
    trivia.js             AP + wildcard DNS         host UI (scenes)
    connect4.js           catch-all HTTP (assets)   UART v2 (ha_uart)
    app.js (core)         AsyncWebSocket /ws        session/roster/rounds
-                         game engine (referee)     trivia pack -> QUESTION
+                         game engine (referee)     packs -> ContentBank
                               ^                          ^
                               +------ UART 921600 -------+
 ```
@@ -24,14 +24,15 @@ UART only ever carries low-frequency, high-level messages, never per-frame state
 | Flipper owns (session/meta)                         | ESP owns (real-time)                    |
 |-----------------------------------------------------|-----------------------------------------|
 | Lobby roster + live scoreboard (mirrored)           | WebSocket connections, socket<->player  |
-| Which game is active, round flow (start/reveal/next)| Per-move / per-question game state       |
-| Trivia question bank (SD) fed one round at a time    | Move validation, buzz timing            |
+| Which game/content/locale to select transactionally | Per-move / per-question game state       |
+| SD content source + bounded typed host history       | Active typed ContentBank + validation    |
 | Authoritative persistent scores, host display        | Broadcasting state to phones            |
 | Streaming the web bundle to the ESP (on change)      | Serving the bundle from LittleFS flash  |
 
 Scores are computed by the ESP (it is the referee), broadcast to phones for display,
-**and** reported to the Flipper via `SCORE`/`ROUND_RESULT` so the host screen and
-leaderboard stay in sync. Both stay consistent because every delta is reported.
+**and** reported to the Flipper via `SCORE` so the host screen and leaderboard stay in
+sync. Semantic milestones use bounded typed `EVENT` frames rather than display JSON.
+Every score award uses one saturating engine path and reports only the applied delta.
 
 ## ESP32 firmware (`esp32/hotspot-arcade-fw/`)
 
@@ -49,7 +50,8 @@ Single Arduino sketch plus header-only helpers (one translation unit):
 - `ha_games.h` — the engine: player roster (with emoji avatars) plus all twenty games and
   their per-client JSON serialization. Per-game runtime state shares one union (only
   the active game's state is ever live; a game switch zeroes it and re-defaults only
-  the incoming game), content packs stay resident outside the union, and Draw a
+  the incoming game), only one validated active ContentBank stays resident outside the
+  union (plus one staged bank during an atomic replacement), and Draw a
   Monster's large stroke store is heap/PSRAM-allocated only while it is the active
   game — that is how twenty games fit the S2's internal DRAM. The whole-group games
   (Trivia, Would You Rather, Word Scramble, Reaction Duel, Guess the Color, Spectrum,
@@ -71,8 +73,9 @@ Single Arduino sketch plus header-only helpers (one translation unit):
 - `ha_json.h` / `ha_proto.h` — tiny JSON reader/writer and the UART frame constants +
   CRC-8.
 
-The web app (about 63 KB gzipped) lives in LittleFS flash, and RAM stays flat regardless
-of trivia pack size (questions are pushed one at a time, never stored in bulk).
+The web app (about 63 KB gzipped) lives in LittleFS flash. Content RAM is bounded by
+validated per-game caps (up to eight ordinary packs/topics and 32 items per ordinary
+word/prompt pack); only the selected game's bank is live.
 
 ## Flipper app (`flipper/hotspot-arcade/`)
 
@@ -85,10 +88,11 @@ A `ViewDispatcher` + `SceneManager` app, same shape as flytrap:
   USART. Runs at 921600.
 - `ha_proto.c` — framed message encode.
 - `helpers/ha_session.c` — the heart: the RX frame parser, the start **handshake**
-  state machine (CLEAR_FILES -> stream bundle -> SET_AP -> START, driven by ESP acks),
+  state machine (CLEAR_FILES -> stream bundle -> transactional content -> SET_AP -> START,
+  driven by ESP acks),
   the roster (JOIN/LEAVE/SCORE), planned-transport state (expected/rejoined identity masks,
-  AP restart and host reconnect window), and trivia round orchestration (parse a pack
-  question, build + send `QUESTION`, `REVEAL`, next).
+  AP restart and host reconnect window), typed semantic event formatting, and atomic
+  streaming of the selected game's packs into the ESP ContentBank.
 - `helpers/ha_storage.c` — config (FlipperFormat), `manifest.json` parsing, binary-safe
   file reads (pre-reserved buffers to avoid an OOM-inducing 2x realloc peak), trivia
   pack loading.
@@ -127,13 +131,14 @@ Both links are specified in [PROTOCOL.md](PROTOCOL.md): the framed UART v2 (with
 raw-bulk escape used to stream files) and the WebSocket JSON. The protocol is the source
 of truth; all three programs are kept in sync with it.
 
-## Data flow: a trivia round
+## Data flow: a trivia run
 
-1. Host picks a pack (SD) and Start Session. Flipper streams the bundle to the ESP,
-   which brings up the AP. Phones join, `hello` -> `welcome`/`lobby`.
-2. Host selects Trivia. Flipper parses question N from the pack, sends `QUESTION`.
-3. ESP broadcasts `trivia` state; phones tap; ESP validates + times each `answer`,
-   reports live `EVENT {answers,total}` to the Flipper.
-4. Host taps Reveal. Flipper sends `REVEAL`; ESP scores correct answers (speed bonus),
-   reports `SCORE` per player + `ROUND_RESULT`, broadcasts the reveal.
-5. Host taps Next -> back to step 2, until the pack ends (`ROUND_END`).
+1. Host selects Trivia and a locale. The Flipper begins a content transaction, streams
+   all validated topic/question blocks from SD, and commits exact pack/item counts.
+2. The ESP atomically swaps the active typed bank, publishes locale + a fresh lobby, and
+   keeps the previous game untouched if any allocation, item, or count check failed.
+3. Phones ready and vote; the ESP chooses a topic, runs every question/reveal timer,
+   validates answers, and broadcasts per-phone snapshots from its logical game clock.
+4. Every applied score delta goes to phones and `SCORE`; semantic final/round milestones
+   use typed `EVENT`. The host selects another game or explicitly ends the run with
+   `ROUND_END`; it never parses phone JSON or drives individual questions.

@@ -99,8 +99,8 @@ the Flipper leaderboard):
 
 - **Drawing & guessing** — one player draws on their phone canvas, everyone else guesses
   in a chat; points for the drawer and the first correct guess; rounds rotate the drawer.
-  Words are the draw packs on the SD card (no vote strip — the first pack streamed is
-  the one played).
+  Words come from every non-empty draw pack on the SD card in round-robin order, with a
+  shuffled no-repeat cursor per pack that persists across replays.
 
 All games run on one pluggable engine on the ESP (the real-time referee), and the web
 client shares one implementation of the lobby, countdown, timer, leaderboard, and podium,
@@ -193,7 +193,8 @@ the games stay in sync.
   mini-browsers are too limited for WebSockets, so it is a "tap to open in your browser"
   handoff).
 - The Flipper streams the (gzipped) web bundle and the **selected game's** content to the
-  ESP over a framed UART protocol, then orchestrates rounds. Game/locale changes use a
+  ESP over a framed UART protocol, then mirrors the authoritative engine state. The ESP
+  engine orchestrates rounds. Game/locale changes use a
   count-checked transaction: a malformed or failed load leaves the prior game untouched,
   and the ESP holds one live typed content bank plus at most one staged bank. The web bundle
   is stored in a **LittleFS flash partition** on the ESP and served from flash (so it costs no RAM and survives a

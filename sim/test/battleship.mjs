@@ -77,6 +77,14 @@ assert.equal(a.msg.result, "win", "Alice wins");
 assert.equal(b.msg.result, "lose", "Bob loses");
 assert.ok(Array.isArray(a.msg.oppFleet), "the enemy fleet is revealed at game over");
 assert.equal(a.msg.oppShips, 0, "all enemy ships are sunk");
+let paid = out.filter((x) => x.to === "uart" && x.kind === "score");
+assert.deepEqual(paid.map((x) => [x.pid, x.delta, x.reason]), [[1, 300, "battlewin"]],
+  "a Battleship win is awarded exactly once through the shared score path");
+let events = out.filter((x) => x.to === "uart" && x.kind === "host_event");
+assert.deepEqual(events.map((x) => [x.event, x.game, x.actor, x.target]), [[4, BS, 1, 2]],
+  "the host receives one typed Battleship win event");
+assert.deepEqual(e.input(1, { t: "fire", n: EMPTY_B }), [],
+  "input after game over cannot double-award the winner");
 
 // rematch -> back to placement, first move alternated (Bob fires first now)
 out = e.input(1, { t: "rematch" });
@@ -92,5 +100,10 @@ out = e.input(1, { t: "leaveGame" });
 b = lastToWs(out, 2, "bs");
 assert.equal(b.msg.phase, "over", "opponent leaving ends the match");
 assert.equal(b.msg.result, "win", "you win when your opponent forfeits");
+paid = out.filter((x) => x.to === "uart" && x.kind === "score");
+assert.deepEqual(paid.map((x) => [x.pid, x.delta, x.reason]), [[2, 300, "battlewin"]],
+  "a forfeit uses the same one-shot Battleship award");
+events = out.filter((x) => x.to === "uart" && x.kind === "host_event");
+assert.deepEqual(events.map((x) => [x.event, x.actor, x.target]), [[4, 2, 1]]);
 
 console.log("battleship: all checks passed");

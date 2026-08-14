@@ -140,12 +140,19 @@ void haUartScore(uint8_t pid, int delta, const char* reason) {
         ",\"delta\":" + std::to_string(delta) + ",\"reason\":\"" + esc(reason) + "\"}");
 }
 
-void haUartEvent(const String& json) {
-    g_outbox.push_back("{\"to\":\"uart\",\"kind\":\"event\",\"json\":" + json.str() + "}");
-}
-
-void haUartRoundResult(const String& json) {
-    g_outbox.push_back("{\"to\":\"uart\",\"kind\":\"round\",\"json\":" + json.str() + "}");
+void haUartHostEvent(
+    uint8_t kind,
+    uint8_t game,
+    uint8_t actor,
+    uint8_t target,
+    int16_t value,
+    const char* text) {
+    g_outbox.push_back(
+        "{\"to\":\"uart\",\"kind\":\"host_event\",\"event\":" +
+        std::to_string((int)kind) + ",\"game\":" + std::to_string((int)game) +
+        ",\"actor\":" + std::to_string((int)actor) + ",\"target\":" +
+        std::to_string((int)target) + ",\"value\":" + std::to_string((int)value) +
+        ",\"text\":\"" + esc(text ? text : "") + "\"}");
 }
 
 // The 8th sink: the identity trace the firmware prints to its serial console. It is
@@ -204,7 +211,10 @@ int ha_transport_pause(int reason, const char* ssid, uint32_t reconnectMs) {
     return (int)engine.pauseTransport(
         (HaTransportReason)reason, ssid ? ssid : "", reconnectMs, g_millis);
 }
-int ha_transport_resume() { return (int)engine.resumeTransport(g_millis); }
+int ha_transport_resume(int expireMissing) {
+    return (int)engine.resumeTransport(g_millis, expireMissing != 0);
+}
+void ha_transport_detach_sockets() { engine.detachTransportSockets(g_millis); }
 int ha_transport_fallback_ssid(const char* ssid) {
     return engine.replacePausedTransportSsid(ssid) ? 1 : 0;
 }
@@ -237,6 +247,13 @@ int ha_content_active_game() { return engine.contentActiveGame(); }
 const char* ha_content_active_lang() { return engine.contentActiveLang(); }
 void ha_round_end() { engine.roundEnd(g_millis); }
 void ha_reset_scores() { engine.resetScores(); }
+void ha_test_set_score(int pid, int32_t score) { engine.hostTestSetScore((uint8_t)pid, score); }
+void ha_test_award_score(int pid, int delta) {
+    engine.hostTestAwardScore((uint8_t)pid, delta);
+}
+void ha_test_host_event(int kind, const char* text) {
+    engine.hostTestEvent((uint8_t)kind, text);
+}
 // Test-only chess hooks (HA_CHESS_TEST), for positions the opening moves can't reach
 // quickly and for perft ground truth against the real move generator.
 void ha_chess_load(const char* board64, int stm, int rights, int ep, int halfmove,

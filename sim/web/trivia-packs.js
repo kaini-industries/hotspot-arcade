@@ -150,7 +150,7 @@ export const PACK_DIRS = [
   { game: 8, dir: "wyr", names: ["everyday", "spooky", "spicy", "superpowers", "timespace", "absurd"] },
   { game: 9, dir: "scramble", names: ["classic", "animals", "food", "space", "music", "sports"] },
   { game: 5, dir: "draw", names: ["classic", "movies", "food", "nature", "animals", "fantasy"] },
-  { game: 13, dir: "spectrum", names: ["everyday", "extremes", "opinions", "tastes"] },
+  { game: 13, dir: "spectrum", names: ["everyday", "extremes", "opinions", "tastes", "wildcard"] },
   { game: 14, dir: "kmk", names: ["famous", "fiction", "historical", "mix"] },
   { game: 16, dir: "secrets", names: ["1-normal", "2-slightly-spicy", "3-super-chili"] },
   { game: 17, dir: "fillblank", names: ["1-family", "2-spicy"] },

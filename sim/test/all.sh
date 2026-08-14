@@ -13,7 +13,7 @@ trap 'rm -f "$roster_test_bin" "$adapter_test_bin" "$content_flow_test_bin"' EXI
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror content-flow.c -o "$content_flow_test_bin"
 "$content_flow_test_bin"
 for t in smoke.mjs identity.mjs clock.mjs transport-pause.mjs disconnect-pause.mjs timer-contract.mjs \
-         trivia.mjs duel.mjs result-attribution.mjs draw-input.mjs packs.mjs reactions.mjs content.mjs content-bank.mjs \
+         trivia.mjs duel.mjs result-attribution.mjs draw-input.mjs packs.mjs reactions.mjs content.mjs content-bank.mjs engine-contract.mjs \
          guesscolor.mjs battleship.mjs spectrum.mjs kmk.mjs secrets.mjs fillblank.mjs \
          gamevote.mjs online-cohort.mjs wyr.mjs utf8.mjs lang.mjs chess.mjs werewolf.mjs spyfall.mjs \
          frankendraw.mjs multigame.mjs; do

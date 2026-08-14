@@ -8,6 +8,23 @@
 #define HA_SYNC 0xA5
 #define HA_MAX_PAYLOAD 4096
 #define HA_IDENTITY_BYTES 16 // first 128 bits of SHA-256(browser resume token)
+#define HA_HOST_EVENT_VERSION 1
+#define HA_HOST_EVENT_TEXT_MAX 96
+#define HA_HOST_EVENT_HEADER_SIZE 7
+#define HA_TRANSPORT_RESUME_EXPIRE_MISSING 0x01
+
+// Bounded semantic host events. HA_MSG_EVENT carries the fixed seven-byte header
+// (version, kind, game, actor, target, signed value LE) followed by 0..96 bytes of
+// UTF-8 text. Hosts never parse display-oriented JSON to recover game meaning.
+enum {
+    HA_HOST_EVT_MATCH_STARTED = 1,
+    HA_HOST_EVT_CHAT = 2,
+    HA_HOST_EVT_ROLE = 3,
+    HA_HOST_EVT_ROUND_WIN = 4,
+    HA_HOST_EVT_ROUND_DRAW = 5,
+    HA_HOST_EVT_ROUND_COMPLETE = 6,
+    HA_HOST_EVT_GAME_FINAL = 7,
+};
 
 // Firmware identity carried in every PING beacon: a 4-byte project MAGIC so a
 // different project's beacon is never mistaken for ours, and a VERSION so the
@@ -37,6 +54,8 @@ enum {
     HA_MSG_CONTENT_PACK = 0x1D, // payload = target game byte + pack name
     HA_MSG_CONTENT_ITEM = 0x1E, // payload = JSON object of the file's own keys
     HA_MSG_TRANSPORT_PAUSE = 0x1F, // JSON: reason, ssid, reconnect_ms
+    // Empty payload resumes early and starts ordinary transient grace. A one-byte
+    // HA_TRANSPORT_RESUME_EXPIRE_MISSING flag finalizes still-missing snapshot seats.
     HA_MSG_TRANSPORT_RESUME = 0x20,
     HA_MSG_CONTENT_COMMIT = 0x21, // payload = expected pack/item counts, uint16 LE each
     HA_MSG_CONTENT_ABORT = 0x22, // discard staged bank; live game remains untouched
@@ -48,8 +67,8 @@ enum {
     HA_MSG_JOIN = 0x81,
     HA_MSG_LEAVE = 0x82,
     HA_MSG_SCORE = 0x83,
-    HA_MSG_ROUND_RESULT = 0x84,
-    HA_MSG_EVENT = 0x85,
+    HA_MSG_ROUND_RESULT = 0x84, // reserved legacy JSON result (v21 and older)
+    HA_MSG_EVENT = 0x85, // typed HA_HOST_EVENT_VERSION frame
     HA_MSG_PING = 0x86,
     HA_MSG_ART = 0x87, // finished artwork, streamed: op byte + JSON (see HA_ART_*)
     HA_MSG_TRANSPORT_STATE = 0x88, // fixed 10-byte binary snapshot; flags bit3 = portal live
@@ -83,13 +102,9 @@ enum {
     HA_GAME_CHESS = 15, // chess (1v1, full FIDE rules)
     HA_GAME_SECRETS = 16, // secrets (party, hidden yes/no vote + prediction)
     HA_GAME_FILLBLANK = 17, // fill the blank (party, judge picks the funniest answer)
-    // 16 is Secrets (already on master) and 17 is reserved for a game in flight on
-    // another branch; this game is trivially renumbered down to 17 if that one is
-    // dropped or lands after it.
     HA_GAME_WEREWOLF = 18, // werewolf (party, hidden roles + night/day phases)
     HA_GAME_SPYFALL = 19, // spyfall (party, one player doesn't know the location)
-    // 17..19 are claimed by games in flight on other branches (Werewolf took 19), so
-    // this one starts at 20; the id renumbers trivially (it is not persisted anywhere).
+    // v22 catalog ids are persisted in manifests/history and must never be renumbered.
     HA_GAME_FRANKENDRAW = 20, // "Draw a Monster": head/torso/legs by three hands (party)
 };
 

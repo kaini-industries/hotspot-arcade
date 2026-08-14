@@ -1,7 +1,9 @@
 # Content packs
 
 Plain-text content for the pack-driven games, one directory per game (`packs/trivia/`,
-`packs/wyr/`, `packs/scramble/`, `packs/draw/`, `packs/spectrum/`, `packs/kmk/`).
+`packs/wyr/`, `packs/scramble/`, `packs/draw/`, `packs/spectrum/`, `packs/kmk/`,
+`packs/secrets/`, `packs/fillblank/`, and `packs/spyfall/`). Ordinary games accept up
+to eight packs; ordinary word/prompt packs accept up to 32 items.
 
 The format is the same for every game: `Key: value` lines, with a line of `---` or a
 blank line between blocks. A `Pack:` key names the pack; without one the filename is
@@ -93,8 +95,25 @@ Word: house
 ---
 ```
 
-Same 20-character guidance as scramble. Unlike the other games, draw has no vote
-strip yet — the first pack streamed is the one played.
+Same 20-character guidance as scramble. Draw visits every non-empty pack round-robin,
+shuffles each one without replacement, and preserves its cursors across replays.
+
+### Spectrum's keys
+
+Each block is one `Left:` / `Right:` pair. The English `wildcard.txt` is the full
+32-pair boundary pack and is also a regression fixture for the engine's validated cap:
+
+```
+Pack: Wild Card
+Left: Introvert
+Right: Extrovert
+---
+```
+
+`wildcard.txt` is intentionally English-only. German and Brazilian Portuguese already
+have localized Spectrum sets, so those locales offer their translated packs without
+mixing in this English pack; per-game fallback applies only when a locale has no packs
+for the game at all.
 
 ## Languages
 

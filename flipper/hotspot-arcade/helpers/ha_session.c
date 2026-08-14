@@ -24,7 +24,7 @@ static void feedback_blip(HotspotArcadeApp* app) {
     if(app->vibro_on) notification_message(app->notifications, &sequence_single_vibro);
 }
 
-// A success cue for a scored moment (trivia reveal, a Connect Four win).
+// A success cue for a typed win/draw/final milestone.
 static void feedback_success(HotspotArcadeApp* app) {
     if(app->vibro_on) notification_message(app->notifications, &sequence_single_vibro);
     if(app->sound_on) notification_message(app->notifications, &sequence_success);
@@ -37,6 +37,109 @@ static void console_add(HotspotArcadeApp* app, const char* line) {
     furi_string_cat_str(app->console, "\n");
     size_t sz = furi_string_size(app->console);
     if(sz > HA_CONSOLE_MAX) furi_string_right(app->console, sz - HA_CONSOLE_MAX / 2);
+}
+
+static const char* host_event_game_name(uint8_t game) {
+    switch(game) {
+    case HA_GAME_TRIVIA: return "Trivia";
+    case HA_GAME_CONNECT4: return "Connect 4";
+    case HA_GAME_TICTACTOE: return "Tic-Tac-Toe";
+    case HA_GAME_DOTS: return "Dots & Boxes";
+    case HA_GAME_DRAW: return "Drawing";
+    case HA_GAME_PONG: return "Pong";
+    case HA_GAME_REACT: return "Reaction Duel";
+    case HA_GAME_WYR: return "Would You Rather";
+    case HA_GAME_SCRAMBLE: return "Word Scramble";
+    case HA_GAME_REVERSI: return "Reversi";
+    case HA_GAME_GUESSCOLOR: return "Guess the Color";
+    case HA_GAME_BATTLESHIP: return "Battleship";
+    case HA_GAME_SPECTRUM: return "Spectrum";
+    case HA_GAME_KMK: return "Kiss Marry Kill";
+    case HA_GAME_CHESS: return "Chess";
+    case HA_GAME_SECRETS: return "Secrets";
+    case HA_GAME_FILLBLANK: return "Fill the Blank";
+    case HA_GAME_WEREWOLF: return "Werewolf";
+    case HA_GAME_SPYFALL: return "Spyfall";
+    case HA_GAME_FRANKENDRAW: return "Draw a Monster";
+    default: return "Arcade";
+    }
+}
+
+static const char* host_event_player_name(HotspotArcadeApp* app, uint8_t pid) {
+    int index = haRosterFind(app->players, pid);
+    return index >= 0 ? app->players[index].nick : "?";
+}
+
+static void host_event_dispatch(HotspotArcadeApp* app, const uint8_t* payload, uint16_t len) {
+    if(len < HA_HOST_EVENT_HEADER_SIZE || payload[0] != HA_HOST_EVENT_VERSION) return;
+    uint8_t kind = payload[1], game = payload[2], actor = payload[3], target = payload[4];
+    // Game 0 is the party lobby before the first content selection; CHAT events
+    // there are valid and are formatted with the "Arcade" fallback name.
+    if(game > HA_GAME_FRANKENDRAW || actor > HA_MAX_PLAYERS || target > HA_MAX_PLAYERS)
+        return;
+    int16_t value = (int16_t)((uint16_t)payload[5] | ((uint16_t)payload[6] << 8));
+    size_t text_len = len - HA_HOST_EVENT_HEADER_SIZE;
+    if(text_len > HA_HOST_EVENT_TEXT_MAX) return;
+    if(text_len && !haContentFileBytesValid(payload + HA_HOST_EVENT_HEADER_SIZE, text_len)) return;
+    for(size_t i = 0; i < text_len; i++)
+        if(payload[HA_HOST_EVENT_HEADER_SIZE + i] < 0x20) return;
+    char detail[HA_HOST_EVENT_TEXT_MAX + 1];
+    if(text_len) memcpy(detail, payload + HA_HOST_EVENT_HEADER_SIZE, text_len);
+    detail[text_len] = '\0';
+    const char* game_name = host_event_game_name(game);
+    const char* actor_name = host_event_player_name(app, actor);
+    const char* target_name = host_event_player_name(app, target);
+    FuriString* line = furi_string_alloc();
+    bool status = true;
+    switch(kind) {
+    case HA_HOST_EVT_MATCH_STARTED:
+        furi_string_printf(line, "%s: %s vs %s", game_name, actor_name, target_name);
+        break;
+    case HA_HOST_EVT_CHAT:
+        furi_string_printf(line, "%s: %s", actor_name, detail);
+        status = false;
+        break;
+    case HA_HOST_EVT_ROLE:
+        furi_string_printf(line, "%s: %s %s", game_name, actor_name, detail);
+        break;
+    case HA_HOST_EVT_ROUND_WIN:
+        if(detail[0])
+            furi_string_printf(
+                line, "%s: %s beat %s (%s)", game_name, actor_name, target_name, detail);
+        else
+            furi_string_printf(line, "%s: %s beat %s", game_name, actor_name, target_name);
+        break;
+    case HA_HOST_EVT_ROUND_DRAW:
+        if(detail[0])
+            furi_string_printf(
+                line, "%s: %s / %s draw (%s)", game_name, actor_name, target_name, detail);
+        else
+            furi_string_printf(line, "%s: %s / %s draw", game_name, actor_name, target_name);
+        break;
+    case HA_HOST_EVT_ROUND_COMPLETE:
+        if(detail[0])
+            furi_string_printf(line, "%s: round %d complete (%s)", game_name, value, detail);
+        else
+            furi_string_printf(line, "%s: round %d complete", game_name, value);
+        break;
+    case HA_HOST_EVT_GAME_FINAL:
+        if(detail[0])
+            furi_string_printf(line, "%s: game complete (%s)", game_name, detail);
+        else
+            furi_string_printf(line, "%s: game complete", game_name);
+        break;
+    default:
+        furi_string_free(line);
+        return;
+    }
+    console_add(app, furi_string_get_cstr(line));
+    if(status) {
+        furi_string_set(app->last_event, line);
+        if(kind == HA_HOST_EVT_ROUND_WIN || kind == HA_HOST_EVT_ROUND_DRAW ||
+           kind == HA_HOST_EVT_GAME_FINAL)
+            feedback_success(app);
+    }
+    furi_string_free(line);
 }
 
 // ---------------- roster ----------------
@@ -585,7 +688,12 @@ void ha_session_transport_resume(HotspotArcadeApp* app) {
     // or acknowledgement is lost instead of leaving the host stuck forever in a
     // locally optimistic "transport_resuming" state.
     furi_string_set(app->status, "transport_resuming");
-    ha_proto_send(app->uart, HA_MSG_TRANSPORT_RESUME, NULL, 0);
+    if(app->transport_wait_expired) {
+        const uint8_t flags = HA_TRANSPORT_RESUME_EXPIRE_MISSING;
+        ha_proto_send(app->uart, HA_MSG_TRANSPORT_RESUME, &flags, 1);
+    } else {
+        ha_proto_send(app->uart, HA_MSG_TRANSPORT_RESUME, NULL, 0);
+    }
 }
 
 bool ha_session_transport_wait_elapsed(const HotspotArcadeApp* app) {
@@ -776,9 +884,8 @@ static void dispatch_frame(HotspotArcadeApp* app) {
         }
         break;
     case HA_MSG_ROUND_RESULT:
-        furi_string_set_str(app->last_event, (const char*)p);
-        console_add(app, (const char*)p);
-        feedback_success(app); // trivia reveal scored, or a Connect Four win
+        // Legacy v21-and-older JSON result. Current v22 firmware emits only the
+        // bounded typed HA_MSG_EVENT frame below.
         break;
     case HA_MSG_ART:
         // Finished Frankendraw artwork: op byte + JSON. Straight through to the SVG
@@ -856,22 +963,7 @@ static void dispatch_frame(HotspotArcadeApp* app) {
         }
         break;
     case HA_MSG_EVENT: {
-        // Game-specific host-facing status line for the console / duel feed.
-        char ev[64];
-        if(ha_json_str((const char*)p, "duel", ev, sizeof(ev)) ||
-           ha_json_str((const char*)p, "pong", ev, sizeof(ev)) ||
-           ha_json_str((const char*)p, "draw", ev, sizeof(ev)) ||
-           ha_json_str((const char*)p, "chess", ev, sizeof(ev)) ||
-           ha_json_str((const char*)p, "bs", ev, sizeof(ev)) ||
-           ha_json_str((const char*)p, "spyfall", ev, sizeof(ev))) {
-            furi_string_set_str(app->last_event, ev);
-            console_add(app, ev);
-        } else if(ha_json_str((const char*)p, "gamechange", ev, sizeof(ev))) {
-            // Phone requests are policy-only; selection remains a host content transaction.
-            console_add(app, ev);
-        } else if(ha_json_str((const char*)p, "chat", ev, sizeof(ev))) {
-            console_add(app, ev); // lobby chatter, not a game status line
-        }
+        host_event_dispatch(app, p, len);
         break;
     }
     default:

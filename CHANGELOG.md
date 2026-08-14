@@ -52,6 +52,20 @@ All notable changes to Hotspot Arcade are documented here. The format is based o
 - Phone-initiated game changes now return a typed host-policy result instead of opening a
   vote that could switch into an unloaded content game. Host selection remains immediate
   through `CONTENT_BEGIN`…`CONTENT_COMMIT`.
+- Bounded typed host events now carry semantic milestones for all twenty games while
+  preserving the generic/art UART surfaces used by existing hosts. Lobby chat is valid
+  before a game is selected, and event text is validated UTF-8 capped at 96 bytes.
+- All score changes now pass through one saturating award path. Battleship awards its
+  winner exactly once, and Spectrum and Kiss Marry Kill clear per-game phone scores on
+  replay while cumulative host session scores remain available to the adapter.
+- Drawing & Guessing now rotates every non-empty pack, shuffles without replacement,
+  avoids a repeat across reshuffle boundaries, and persists pack/word/drawer cursors so
+  short replays remain fair to every seat.
+- The English Spectrum Wild Card pack adds 32 Left/Right pairs. It is intentionally
+  English-only; locale selection never synthesizes translations or mixes pack languages.
+- Planned AP shutdown now atomically detaches live transport sockets while preserving
+  expected identities, roles, challenges, and frozen clocks. At the exact ten-minute
+  boundary, still-missing seats are finalized once before the session resumes.
 
 ## [1.8.0] - 2026-08-11
 

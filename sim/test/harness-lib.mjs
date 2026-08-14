@@ -51,9 +51,13 @@ export async function newEngine() {
       );
       return { result, out: drain() };
     },
-    transportResume: () => {
-      const result = M.ccall("ha_transport_resume", "number", [], []);
+    transportResume: (expireMissing = false) => {
+      const result = M.ccall("ha_transport_resume", "number", ["number"], [expireMissing ? 1 : 0]);
       return { result, out: drain() };
+    },
+    transportDetachSockets: () => {
+      M.ccall("ha_transport_detach_sockets", null, [], []);
+      return drain();
     },
     transportFallbackSsid: (ssid) => {
       const ok = M.ccall("ha_transport_fallback_ssid", "number", ["string"], [ssid]) !== 0;
@@ -81,6 +85,18 @@ export async function newEngine() {
       return before.concat(drain());
     },
     resetScores: () => { M.ccall("ha_reset_scores", null, [], []); return drain(); },
+    testSetScore: (pid, score) => {
+      M.ccall("ha_test_set_score", null, ["number", "number"], [pid, score]);
+      return drain();
+    },
+    testAwardScore: (pid, delta) => {
+      M.ccall("ha_test_award_score", null, ["number", "number"], [pid, delta]);
+      return drain();
+    },
+    testHostEvent: (kind, text) => {
+      M.ccall("ha_test_host_event", null, ["number", "string"], [kind, text]);
+      return drain();
+    },
     contentBegin: (game, lang = "") => {
       legacy = null;
       const ok = M.ccall("ha_content_begin", "number", ["number", "string"], [game, lang]) !== 0;

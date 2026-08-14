@@ -1,0 +1,96 @@
+Pack: Wild Card
+Left: Introvert
+Right: Extrovert
+---
+Left: Overhyped
+Right: Hidden gem
+---
+Left: Morning person
+Right: Night owl
+---
+Left: Slightly haunted
+Right: Fully cursed
+---
+Left: Wallflower
+Right: Life of the party
+---
+Left: One-hit wonder
+Right: Legend
+---
+Left: Play it safe
+Right: Risk it all
+---
+Left: Suspiciously calm
+Right: Pure chaos
+---
+Left: Remake
+Right: Original
+---
+Left: Stay home
+Right: Travel forever
+---
+Left: Awkward silence
+Right: Roaring laughter
+---
+Left: Harmless prank
+Right: Total anarchy
+---
+Left: Guilty pleasure
+Right: Proudly obsessed
+---
+Left: Underrated
+Right: Overrated
+---
+Left: Old soul
+Right: Forever young
+---
+Left: Mildly weird
+Right: Absolutely unhinged
+---
+Left: Book was better
+Right: Movie was better
+---
+Left: Solo adventure
+Right: Squad deep
+---
+Left: Bare minimum
+Right: Way too much
+---
+Left: Lowkey genius
+Right: Chaotic evil
+---
+Left: Villain era
+Right: Main character
+---
+Left: Overthinking it
+Right: Winging it
+---
+Left: Cringe
+Right: Iconic
+---
+Left: Comfort zone
+Right: New experience
+---
+Left: Early adopter
+Right: Still on flip phone
+---
+Left: Petty grudge
+Right: Forgive and forget
+---
+Left: Control freak
+Right: Go with the flow
+---
+Left: Niche hobby
+Right: Basic interest
+---
+Left: Hot take
+Right: Common sense
+---
+Left: Polite lie
+Right: Brutal honesty
+---
+Left: Cursed knowledge
+Right: Blissful ignorance
+---
+Left: Calm before storm
+Right: Storm is the calm

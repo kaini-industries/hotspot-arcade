@@ -293,7 +293,7 @@ static inline int haUtf8Len(const char* s) {
 // Czar picks the winner for a point.
 //
 // Sizing: a pack here is two decks, not one, so this does NOT reuse PACK_MAX_ITEMS (32)
-// or TRIVIA_MAX_TOPICS (6) — the answer deck needs well over 32 entries, but a judging
+// or TRIVIA_MAX_TOPICS (8) — the answer deck needs well over 32 entries, but a judging
 // game only ever plays one pack per session and the lobby vote strip stays readable at
 // three, so the pack cap drops instead of the deck growing. The prompt deck only needs
 // FB_ROUNDS entries plus slack (24); the answer deck has to keep every hand full
@@ -402,15 +402,15 @@ static inline int haUtf8Len(const char* s) {
 //
 // The sheet is a 0..255 square in both axes (FD_UNIT), split into FD_PANELS equal
 // bands of FD_BAND -- 255 = 3 * 85 exactly, so the bands need no rounding. Strokes are
-// stored quantised to those units: four bytes a segment, which is what keeps a whole
-// gallery in a fixed block of .bss instead of the heap (see FrankenState).
+// stored quantised to those units: four bytes a segment, keeping the on-demand gallery
+// allocation bounded (see FrankenState).
 //
 // FD_PANEL_STROKES is the whole memory story: HA_MAX_PLAYERS * FD_PANELS * it * 4 bytes.
 // At 192 that is 12 * 3 * 192 * 4 = 27.6 KB, up from 9 KB at the 64 it shipped with --
 // 64 turned out to be about a third of one drawing. 192 is picked to stay comfortable on
-// the smallest supported board: the ESP32-S2 has 320 KB of SRAM, most of which goes to
-// WiFi/lwIP and the heap-held web bundle, and 28 KB of static state is a few per cent of
-// it. Boards with more RAM (the C5, WROOM, a Cardputer host) have far more headroom, but
+// the smallest supported board: the ESP32-S2 has 320 KB of SRAM, most of which is shared
+// with WiFi/lwIP, and the 28 KB store is allocated only while this game is active.
+// Boards with more RAM (the C5, WROOM, a Cardputer host) have more headroom, but
 // this is one constant, shared, and sized for the tightest one. Raising it also grows the
 // gallery message; that is why the picture is broadcast once per creature rather than
 // pasted into every per-player push (see fdShowSheet).
@@ -448,8 +448,8 @@ bool haPhoneGameChangeAllowed(uint8_t fromGame, uint8_t toGame);
 void haUartJoinStable(uint8_t pid, const char* identity, const char* nick, const char* avatar);
 void haUartLeave(uint8_t pid);
 void haUartScore(uint8_t pid, int delta, const char* reason);
-void haUartEvent(const String& json);
-void haUartRoundResult(const String& json);
+void haUartHostEvent(uint8_t kind, uint8_t game, uint8_t actor, uint8_t target,
+                     int16_t value, const char* text);
 // Finished artwork, for the host to keep. Called once with HA_ART_BEGIN, then once per
 // line segment with HA_ART_STROKE, then once with HA_ART_END -- a picture is streamed
 // as it is handed over, never buffered, so this costs the engine no RAM at all. The
@@ -531,8 +531,11 @@ struct WordPack {
 struct DrawState {
     uint8_t phase; // 0 idle, 1 draw, 2 reveal, 3 final
     uint8_t drawer; // pid currently drawing
-    uint8_t drawerSeq; // rotates the drawer
-    uint16_t wordSeq; // rotates the word
+    uint8_t lastDrawer; // survives replays so a capped run does not starve high pids
+    uint8_t nextPack; // survives replays; rounds visit each non-empty pack
+    uint16_t wordSeq[TRIVIA_MAX_TOPICS]; // per-pack cursors, reset with new content
+    uint8_t wordOrder[TRIVIA_MAX_TOPICS][PACK_MAX_ITEMS]; // shuffled nonrepeat decks
+    uint8_t lastWord[TRIVIA_MAX_TOPICS]; // blocks repeats across reshuffle boundaries
     char word[24];
     int round;
     int roundsTotal; // game ends after this many rounds
@@ -540,8 +543,8 @@ struct DrawState {
     uint32_t revealUntil; // game-clock ms (reveal end)
     uint8_t winner; // pid who guessed it, or 0
     // Content lives in the active typed bank, outside the POD game-state union.
-    int8_t vote[HA_MAX_PLAYERS + 1]; // pack index, -1 = not voted (no vote strip yet; see Task 3)
-    uint8_t pack; // chosen pack index (pack 0 for now, no draw vote strip)
+    int8_t vote[HA_MAX_PLAYERS + 1]; // reserved for a future pack-vote UI
+    uint8_t pack; // current round-robin pack index
 };
 
 // Shared lobby/ready/countdown skeleton for the whole-group party games.
@@ -1203,6 +1206,31 @@ public:
     uint32_t sessionNow() const { return _sessionClock.now(); }
     uint32_t gameNow() const { return _gameClock.now(); }
 
+    // AsyncWebSocket::closeAll() starts a graceful close but does not synchronously
+    // destroy its clients or emit WS_EVT_DISCONNECT.  The adapter calls this at the
+    // actual planned network-suspension boundary, before closeAll/server/AP teardown,
+    // so the first post-restart transport snapshot cannot count stale sockets as
+    // returned players.  Keep the expected snapshot and every game role/challenge;
+    // later disconnect callbacks carry old wsIds and are therefore harmless.
+    void detachTransportSockets(uint32_t rawNow) {
+        if(!_transportPaused) return;
+        syncClocks(rawNow);
+        chessSyncAll(_sessionClock.now());
+        for(uint8_t pid = 1; pid <= HA_MAX_PLAYERS; pid++) {
+            if(!_p[pid].used || !_p[pid].wsId) continue;
+            _p[pid].wsId = 0;
+            _p[pid].detached = true;
+            _p[pid].detachedAt = _sessionClock.now();
+            if(_active == HA_GAME_PONG) {
+                PongMatch* match = pongMatchOf(pid);
+                if(match) {
+                    if(pid == match->a) match->d1 = 0;
+                    if(pid == match->b) match->d2 = 0;
+                }
+            }
+        }
+    }
+
     HaTransportResult pauseTransport(
         HaTransportReason reason, const char* nextSsid, uint32_t reconnectMs, uint32_t rawNow) {
         if((reason != HA_TRANSPORT_SSID_CHANGE && reason != HA_TRANSPORT_AP_OFF) ||
@@ -1232,11 +1260,27 @@ public:
         return HA_TRANSPORT_OK;
     }
 
-    HaTransportResult resumeTransport(uint32_t rawNow) {
+    HaTransportResult resumeTransport(uint32_t rawNow, bool expireMissing = false) {
         syncClocks(rawNow);
         if(!_transportPaused) return HA_TRANSPORT_NOT_PAUSED;
-        // Offline expected players now become ordinary transient disconnects.
-        // Their grace starts at this still-frozen session instant.
+        // At the host's exact planned-window boundary, seats that were online at
+        // pause but did not return are finalized while both logical clocks remain
+        // frozen. Reuse the ordinary expiry sweep so two absent opponents are
+        // cleared without pid-order-dependent forfeits. Seats already offline when
+        // pause began are not in _transportExpected and retain their remaining
+        // transient grace.
+        if(expireMissing) {
+            for(uint8_t pid = 1; pid <= HA_MAX_PLAYERS; pid++) {
+                if(!(_transportExpected & pidMask(pid)) || playerOnline(pid) ||
+                   !_p[pid].used)
+                    continue;
+                _p[pid].detached = true;
+                _p[pid].detachedAt = _sessionClock.now() - HA_RESUME_GRACE_MS;
+            }
+            (void)expireDetached(_sessionClock.now());
+        }
+        // An early/manual resume gives any still-missing expected player the normal
+        // two-minute transient grace, starting at this frozen session instant.
         for(uint8_t pid = 1; pid <= HA_MAX_PLAYERS; pid++) {
             if(!(_transportExpected & pidMask(pid)) || playerOnline(pid) || !_p[pid].used) continue;
             _p[pid].detached = true;
@@ -1401,6 +1445,9 @@ public:
         _gameClock.reset(_sessionClock.now());
         if(_transportPaused) _gameClock.setPaused(true, _sessionClock.now());
         gsZero();
+        if(_active == HA_GAME_DRAW)
+            for(uint8_t pack = 0; pack < TRIVIA_MAX_TOPICS; pack++)
+                _d.lastWord[pack] = 0xFF;
         challengesClear();
         if(gameChanged) resetScoresAll();
         if(_active != HA_GAME_FRANKENDRAW) fdSheetsFree();
@@ -2059,6 +2106,39 @@ private:
     // sentinel right after it. uintptr_t math avoids UB from subtracting unrelated pointers.
     void gsZero() {
         memset((void*)&_t, 0, (size_t)((uintptr_t)&_gsSentinel - (uintptr_t)&_t));
+    }
+
+    // Browser scores are authoritative signed 32-bit state. Apply every award in
+    // one saturating path, then report only the delta that actually fit so a host's
+    // cumulative ledger can never diverge at an integer boundary.
+    void awardScore(uint8_t pid, int delta, const char* reason) {
+        if(pid < 1 || pid > HA_MAX_PLAYERS || !_p[pid].used || delta == 0) return;
+        int32_t before = _p[pid].score;
+        int64_t next = (int64_t)before + (int64_t)delta;
+        if(next > INT32_MAX) next = INT32_MAX;
+        if(next < INT32_MIN) next = INT32_MIN;
+        _p[pid].score = (int32_t)next;
+        int64_t applied64 = (int64_t)_p[pid].score - (int64_t)before;
+        if(applied64) haUartScore(pid, (int)applied64, reason ? reason : "");
+    }
+
+    void hostEvent(uint8_t kind, uint8_t actor = 0, uint8_t target = 0,
+                   int16_t value = 0, const char* text = "") {
+        // Trim only at a complete valid UTF-8 code point. Invalid input bytes are
+        // skipped instead of being copied into the semantic host-event channel.
+        const unsigned char* src = (const unsigned char*)(text ? text : "");
+        char bounded[HA_HOST_EVENT_TEXT_MAX + 1];
+        size_t out = 0;
+        while(*src && out < HA_HOST_EVENT_TEXT_MAX) {
+            size_t width = ha_json_utf8_width(src);
+            if(width == 0) { src++; continue; }
+            if(out + width > HA_HOST_EVENT_TEXT_MAX) break;
+            memcpy(bounded + out, src, width);
+            out += width;
+            src += width;
+        }
+        bounded[out] = '\0';
+        haUartHostEvent(kind, _active, actor, target, value, bounded);
     }
 
     static bool validResumeToken(const char* token) {
@@ -2831,9 +2911,8 @@ private:
             _t.counts[_t.answer[pid]]++;
             if(_t.answer[pid] == correct) {
                 int pts = triviaPoints(_t.answerMs[pid]);
-                _p[pid].score += pts;
                 _t.gained[pid] = pts;
-                haUartScore(pid, pts, "trivia");
+                awardScore(pid, pts, "trivia");
             }
         }
         _t.revealUntil = gameNow() + TRIVIA_REVEAL_MS;
@@ -2844,7 +2923,7 @@ private:
         _t.qi++;
         if(_t.qi >= triviaPacks()[_t.topic].qcount) {
             _t.phase = 4; // final
-            haUartRoundResult("{\"trivia\":\"final\"}");
+            hostEvent(HA_HOST_EVT_GAME_FINAL);
             pushAll();
         } else {
             triviaStartQuestion();
@@ -3189,13 +3268,7 @@ private:
         // slot exists. A full table leaves the challenge available for retry.
         duelRemoveChallengesInvolving(pid);
         duelRemoveChallengesInvolving(from);
-        const char* key = (_active == HA_GAME_PONG)       ? "pong" :
-                          (_active == HA_GAME_BATTLESHIP) ? "bs" :
-                          (_active == HA_GAME_CHESS)      ? "chess" :
-                                                            "duel";
-        haUartEvent(
-            String("{\"") + key + "\":\"" + ha_json_escape(_p[from].nick) + " vs " +
-            ha_json_escape(_p[pid].nick) + "\"}");
+        hostEvent(HA_HOST_EVT_MATCH_STARTED, from, pid);
         pushAll();
     }
 
@@ -3393,11 +3466,10 @@ private:
         m->turn = 0;
         uint8_t loser = (winnerPid == m->a) ? m->b : (winnerPid == m->b) ? m->a : 0;
         if(winnerPid) {
-            _p[winnerPid].score += 300;
-            haUartScore(winnerPid, 300, "duelwin");
-            haUartRoundResult(String("{\"win\":") + winnerPid + ",\"lose\":" + loser + "}");
+            awardScore(winnerPid, 300, "duelwin");
+            hostEvent(HA_HOST_EVT_ROUND_WIN, winnerPid, loser);
         } else {
-            haUartRoundResult(String("{\"draw\":[") + m->a + "," + m->b + "]}");
+            hostEvent(HA_HOST_EVT_ROUND_DRAW, m->a, m->b);
         }
     }
 
@@ -3561,15 +3633,13 @@ private:
     void drawClear() {
         _d.phase = 0;
         _d.drawer = 0;
-        _d.drawerSeq = 0;
-        _d.wordSeq = 0;
         _d.word[0] = '\0';
         _d.round = 0;
         _d.roundsTotal = 0;
         _d.deadline = 0;
         _d.revealUntil = 0;
         _d.winner = 0;
-        _d.pack = 0; // no draw vote strip yet (see Task 3): always pack 0
+        _d.pack = 0;
         for(int i = 0; i <= HA_MAX_PLAYERS; i++) _d.vote[i] = -1;
     }
 
@@ -3586,9 +3656,8 @@ private:
         haWsBroadcast(
             String("{\"t\":\"chat\",\"nick\":\"") + ha_json_escape(_p[pid].nick) + "\",\"text\":\"" +
             ha_json_escape(text) + "\"}");
-        // Also surface it on the Flipper console so the host can follow the lobby chat.
-        haUartEvent(String("{\"chat\":\"") + ha_json_escape(_p[pid].nick) + ": " +
-                    ha_json_escape(text) + "\"}");
+        // Also surface it on the host console without making it parse display JSON.
+        hostEvent(HA_HOST_EVT_CHAT, pid, 0, 0, text);
     }
 
     // Emoji reaction. Goes to whoever shares your screen: your opponent if you are
@@ -3632,6 +3701,22 @@ private:
         }
     }
 
+    void drawShuffleDeck(uint8_t pack, uint8_t count) {
+        if(pack >= TRIVIA_MAX_TOPICS || count == 0 || count > PACK_MAX_ITEMS) return;
+        for(uint8_t i = 0; i < count; i++) _d.wordOrder[pack][i] = i;
+        for(int i = count - 1; i > 0; i--) {
+            int j = (int)random(i + 1);
+            uint8_t t = _d.wordOrder[pack][i];
+            _d.wordOrder[pack][i] = _d.wordOrder[pack][j];
+            _d.wordOrder[pack][j] = t;
+        }
+        if(count > 1 && _d.wordOrder[pack][0] == _d.lastWord[pack]) {
+            uint8_t t = _d.wordOrder[pack][0];
+            _d.wordOrder[pack][0] = _d.wordOrder[pack][1];
+            _d.wordOrder[pack][1] = t;
+        }
+    }
+
     void drawStart(uint32_t now) {
         if(livePackCount(HA_GAME_DRAW) == 0) return; // no pack streamed: refuse to start a round
         int used = connectedCount();
@@ -3648,42 +3733,56 @@ private:
         }
         if(_d.round >= _d.roundsTotal) { // played them all -> final scoreboard
             _d.phase = 3;
-            haUartRoundResult("{\"draw\":\"final\"}");
+            hostEvent(HA_HOST_EVT_GAME_FINAL);
             pushAll();
             return;
         }
-        _d.drawerSeq++;
-        int target = _d.drawerSeq % used, i = 0;
+        // Continue from the previous drawer across replays. A six-round cap can
+        // therefore never permanently favor the same low-numbered seats.
         uint8_t drawer = 0;
-        for(uint8_t pid = 1; pid <= HA_MAX_PLAYERS; pid++)
-            if(playerOnline(pid)) {
-                if(i == target) {
-                    drawer = pid;
-                    break;
-                }
-                i++;
-            }
+        for(uint8_t step = 1; step <= HA_MAX_PLAYERS; step++) {
+            uint8_t pid = (uint8_t)((_d.lastDrawer + step - 1) % HA_MAX_PLAYERS + 1);
+            if(playerOnline(pid)) { drawer = pid; break; }
+        }
         if(!drawer) {
             _d.phase = 0;
             return;
         }
-        WordPack& dp = wordPacks(HA_GAME_DRAW)[_d.pack];
-        if(dp.count == 0) { // empty pack: nothing to draw, end the game
+        _d.lastDrawer = drawer;
+
+        // Visit every non-empty pack instead of silently pinning Draw to pack 0.
+        uint8_t packCount = livePackCount(HA_GAME_DRAW);
+        bool packFound = false;
+        for(uint8_t step = 0; step < packCount; step++) {
+            uint8_t pack = (uint8_t)((_d.nextPack + step) % packCount);
+            if(wordPacks(HA_GAME_DRAW)[pack].count) {
+                _d.pack = pack;
+                _d.nextPack = (uint8_t)((pack + 1) % packCount);
+                packFound = true;
+                break;
+            }
+        }
+        if(!packFound) {
             _d.phase = 3;
-            haUartRoundResult("{\"draw\":\"final\"}");
+            hostEvent(HA_HOST_EVT_GAME_FINAL);
             pushAll();
             return;
         }
+        WordPack& dp = wordPacks(HA_GAME_DRAW)[_d.pack];
         _d.drawer = drawer;
-        strlcpy(_d.word, dp.words[_d.wordSeq % dp.count].c_str(), sizeof(_d.word));
-        _d.wordSeq++;
+        uint8_t deckPos = (uint8_t)(_d.wordSeq[_d.pack] % dp.count);
+        if(deckPos == 0) drawShuffleDeck(_d.pack, dp.count);
+        uint8_t wordIndex = _d.wordOrder[_d.pack][deckPos];
+        strlcpy(_d.word, dp.words[wordIndex].c_str(), sizeof(_d.word));
+        _d.lastWord[_d.pack] = wordIndex;
+        _d.wordSeq[_d.pack]++;
         _d.phase = 1;
         _d.round++;
         _d.winner = 0;
         _d.deadline = now + (uint32_t)DRAW_SECS * 1000;
         haWsBroadcast("{\"t\":\"ink\",\"clear\":true}");
         pushAll();
-        haUartEvent(String("{\"draw\":\"") + ha_json_escape(_p[drawer].nick) + " drawing\"}");
+        hostEvent(HA_HOST_EVT_ROLE, drawer, 0, 0, "drawer");
     }
 
     void drawReveal(uint32_t now, uint8_t winner) {
@@ -3721,13 +3820,11 @@ private:
     void drawGuess(uint8_t pid, const char* text) {
         if(_active != HA_GAME_DRAW || _d.phase != 1 || pid == _d.drawer) return;
         if(wordMatch(text, _d.word)) {
-            _p[pid].score += 200;
-            haUartScore(pid, 200, "draw");
+            awardScore(pid, 200, "draw");
             if(_p[_d.drawer].used) {
-                _p[_d.drawer].score += 100;
-                haUartScore(_d.drawer, 100, "drawn");
+                awardScore(_d.drawer, 100, "drawn");
             }
-            haUartRoundResult(String("{\"draw\":\"") + ha_json_escape(_p[pid].nick) + " got it\"}");
+            hostEvent(HA_HOST_EVT_ROUND_WIN, pid, _d.drawer, 0, "guessed");
             drawReveal(gameNow(), pid);
         } else {
             haWsBroadcast(
@@ -3883,9 +3980,8 @@ private:
         m->phase = 2;
         m->winner = winner;
         uint8_t loser = (winner == m->a) ? m->b : m->a;
-        _p[winner].score += 300;
-        haUartScore(winner, 300, "pongwin");
-        haUartRoundResult(String("{\"win\":") + winner + ",\"lose\":" + loser + "}");
+        awardScore(winner, 300, "pongwin");
+        hostEvent(HA_HOST_EVT_ROUND_WIN, winner, loser);
     }
 
     void pongOnLeave(uint8_t pid) {
@@ -4197,12 +4293,14 @@ private:
         Party& pt = _wyr.pt;
         if(pt.round >= WYR_ROUNDS) {
             pt.phase = 4; // final
+            hostEvent(HA_HOST_EVT_GAME_FINAL);
             pushAll();
             return;
         }
         WyrPack& pk = promptPacks(HA_GAME_WYR)[_wyr.pack];
         if(pk.count == 0) { // empty pack: nothing to play, end the game
             pt.phase = 4;
+            hostEvent(HA_HOST_EVT_GAME_FINAL);
             pushAll();
             return;
         }
@@ -4235,6 +4333,7 @@ private:
             _wyr.splitB[_wyr.splitCount] = (uint8_t)cB;
             _wyr.splitCount++;
         }
+        hostEvent(HA_HOST_EVT_ROUND_COMPLETE, 0, 0, _wyr.pt.round);
         _wyr.pt.phase = 3;
         _wyr.pt.revealUntil = now + WYR_REVEAL_MS;
         pushAll();
@@ -4445,14 +4544,14 @@ private:
         Party& pt = _scr.pt;
         if(pt.round >= SCR_ROUNDS) {
             pt.phase = 4;
-            haUartRoundResult("{\"scramble\":\"final\"}");
+            hostEvent(HA_HOST_EVT_GAME_FINAL);
             pushAll();
             return;
         }
         WordPack& p = wordPacks(HA_GAME_SCRAMBLE)[_scr.pack];
         if(p.count == 0) { // empty pack: nothing to play, end the game
             pt.phase = 4;
-            haUartRoundResult("{\"scramble\":\"final\"}");
+            hostEvent(HA_HOST_EVT_GAME_FINAL);
             pushAll();
             return;
         }
@@ -4477,8 +4576,7 @@ private:
                   (_scr.solvedCount == 2) ? 80 :
                                             40;
         _scr.solvedCount++;
-        _p[pid].score += pts;
-        haUartScore(pid, pts, "scramble");
+        awardScore(pid, pts, "scramble");
         haWsBroadcast(
             String("{\"t\":\"chat\",\"nick\":\"") + ha_json_escape(_p[pid].nick) +
             "\",\"text\":\"solved it!\"}");
@@ -4614,7 +4712,7 @@ private:
         Party& pt = _react.pt;
         if(pt.round >= REACT_ROUNDS) {
             pt.phase = 4;
-            haUartRoundResult("{\"react\":\"final\"}");
+            hostEvent(HA_HOST_EVT_GAME_FINAL);
             pushAll();
             return;
         }
@@ -4645,8 +4743,7 @@ private:
         if(_react.winner == 0) {
             _react.winner = pid;
             _react.winMs = now - _react.redTimer.deadline;
-            _p[pid].score += 200;
-            haUartScore(pid, 200, "react");
+            awardScore(pid, 200, "react");
             reactReveal(now); // first valid tap ends the round
         } else {
             pushAll();
@@ -4786,7 +4883,7 @@ private:
         Party& pt = _gc.pt;
         if(pt.round >= GC_ROUNDS) {
             pt.phase = 4;
-            haUartRoundResult("{\"gc\":\"final\"}");
+            hostEvent(HA_HOST_EVT_GAME_FINAL);
             pushAll();
             return;
         }
@@ -4850,8 +4947,7 @@ private:
             int pts = (int)((closeness + speed) / 30.0f + 0.5f); // rescale 0..300 -> 0..10
             if(pts > 10) pts = 10;
             _gc.gained[i] = pts;
-            _p[i].score += pts;
-            haUartScore(i, pts, "gc");
+            awardScore(i, pts, "gc");
             if(pts > bestPts || (pts == bestPts && _gc.submitMs[i] < bestMs)) {
                 bestPts = pts;
                 bestMs = _gc.submitMs[i];
@@ -4975,9 +5071,13 @@ private:
     }
 
     void battleFinish(BattleMatch* m, uint8_t winner) {
+        if(!m || m->phase == 2) return;
         m->phase = 2;
         m->winner = winner;
         m->turn = 0;
+        uint8_t loser = winner == m->a ? m->b : m->a;
+        awardScore(winner, 300, "battlewin");
+        hostEvent(HA_HOST_EVT_ROUND_WIN, winner, loser);
     }
 
     // Parse one base-10 int from `p`, advancing past it. Own parser (no strtol, which
@@ -5602,8 +5702,8 @@ private:
         m->histLen = 1;
     }
 
-    // Scoring copies duelFinish (battleship's finish forgot it): 300 to the winner,
-    // nothing on a draw, and the result goes up the UART either way. winnerPid 0 = draw.
+    // Chess awards 300 to the winner, nothing on a draw, and reports the typed result
+    // either way. winnerPid 0 = draw.
     void chessFinish(ChessMatch* m, uint8_t winnerPid, uint8_t reason) {
         if(m->phase != 1) return;
         m->phase = 2;
@@ -5612,11 +5712,12 @@ private:
         m->offerBy = 0;
         uint8_t loser = (winnerPid == m->a) ? m->b : (winnerPid == m->b) ? m->a : 0;
         if(winnerPid) {
-            _p[winnerPid].score += 300;
-            haUartScore(winnerPid, 300, "chesswin");
-            haUartRoundResult(String("{\"win\":") + winnerPid + ",\"lose\":" + loser + "}");
+            awardScore(winnerPid, 300, "chesswin");
+            hostEvent(
+                HA_HOST_EVT_ROUND_WIN, winnerPid, loser, m->reason, chessReasonStr(m->reason));
         } else {
-            haUartRoundResult(String("{\"draw\":[") + m->a + "," + m->b + "]}");
+            hostEvent(
+                HA_HOST_EVT_ROUND_DRAW, m->a, m->b, m->reason, chessReasonStr(m->reason));
         }
     }
 
@@ -5899,6 +6000,12 @@ private:
 
 #ifdef HA_CHESS_TEST
 public:
+    void hostTestSetScore(uint8_t pid, int32_t score) {
+        if(pid >= 1 && pid <= HA_MAX_PLAYERS && _p[pid].used) _p[pid].score = score;
+    }
+    void hostTestAwardScore(uint8_t pid, int delta) { awardScore(pid, delta, "test"); }
+    void hostTestEvent(uint8_t kind, const char* text) { hostEvent(kind, 1, 2, 7, text); }
+
     // Test-only: overwrite match slot 0's position after a normal challenge/accept, so
     // a scenario can set up a specific board without walking through the opening moves.
     // Requires slot 0 to already hold a live game (_cm[0].used && phase == 1).
@@ -6015,6 +6122,7 @@ private:
         WyrPack& pk = promptPacks(HA_GAME_SPECTRUM)[_spec.pack];
         if(pt.round >= SPECTRUM_ROUNDS || pk.count == 0) {
             pt.phase = 4; // final
+            hostEvent(HA_HOST_EVT_GAME_FINAL);
             pushAll();
             return;
         }
@@ -6042,8 +6150,7 @@ private:
         strlcpy(_spec.clue, text, sizeof(_spec.clue));
         _spec.stage = 1; // move to guessing
         _spec.pt.deadline = gameNow() + (uint32_t)SPECTRUM_GUESS_SECS * 1000;
-        haUartEvent(String("{\"draw\":\"") + ha_json_escape(_p[pid].nick) + ": " +
-                    ha_json_escape(_spec.clue) + "\"}");
+        hostEvent(HA_HOST_EVT_ROLE, pid, 0, 0, _spec.clue);
         pushAll();
     }
 
@@ -6087,8 +6194,7 @@ private:
                 continue;
             int pts = spectrumPoints(_spec.target, _spec.guess[i]);
             _spec.gained[i] = pts;
-            _p[i].score += pts;
-            if(pts) haUartScore(i, pts, "spectrum");
+            awardScore(i, pts, "spectrum");
             sum += pts;
             guessers++;
         }
@@ -6097,10 +6203,9 @@ private:
         if(_spec.psychic && guessers > 0) {
             int avg = (sum + guessers / 2) / guessers;
             _spec.gained[_spec.psychic] = avg;
-            _p[_spec.psychic].score += avg;
-            if(avg) haUartScore(_spec.psychic, avg, "clue");
+            awardScore(_spec.psychic, avg, "clue");
         }
-        haUartRoundResult(String("{\"spectrum\":\"round ") + _spec.pt.round + "\"}");
+        hostEvent(HA_HOST_EVT_ROUND_COMPLETE, _spec.psychic, 0, _spec.pt.round);
         _spec.pt.phase = 3;
         _spec.pt.revealUntil = now + SPECTRUM_REVEAL_MS;
         pushAll();
@@ -6118,6 +6223,7 @@ private:
         if(pt.phase == 1) {
             if(partyCountdownDone(pt, now)) {
                 pt.round = 0;
+                resetScoresAll();
                 _spec.pack = (uint8_t)spectrumWinningPack();
                 _spec.psychicSeq = 0;
                 _spec.cardSeq = 0;
@@ -6309,6 +6415,7 @@ private:
         WordPack& pk = wordPacks(HA_GAME_KMK)[_kmk.pack];
         if(pt.round >= KMK_ROUNDS || pk.count < 3) {
             pt.phase = 4; // final (need at least three names to play)
+            hostEvent(HA_HOST_EVT_GAME_FINAL);
             pushAll();
             return;
         }
@@ -6369,7 +6476,7 @@ private:
             for(int i = 0; i < 3; i++) _kmk.cLabel[i] = labels[i];
             _kmk.stage = 1;
             _kmk.pt.deadline = gameNow() + (uint32_t)KMK_GUESS_SECS * 1000;
-            haUartEvent(String("{\"draw\":\"") + ha_json_escape(_p[pid].nick) + " has decided\"}");
+            hostEvent(HA_HOST_EVT_ROLE, pid, 0, 0, "chooser");
             pushAll();
         } else {
             if(pid == _kmk.chooser) return; // the chooser doesn't guess
@@ -6390,18 +6497,16 @@ private:
             for(int j = 0; j < 3; j++)
                 if(_kmk.gLabel[i][j] == _kmk.cLabel[j]) hit++;
             _kmk.gained[i] = hit; // 0, 1 or 3 (two right forces the third)
-            _p[i].score += hit;
-            if(hit) haUartScore(i, hit, "kmk");
+            awardScore(i, hit, "kmk");
             sum += hit;
             guessers++;
         }
         if(_kmk.chooser && guessers > 0) {
             int avg = (sum + guessers / 2) / guessers;
             _kmk.gained[_kmk.chooser] = avg;
-            _p[_kmk.chooser].score += avg;
-            if(avg) haUartScore(_kmk.chooser, avg, "kmk");
+            awardScore(_kmk.chooser, avg, "kmk");
         }
-        haUartRoundResult(String("{\"kmk\":\"round ") + _kmk.pt.round + "\"}");
+        hostEvent(HA_HOST_EVT_ROUND_COMPLETE, _kmk.chooser, 0, _kmk.pt.round);
         _kmk.pt.phase = 3;
         _kmk.pt.revealUntil = now + KMK_REVEAL_MS;
         pushAll();
@@ -6419,6 +6524,7 @@ private:
         if(pt.phase == 1) {
             if(partyCountdownDone(pt, now)) {
                 pt.round = 0;
+                resetScoresAll();
                 _kmk.pack = (uint8_t)kmkWinningPack();
                 _kmk.chooserSeq = 0;
                 _kmk.nameSeq = 0;
@@ -6616,6 +6722,7 @@ private:
         WordPack& pk = wordPacks(HA_GAME_SECRETS)[_secrets.pack];
         if(pt.round >= SECRETS_ROUNDS || pk.count == 0) {
             pt.phase = 4; // final
+            hostEvent(HA_HOST_EVT_GAME_FINAL);
             pushAll();
             return;
         }
@@ -6696,12 +6803,9 @@ private:
             // scores nothing.
             int pts = (pred >= 0 && pred == yes) ? 1 : 0;
             _secrets.gained[i] = pts;
-            if(pts) {
-                _p[i].score += pts;
-                haUartScore(i, pts, "secrets");
-            }
+            awardScore(i, pts, "secrets");
         }
-        haUartRoundResult(String("{\"secrets\":\"round ") + _secrets.pt.round + "\"}");
+        hostEvent(HA_HOST_EVT_ROUND_COMPLETE, 0, 0, _secrets.pt.round);
         _secrets.pt.phase = 3;
         _secrets.pt.revealUntil = now + SECRETS_REVEAL_MS;
         pushAll();
@@ -6719,6 +6823,7 @@ private:
         if(pt.phase == 1) {
             if(partyCountdownDone(pt, now)) {
                 pt.round = 0;
+                resetScoresAll();
                 _secrets.pack = (uint8_t)secretsWinningPack();
                 _secrets.qSeq = 0;
                 secretsNextRound(now);
@@ -6870,8 +6975,7 @@ private:
                         status + "\",\"game\":\"" + gameName((uint8_t)id) + "\",\"id\":" +
                         String(id) + "}";
         haWsSendWs(_p[pid].wsId, result);
-        haUartEvent(String("{\"gamechange\":\"") + status + "\",\"game\":\"" +
-                    gameName((uint8_t)id) + "\",\"id\":" + String(id) + "}");
+        hostEvent(HA_HOST_EVT_ROLE, pid, 0, (int16_t)id, status);
     }
 
     // ---------- Fill the Blank (a judge picks the funniest answer) ----------
@@ -7022,6 +7126,7 @@ private:
         FillBlankPack& pk = fillBlankPacks()[_fb.pack];
         if(pt.round >= FB_ROUNDS || pk.pcount == 0 || pk.acount == 0) {
             pt.phase = 4; // final (an empty pack can't be played)
+            hostEvent(HA_HOST_EVT_GAME_FINAL);
             pushAll();
             return;
         }
@@ -7166,13 +7271,11 @@ private:
             } else {
                 _fb.winner = w;
                 if(_p[w].used) { // the author may have left between playing and the pick
-                    _p[w].score += 1;
-                    haUartScore(w, 1, "fillblank");
+                    awardScore(w, 1, "fillblank");
                 }
                 if(_fb.czar && _p[_fb.czar].used) {
                     _fb.czarGain = 1;
-                    _p[_fb.czar].score += 1;
-                    haUartScore(_fb.czar, 1, "fillblank-czar");
+                    awardScore(_fb.czar, 1, "fillblank-czar");
                 }
             }
         }
@@ -7187,7 +7290,10 @@ private:
     }
 
     void fillblankReveal(uint32_t now) {
-        haUartRoundResult(String("{\"fillblank\":\"round ") + _fb.pt.round + "\"}");
+        if(_fb.winner)
+            hostEvent(HA_HOST_EVT_ROUND_WIN, _fb.winner, _fb.czar, _fb.pt.round, "picked");
+        else
+            hostEvent(HA_HOST_EVT_ROUND_COMPLETE, _fb.czar, 0, _fb.pt.round, "deck");
         _fb.pt.phase = 3;
         _fb.pt.revealUntil = now + FB_REVEAL_MS;
         pushAll();
@@ -7205,6 +7311,7 @@ private:
         if(pt.phase == 1) {
             if(partyCountdownDone(pt, now)) {
                 pt.round = 0;
+                resetScoresAll();
                 _fb.pack = (uint8_t)fillblankWinningPack();
                 _fb.czarSeq = 0;
                 _fb.promptSeq = 0;
@@ -7650,12 +7757,14 @@ private:
             _ww.revealed[i] = true; // the reckoning: every role is public now
             if(!_ww.alive[i]) continue;
             if((_ww.role[i] == WW_WOLF) != (_ww.winner == WW_WOLF)) continue;
-            _p[i].score += 1;
-            haUartScore(i, 1, "werewolf");
+            awardScore(i, 1, "werewolf");
         }
-        haUartRoundResult(
-            String("{\"werewolf\":\"") + (_ww.winner == WW_WOLF ? "wolves" : "villagers") +
-            " win\"}");
+        hostEvent(
+            HA_HOST_EVT_GAME_FINAL,
+            0,
+            0,
+            _ww.winner,
+            _ww.winner == WW_WOLF ? "wolves" : "villagers");
         _ww.pt.phase = 4;
         _ww.pt.deadline = now;
         pushAll();
@@ -7706,11 +7815,12 @@ private:
         _ww.stage = WW_S_DAWN;
         _ww.pt.deadline = now + WW_ANNOUNCE_MS;
         _ww.durationMs = WW_ANNOUNCE_MS;
-        // "draw" is the engine's generic host-facing status-line key (Spectrum
-        // reuses it the same way); the Flipper console prints whatever it holds.
-        haUartEvent(
-            String("{\"draw\":\"night ") + _ww.pt.round + ": " +
-            (v ? ha_json_escape(_p[v].nick) + " died" : String("nobody died")) + "\"}");
+        hostEvent(
+            HA_HOST_EVT_ROUND_COMPLETE,
+            v,
+            0,
+            _ww.pt.round,
+            v ? "night death" : "quiet night");
         pushAll();
     }
 
@@ -7733,11 +7843,12 @@ private:
         _ww.stage = WW_S_DUSK;
         _ww.pt.deadline = now + WW_ANNOUNCE_MS;
         _ww.durationMs = WW_ANNOUNCE_MS;
-        haUartEvent(
-            String("{\"draw\":\"day ") + _ww.pt.round + ": " +
-            (_ww.lynched ? ha_json_escape(_p[_ww.lynched].nick) + " voted out" :
-                           String("no majority")) +
-            "\"}");
+        hostEvent(
+            HA_HOST_EVT_ROUND_COMPLETE,
+            _ww.lynched,
+            0,
+            _ww.pt.round,
+            _ww.lynched ? "day vote" : "no majority");
         pushAll();
     }
 
@@ -7828,6 +7939,7 @@ private:
         if(pt.phase == 1) {
             if(partyCountdownDone(pt, now)) {
                 pt.round = 0;
+                resetScoresAll();
                 wwDeal();
                 pt.phase = 2;
                 _ww.stage = WW_S_ROLES;
@@ -8198,6 +8310,7 @@ private:
         if(pt.round >= SPYFALL_ROUNDS || pk.count == 0 ||
            connectedCount() < SPYFALL_MIN_PLAYERS) {
             pt.phase = 4; // final
+            hostEvent(HA_HOST_EVT_GAME_FINAL);
             pushAll();
             return;
         }
@@ -8313,9 +8426,7 @@ private:
                 sizeof(_sf.missOfNick[_sf.missCount]));
             _sf.missCount++;
         }
-        haUartEvent(
-            String("{\"spyfall\":\"") + ha_json_escape(_p[pid].nick) + " missed " +
-            ha_json_escape(_p[target].nick) + "\"}");
+        hostEvent(HA_HOST_EVT_ROLE, pid, (uint8_t)target, 0, "missed accusation");
         pushAll();
     }
 
@@ -8442,18 +8553,16 @@ private:
             teamPts = 1;
         if(spyPts && _sf.spy && _p[_sf.spy].used) {
             _sf.gained[_sf.spy] = spyPts;
-            _p[_sf.spy].score += spyPts;
-            haUartScore(_sf.spy, spyPts, "spy");
+            awardScore(_sf.spy, spyPts, "spy");
         }
         if(teamPts) {
             for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
                 if(!_p[i].used || !_sf.inRound[i] || i == _sf.spy) continue;
                 _sf.gained[i] = teamPts;
-                _p[i].score += teamPts;
-                haUartScore(i, teamPts, "spyfall");
+                awardScore(i, teamPts, "spyfall");
             }
         }
-        haUartRoundResult(String("{\"spyfall\":\"round ") + _sf.pt.round + "\"}");
+        hostEvent(HA_HOST_EVT_ROUND_COMPLETE, _sf.spy, _sf.blamed, _sf.pt.round);
         _sf.pt.phase = 3;
         _sf.pt.revealUntil = now + SPYFALL_REVEAL_MS;
         pushAll();
@@ -8521,6 +8630,7 @@ private:
         if(pt.phase == 1) {
             if(partyCountdownDone(pt, now)) {
                 pt.round = 0;
+                resetScoresAll();
                 _sf.pack = (uint8_t)spyfallWinningPack();
                 _sf.spySeq = 0;
                 _sf.locSeq = 0;
@@ -8745,14 +8855,14 @@ private:
     //    and stays blank and uncredited if that seat was already empty.
     // Frankendraw's stroke store is large (~28 KB) and only needed while the game runs, so it
     // is allocated on demand rather than living in static DRAM. ps_malloc prefers PSRAM (S2/C5)
-    // and falls back to internal heap; malloc is the second fallback for a board with no PSRAM.
-    // Returns false only when neither has the room, in which case Frankendraw refuses to start
+    // and falls back to internal heap only when the adapter's reserve policy permits it.
+    // Returns false when neither pool is safe, in which case Frankendraw refuses to start
     // (fdCheckStart / fdBegin) and every other game keeps working.
     bool fdSheetsEnsure() {
         if(_fdSheets) return true;
         size_t bytes = sizeof(FdSheet) * HA_MAX_PLAYERS;
         _fdSheets = (FdSheet*)ps_malloc(bytes);
-        if(!_fdSheets) _fdSheets = (FdSheet*)malloc(bytes);
+        if(!_fdSheets && haContentAllocationAllowed()) _fdSheets = (FdSheet*)malloc(bytes);
         if(_fdSheets) memset(_fdSheets, 0, bytes);
         return _fdSheets != nullptr;
     }
@@ -8870,7 +8980,7 @@ private:
         pt.deadline = now + (uint32_t)FD_DRAW_SECS * 1000;
         pt.phase = 2;
         pushAll();
-        haUartEvent(String("{\"draw\":\"frankendraw panel ") + pt.round + "/" + FD_PANELS + "\"}");
+        hostEvent(HA_HOST_EVT_ROUND_COMPLETE, 0, 0, pt.round, "panel");
     }
 
     // One normalised 0..1 wire coordinate, quantised onto the 0..FD_UNIT sheet grid.
@@ -9008,6 +9118,7 @@ private:
         _fd.stage = 0;
         if(_fd.seats == 0) { // never got going: nothing to show
             _fd.pt.phase = 4;
+            hostEvent(HA_HOST_EVT_GAME_FINAL);
             pushAll();
             return;
         }
@@ -9038,6 +9149,7 @@ private:
             return;
         }
         _fd.pt.phase = 4;
+        hostEvent(HA_HOST_EVT_GAME_FINAL);
         pushAll();
     }
 
@@ -9118,13 +9230,15 @@ private:
             for(int p = 0; p < FD_PANELS; p++) {
                 uint8_t pid = _fdSheets[s].by[p];
                 if(!pid || !_p[pid].used) continue;
-                _p[pid].score += net * FD_VOTE_POINTS;
-                haUartScore(pid, net * FD_VOTE_POINTS, "frankendraw");
+                awardScore(pid, net * FD_VOTE_POINTS, "frankendraw");
             }
         }
-        haUartRoundResult(
-            String("{\"frankendraw\":\"sheet ") + (int)(_fd.best + 1) + " wins, net " +
-            _fd.bestNet + "\"}");
+        hostEvent(
+            HA_HOST_EVT_ROUND_COMPLETE,
+            0,
+            0,
+            (int16_t)(_fd.best + 1),
+            "winning sheet");
     }
 
     void fdAgain(uint8_t pid) {

@@ -140,4 +140,37 @@ assert.notEqual(onlineStates[0].chooser, "OFFLINE",
     "offline reserved guesser receives the submitted-work score event");
 }
 
+// Replay keeps the committed people pack but resets per-game phone scores when the
+// next countdown completes.
+{
+  const g = await newEngine();
+  g.reset();
+  for (const pid of [1, 2, 3]) g.join(pid, `R${pid}`);
+  g.loadContent(KMK, [{
+    name: "Replay", items: ["A", "B", "C", "D"].map((name) => ({ name })),
+  }]);
+  for (const pid of [1, 2, 3]) g.input(pid, { t: "ready", ready: true });
+  let now = 3000;
+  let stateOut = g.tick(now);
+  for (let round = 1; round <= 6; round++) {
+    const chooserPid = [1, 2, 3].find((pid) => lastToWs(stateOut, pid, "kmk").msg.iam);
+    g.input(chooserPid, { t: "assign", kiss: 0, marry: 1, kill: 2 });
+    let reveal = [];
+    for (const pid of [1, 2, 3].filter((p) => p !== chooserPid))
+      reveal = g.input(pid, { t: "assign", kiss: 0, marry: 1, kill: 2 });
+    assert.equal(lastToWs(reveal, 1, "kmk").msg.stage, "reveal");
+    now += 7000;
+    stateOut = g.tick(now);
+  }
+  assert.equal(lastToWs(stateOut, 1, "kmk").msg.phase, "final");
+  g.input(1, { t: "again" });
+  g.testSetScore(1, 777);
+  for (const pid of [1, 2, 3]) g.input(pid, { t: "ready", ready: true });
+  stateOut = g.tick(now + 3000);
+  const replay = lastToWs(stateOut, 1, "kmk").msg;
+  assert.equal(replay.phase, "play");
+  assert.equal(replay.scores.find((p) => p.pid === 1).score, 0,
+    "KMK replay starts with a fresh phone scoreboard");
+}
+
 console.log("kmk: all checks passed");

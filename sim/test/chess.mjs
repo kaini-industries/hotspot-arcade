@@ -110,9 +110,10 @@ function mv(pid, from, to, promo) {
   assert.equal(score.pid, 1);
   assert.equal(score.delta, 300);
   assert.equal(score.reason, "chesswin");
-  const round = out.find((o) => o.to === "uart" && o.kind === "round");
-  assert.equal(round.json.win, 1);
-  assert.equal(round.json.lose, 2);
+  const round = out.find((o) => o.to === "uart" && o.kind === "host_event" && o.event === 4);
+  assert.equal(round.actor, 1);
+  assert.equal(round.target, 2);
+  assert.equal(round.text, "mate");
 }
 
 // ---- 4. Castling --------------------------------------------------------------------
@@ -234,8 +235,10 @@ function mv(pid, from, to, promo) {
   assert.equal(a.msg.result, "draw");
   assert.equal(a.msg.reason, "stalemate");
   assert.equal(b.msg.result, "draw");
-  const round = out.find((o) => o.to === "uart" && o.kind === "round");
-  assert.deepEqual(round.json.draw, [1, 2]);
+  const round = out.find((o) => o.to === "uart" && o.kind === "host_event" && o.event === 5);
+  assert.equal(round.actor, 1);
+  assert.equal(round.target, 2);
+  assert.equal(round.text, "stalemate");
   assert.ok(!out.some((o) => o.to === "uart" && o.kind === "score"), "no score on a draw");
 }
 

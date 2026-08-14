@@ -15,6 +15,16 @@ function assertLive(e, game, lang = "") {
   assert.equal(e.contentBankCount(), 1, "failed staging bank is reclaimed");
 }
 
+// Frankendraw's separate ~28 KiB stroke store may prefer PSRAM, but its internal-heap
+// fallback must honor the same adapter reserve gate as a staged ContentBank.
+{
+  const games = readFileSync(
+    new URL("../../esp32/hotspot-arcade-fw/ha_games.h", import.meta.url), "utf8");
+  assert.match(games,
+    /_fdSheets\s*=\s*\(FdSheet\*\)ps_malloc\(bytes\);[\s\S]*?if\s*\(!_fdSheets\s*&&\s*haContentAllocationAllowed\(\)\)/,
+    "Frankendraw cannot consume adapter-reserved internal heap");
+}
+
 // Allocation checkpoints at begin, mid-ingest, and commit all preserve the old bank.
 {
   const e = await newEngine();

@@ -216,21 +216,23 @@ static void uartTransportState() {
     uint8_t reason;
     uint16_t expected, online;
     uint32_t reconnectMs;
-    bool paused;
+    bool paused, portalLive, suspendPending;
     ENGINE_LOCK();
     paused = engine.transportPaused();
     reason = engine.transportReason();
     expected = engine.transportExpectedMask();
     online = engine.transportOnlineExpectedMask();
     reconnectMs = engine.transportReconnectMs();
+    portalLive = portalRunning;
+    suspendPending = networkSuspendPending;
     ENGINE_UNLOCK();
     // A portal scheduled to go down is not resume-ready even though the sockets are
     // deliberately left alive for the 200 ms server_pause flush window. Reporting it
     // ready here would let the host immediately undo the pause before shutdown.
-    bool networkReady = portalRunning && !networkSuspendPending;
+    bool networkReady = portalLive && !suspendPending;
     uint8_t p[10] = {
         (uint8_t)((paused ? 0x01 : 0) | (networkReady ? 0x02 : 0) |
-                  (expected == online ? 0x04 : 0) | (portalRunning ? 0x08 : 0)),
+                  (expected == online ? 0x04 : 0) | (portalLive ? 0x08 : 0)),
         reason,
         (uint8_t)(expected & 0xFF),
         (uint8_t)(expected >> 8),
@@ -324,11 +326,24 @@ void haUartScore(uint8_t pid, int delta, const char* reason) {
     memcpy(buf + 3, reason, n);
     uartSend(HA_MSG_SCORE, buf, 3 + n);
 }
-void haUartEvent(const String& json) {
-    uartSend(HA_MSG_EVENT, (const uint8_t*)json.c_str(), json.length());
-}
-void haUartRoundResult(const String& json) {
-    uartSend(HA_MSG_ROUND_RESULT, (const uint8_t*)json.c_str(), json.length());
+void haUartHostEvent(
+    uint8_t kind,
+    uint8_t game,
+    uint8_t actor,
+    uint8_t target,
+    int16_t value,
+    const char* text) {
+    uint8_t buf[HA_HOST_EVENT_HEADER_SIZE + HA_HOST_EVENT_TEXT_MAX];
+    buf[0] = HA_HOST_EVENT_VERSION;
+    buf[1] = kind;
+    buf[2] = game;
+    buf[3] = actor;
+    buf[4] = target;
+    buf[5] = (uint8_t)((uint16_t)value & 0xFF);
+    buf[6] = (uint8_t)(((uint16_t)value >> 8) & 0xFF);
+    size_t n = text ? strnlen(text, HA_HOST_EVENT_TEXT_MAX) : 0;
+    if(n) memcpy(buf + HA_HOST_EVENT_HEADER_SIZE, text, n);
+    uartSend(HA_MSG_EVENT, buf, HA_HOST_EVENT_HEADER_SIZE + n);
 }
 // Finished artwork (Frankendraw). One frame per call -- a sheet header, a single line
 // segment, or the end marker -- so a whole drawing streams to the Flipper a segment at
@@ -443,12 +458,19 @@ static void onWsEvent(
             char buf[WS_MSG_MAX];
             memcpy(buf, data, len);
             buf[len] = '\0';
-            bool reportTransport;
+            bool accepted = false;
+            bool reportTransport = false;
             ENGINE_LOCK();
-            engine.onInput(client->id(), buf, millis());
-            reportTransport = engine.transportPaused();
+            // Check lifecycle under the same mutex as onInput and the PAUSE write.
+            // A callback that parsed before shutdown but waited for this lock cannot
+            // reattach its old socket after detachTransportSockets() has run.
+            if(!networkSuspendPending && portalRunning) {
+                engine.onInput(client->id(), buf, millis());
+                reportTransport = engine.transportPaused();
+                accepted = true;
+            }
             ENGINE_UNLOCK();
-            if(reportTransport) uartTransportState();
+            if(accepted && reportTransport) uartTransportState();
         }
     }
 }
@@ -496,8 +518,12 @@ static bool startPortal() {
         uartStatus("dns_error");
         return false;
     }
-    server.begin();
+    // Publish the lifecycle bit under the mutex used by onWsEvent, before the listener
+    // becomes reachable, so a racing first hello is accepted atomically.
+    ENGINE_LOCK();
     portalRunning = true;
+    ENGINE_UNLOCK();
+    server.begin();
 
     String up = String("up ip=") + WiFi.softAPIP().toString();
     uartStatus(up.c_str());
@@ -507,11 +533,17 @@ static bool startPortal() {
 
 static void suspendPortalNetwork() {
     if(portalRunning) {
+        // closeAll() only queues the WebSocket close handshake.  Detach the engine's
+        // live socket ids first, while its planned expected-mask remains intact, so
+        // startPortal() can never publish a stale all-returned transport snapshot.
+        ENGINE_LOCK();
+        engine.detachTransportSockets(millis());
+        portalRunning = false;
+        ENGINE_UNLOCK();
         ws.closeAll();
         server.end();
         dnsServer.stop();
         WiFi.softAPdisconnect(true);
-        portalRunning = false;
     }
     leasesClear();
     uartStatus("network_suspended");
@@ -754,11 +786,16 @@ static void dispatchFrame() {
     }
     case HA_MSG_TRANSPORT_RESUME: {
         HaTransportResult result = HA_TRANSPORT_CONFLICT;
+        bool validPayload = rxLen == 0 ||
+                            (rxLen == 1 &&
+                             (rxBuf[0] & ~HA_TRANSPORT_RESUME_EXPIRE_MISSING) == 0);
+        bool expireMissing = rxLen == 1 &&
+                             (rxBuf[0] & HA_TRANSPORT_RESUME_EXPIRE_MISSING) != 0;
         // Do not accept resume during the pre-shutdown flush window. The host must wait
         // for a genuine post-restart transport snapshot with network-ready set.
-        if(portalRunning && !networkSuspendPending) {
+        if(validPayload && portalRunning && !networkSuspendPending) {
             ENGINE_LOCK();
-            result = engine.resumeTransport(millis());
+            result = engine.resumeTransport(millis(), expireMissing);
             ENGINE_UNLOCK();
         }
         uartStatus(result == HA_TRANSPORT_OK ? "transport_resumed" :
@@ -908,7 +945,9 @@ void loop() {
         // Keep pending asserted while closeAll invokes disconnect callbacks; their
         // transport snapshots must not briefly advertise resume-ready mid-shutdown.
         suspendPortalNetwork();
+        ENGINE_LOCK();
         networkSuspendPending = false;
+        ENGINE_UNLOCK();
     }
     pumpSerial();
 

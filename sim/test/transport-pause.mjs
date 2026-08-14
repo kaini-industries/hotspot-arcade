@@ -380,6 +380,89 @@ for (const { after, expected } of [
     "old in-progress round was not retained");
 }
 
+// The host's exact planned-window boundary finalizes only snapshot seats which are
+// still missing. A returned seat survives, a seat detached before the snapshot keeps
+// its remaining ordinary grace, and retrying resume cannot finalize twice.
+{
+  const e = await newEngine();
+  e.resetAt(0);
+  e.join(1, "A", token(1)); e.join(2, "B", token(2));
+  e.selectGame(2);
+  const invite = e.input(1, { t: "challenge", to: 2 });
+  const inviteId = challengeId(invite, 2);
+  e.transportPause(2, "", 600000);
+
+  assert.deepEqual(e.transportDetachSockets(), [],
+    "synchronous network detach emits no phone snapshot into closing sockets");
+  assert.equal(e.transportExpected(), 0b11, "detach preserves the planned snapshot");
+  assert.equal(e.transportOnlineExpected(), 0,
+    "the first restarted transport state cannot count stale sockets online");
+  assert.deepEqual(e.disconnect(1), [], "late old-socket disconnect is idempotent");
+  assert.deepEqual(e.disconnect(2), [], "every late close callback is harmless");
+
+  let returned = e.inputAt(11, hello(1, "A"), 600000);
+  assert.equal(e.transportOnlineExpected(), 0b01);
+  returned = e.inputAt(22, hello(2, "B"), 600000);
+  assert.equal(e.transportOnlineExpected(), 0b11,
+    "only genuinely reauthenticated sockets complete the return mask");
+  assert.equal(ws(returned, 22, "welcome").resumed, true);
+  assert.equal(challengeId(returned, 2), inviteId, "planned detach preserves challenges");
+}
+
+for (const { after, preexistingResumes } of [
+  { after: 89999, preexistingResumes: true },
+  { after: 90000, preexistingResumes: false },
+]) {
+  const e = await newEngine();
+  e.resetAt(0);
+  e.join(1, "RETURNED", token(1));
+  e.join(2, "MISSING", token(2));
+  e.join(3, "PREEXISTING", token(3));
+  e.disconnect(3);
+  e.tick(30000); // PREEXISTING has consumed 30 seconds of transient grace
+  e.transportPause(2, "", 600000);
+  e.disconnect(1);
+  e.disconnect(2);
+  e.tick(630000); // planned downtime is invisible to both logical clocks
+  e.inputAt(11, hello(1, "RETURNED"), 630000);
+
+  const resumed = e.transportResume(true);
+  assert.equal(resumed.result, 0);
+  assert.deepEqual(uart(resumed.out, "leave").map((x) => x.pid), [2],
+    "only the still-missing snapshot seat is finalized at the boundary");
+  const retried = e.transportResume(true);
+  assert.equal(retried.result, 4, "boundary finalization is one-shot");
+  assert.deepEqual(retried.out, []);
+
+  const oldSeat = e.inputAt(33, hello(3, "PREEXISTING"), 630000 + after);
+  assert.equal(ws(oldSeat, 33, "welcome").resumed, preexistingResumes,
+    `pre-snapshot grace keeps its exact remaining boundary at ${after} ms`);
+  const missing = e.inputAt(22, hello(2, "MISSING"), 630000 + after);
+  assert.equal(ws(missing, 22, "welcome").resumed, false,
+    "a planned-window expiry never receives an extra transient window");
+}
+
+// Simultaneous absent opponents are removed as one cohort at the boundary. Neither
+// can win by pid-ordered forfeit, earn a score, or emit a semantic win event.
+{
+  const e = await newEngine();
+  e.resetAt(0);
+  e.join(1, "A", token(1)); e.join(2, "B", token(2));
+  e.selectGame(2);
+  const invite = e.input(1, { t: "challenge", to: 2 });
+  e.input(2, { t: "accept", id: challengeId(invite, 2) });
+  e.transportPause(2, "", 600000);
+  e.disconnect(1); e.disconnect(2);
+  const resumed = e.transportResume(true);
+  assert.deepEqual(uart(resumed.out, "leave").map((x) => x.pid), [1, 2]);
+  assert.equal(uart(resumed.out, "score").length, 0);
+  assert.equal(
+    resumed.out.filter((x) => x.to === "uart" && x.kind === "host_event" && x.event === 4).length,
+    0,
+    "two expired opponents produce no winner",
+  );
+}
+
 // Source-level regression for the adapter/host pre-shutdown auto-resume race. These
 // checks deliberately pin both sides of the UART contract, while the tiny state model
 // below proves the required pause -> pending -> down -> up -> fresh-snapshot sequence.
@@ -402,22 +485,61 @@ for (const { after, expected } of [
     ),
     "utf8",
   );
-  assert.match(ino, /networkReady\s*=\s*portalRunning\s*&&\s*!networkSuspendPending/,
-    "pending shutdown is never advertised network-ready");
-  assert.match(ino, /portalRunning\s*\?\s*0x08\s*:\s*0/,
+  assert.match(ino, /networkReady\s*=\s*portalLive\s*&&\s*!suspendPending/,
+    "a mutex-consistent pending shutdown snapshot is never advertised network-ready");
+  assert.match(ino, /portalLive\s*\?\s*0x08\s*:\s*0/,
     "transport snapshot distinguishes portal-live from resume-ready");
+  const transportSnapshot = ino.slice(
+    ino.indexOf("static void uartTransportState"), ino.indexOf("void haWsBroadcast"),
+  );
+  assert.match(transportSnapshot,
+    /ENGINE_LOCK\(\);[\s\S]*?portalLive\s*=\s*portalRunning;[\s\S]*?suspendPending\s*=\s*networkSuspendPending;[\s\S]*?ENGINE_UNLOCK\(\)/,
+    "engine masks and adapter lifecycle flags are snapshotted under one mutex");
   const startPortalSource = ino.slice(
     ino.indexOf("static bool startPortal"), ino.indexOf("static void suspendPortalNetwork"),
   );
   assert.match(startPortalSource,
     /if\(portalRunning\)[\s\S]*?ap_already[\s\S]*?up ip=[\s\S]*?uartTransportState/,
     "idempotent START re-emits both up and authoritative state");
+  assert.match(startPortalSource,
+    /ENGINE_LOCK\(\);\s*portalRunning\s*=\s*true;\s*ENGINE_UNLOCK\(\);\s*server\.begin\(\);/,
+    "the data-acceptance lifecycle bit is mutex-protected before the listener is reachable");
   const pingBlock = ino.slice(ino.indexOf("if(now - lastPing >= 2000)"));
   assert.match(pingBlock, /uartSend\(HA_MSG_PING[\s\S]*?uartTransportState\(\)/,
     "two-second beacon repeats state after any single dropped lifecycle frame");
   assert.match(ino,
-    /case HA_MSG_TRANSPORT_RESUME[\s\S]*?if\s*\(portalRunning\s*&&\s*!networkSuspendPending\)/,
+    /case HA_MSG_TRANSPORT_RESUME[\s\S]*?if\s*\(validPayload\s*&&\s*portalRunning\s*&&\s*!networkSuspendPending\)/,
     "adapter refuses RESUME during the flush window");
+  assert.match(ino,
+    /HA_TRANSPORT_RESUME_EXPIRE_MISSING[\s\S]*?engine\.resumeTransport\(millis\(\),\s*expireMissing\)/,
+    "adapter forwards the host's exact-boundary finalization flag");
+  const suspendPortalSource = ino.slice(
+    ino.indexOf("static void suspendPortalNetwork"), ino.indexOf("static void stopPortal"),
+  );
+  const detachIndex = suspendPortalSource.indexOf("engine.detachTransportSockets(millis())");
+  const closeAllIndex = suspendPortalSource.indexOf("ws.closeAll()");
+  const serverEndIndex = suspendPortalSource.indexOf("server.end()");
+  assert.ok(detachIndex >= 0 && detachIndex < closeAllIndex && closeAllIndex < serverEndIndex,
+    "engine sockets detach synchronously before graceful WS/server teardown");
+  const wsDataHandler = ino.slice(
+    ino.indexOf("} else if(type == WS_EVT_DATA)"), ino.indexOf("// ---------------- AP lifecycle"),
+  );
+  const dataLockIndex = wsDataHandler.indexOf("ENGINE_LOCK()");
+  const dataGateIndex = wsDataHandler.indexOf("if(!networkSuspendPending && portalRunning)");
+  const dataInputIndex = wsDataHandler.indexOf("engine.onInput", dataGateIndex);
+  const dataUnlockIndex = wsDataHandler.indexOf("ENGINE_UNLOCK()", dataInputIndex);
+  assert.ok(
+    dataLockIndex >= 0 && dataLockIndex < dataGateIndex && dataGateIndex < dataInputIndex &&
+      dataInputIndex < dataUnlockIndex,
+    "the lifecycle gate and input dispatch are atomic under the engine mutex",
+  );
+  assert.match(suspendPortalSource,
+    /ENGINE_LOCK\(\);[\s\S]*?detachTransportSockets[\s\S]*?portalRunning\s*=\s*false;[\s\S]*?ENGINE_UNLOCK\(\)/,
+    "network-down publication is atomic with planned socket detach");
+  const suspendLoop = ino.slice(ino.indexOf("if(networkSuspendPending &&"));
+  assert.match(suspendLoop,
+    /suspendPortalNetwork\(\);\s*ENGINE_LOCK\(\);\s*networkSuspendPending\s*=\s*false;\s*ENGINE_UNLOCK\(\);/,
+    "the WS lifecycle gate's pending flag is cleared under the same mutex");
   const pauseHandler = ino.slice(
     ino.indexOf("case HA_MSG_TRANSPORT_PAUSE"), ino.indexOf("case HA_MSG_TRANSPORT_RESUME"));
   const pauseCallIndex = pauseHandler.indexOf("result = engine.pauseTransport");
@@ -491,8 +613,9 @@ for (const { after, expected } of [
   );
   assert.match(explicitResume, /HA_MSG_TRANSPORT_RESUME/,
     "explicit resume still sends the transport command");
-  assert.doesNotMatch(explicitResume, /transport_wait_expired/,
-    "expiry blocks only automatic resume, never the host's explicit action");
+  assert.match(explicitResume,
+    /transport_wait_expired[\s\S]*?HA_TRANSPORT_RESUME_EXPIRE_MISSING/,
+    "ten-minute Resume finalizes missing snapshot seats instead of adding grace");
   assert.doesNotMatch(explicitResume, /strcmp[\s\S]*?transport_resuming[\s\S]*?return/,
     "a lost RESUME frame or acknowledgement can be retried explicitly");
   const pauseHelper = session.slice(

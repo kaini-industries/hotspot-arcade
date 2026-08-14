@@ -18,8 +18,10 @@ assert.equal(result.msg.status, "policy_denied");
 assert.equal(result.msg.game, "wyr");
 assert.equal(e.contentActiveGame(), 13, "active content bank is unchanged");
 
-const event = out.find((x) => x.to === "uart" && x.kind === "event" && x.json?.gamechange);
-assert.equal(event?.json.gamechange, "policy_denied", "host sees the policy result");
+const event = out.find((x) => x.to === "uart" && x.kind === "host_event" && x.event === 3);
+assert.equal(event?.actor, 1);
+assert.equal(event?.value, 8);
+assert.equal(event?.text, "policy_denied", "host sees the typed policy result");
 assert.equal(lastToWs(out, 2, "gamevote"), undefined, "no empty-pack vote overlay is opened");
 
 // A subsequent ready intent still belongs to the original Spectrum lobby.
