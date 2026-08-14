@@ -112,4 +112,32 @@ assert.equal(onlineStates.filter((m) => m.iam).length, 1,
 assert.notEqual(onlineStates[0].chooser, "OFFLINE",
   "reserved offline seat cannot deadlock the round");
 
+// A noncritical guesser who submits and then drops no longer blocks online quorum, but
+// the exact submitted assignment remains in the reveal and keeps its award.
+{
+  const g = await newEngine();
+  g.reset();
+  for (const pid of [1, 2, 3, 4]) g.join(pid, `P${pid}`);
+  g.loadContent(KMK, [{
+    name: "Grace",
+    items: ["A", "B", "C", "D"].map((name) => ({ name })),
+  }]);
+  for (const pid of [1, 2, 3, 4]) g.input(pid, { t: "ready", ready: true });
+  const begun = g.tick(3000);
+  const chooserPid = [1, 2, 3, 4].find((pid) => lastToWs(begun, pid, "kmk").msg.iam);
+  const liveGuessers = [1, 2, 3, 4].filter((pid) => pid !== chooserPid);
+  g.input(chooserPid, { t: "assign", kiss: 0, marry: 1, kill: 2 });
+  const droppedPid = liveGuessers[0];
+  g.input(droppedPid, { t: "assign", kiss: 0, marry: 1, kill: 2 });
+  g.disconnect(droppedPid);
+  g.input(liveGuessers[1], { t: "assign", kiss: 1, marry: 0, kill: 2 });
+  const revealed = g.input(liveGuessers[2], { t: "assign", kiss: 2, marry: 1, kill: 0 });
+  const state = lastToWs(revealed, chooserPid, "kmk").msg;
+  const dropped = state.guesses.find((x) => x.nick === `P${droppedPid}`);
+  assert.ok(dropped && dropped.pts === 3,
+    "submitted KMK guess survives grace and scores");
+  assert.ok(revealed.some((x) => x.to === "uart" && x.kind === "score" && x.pid === droppedPid),
+    "offline reserved guesser receives the submitted-work score event");
+}
+
 console.log("kmk: all checks passed");

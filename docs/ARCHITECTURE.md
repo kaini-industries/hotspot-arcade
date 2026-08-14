@@ -62,6 +62,12 @@ Single Arduino sketch plus header-only helpers (one translation unit):
   Reaction Duel, and the chess clocks run on `tick()` (called from the `.ino` loop)
   alongside the trivia/party/draw round timers. Emoji reactions broadcast to everyone
   as a `emoji` message. Trivia and the duels are event-driven; Pong is the real-time path.
+  A rollover-safe session logical clock freezes for planned AP downtime; a nested game
+  clock additionally freezes for role-critical whole-game absences. Pong and Chess use
+  per-match clocks derived from session time so an affected match can pause without
+  stopping another. Noncritical party quorum follows online presence while valid submitted
+  work remains attached to a grace-reserved identity; poll/cohort games latch their reveal
+  set explicitly. All phone timer state is a relative snapshot, never an ESP timestamp.
 - `ha_json.h` / `ha_proto.h` — tiny JSON reader/writer and the UART frame constants +
   CRC-8.
 
@@ -80,8 +86,9 @@ A `ViewDispatcher` + `SceneManager` app, same shape as flytrap:
 - `ha_proto.c` — framed message encode.
 - `helpers/ha_session.c` — the heart: the RX frame parser, the start **handshake**
   state machine (CLEAR_FILES -> stream bundle -> SET_AP -> START, driven by ESP acks),
-  the roster (JOIN/LEAVE/SCORE), and trivia round orchestration (parse a pack question,
-  build + send `QUESTION`, `REVEAL`, next).
+  the roster (JOIN/LEAVE/SCORE), planned-transport state (expected/rejoined identity masks,
+  AP restart and host reconnect window), and trivia round orchestration (parse a pack
+  question, build + send `QUESTION`, `REVEAL`, next).
 - `helpers/ha_storage.c` — config (FlipperFormat), `manifest.json` parsing, binary-safe
   file reads (pre-reserved buffers to avoid an OOM-inducing 2x realloc peak), trivia
   pack loading.
@@ -100,10 +107,11 @@ so there are no locks on the Flipper side.
 
 ## Web client (`web/`)
 
-Vanilla JS, no framework, built into a single gzipped `index.html` (about 18 KB). `app.js`
+Vanilla JS, no framework, built into a single gzipped `index.html` (under 72 KB). `app.js`
 owns the WebSocket, identity (nickname + emoji avatar in localStorage), lobby, screen
-router, emoji reactions, and the shared game-UI components (`A.readyLobby` / `A.countdown`
-/ `A.timebar` / `A.showLead` leaderboard / `A.podium`). Each game module (`trivia.js`,
+router, emoji reactions, planned-transport overlay, monotonic timer snapshots, and the
+shared game-UI components (`A.readyLobby` / `A.countdown` / `A.timebar` / `A.showLead`
+leaderboard / `A.podium`). Each game module (`trivia.js`,
 `duel.js` for the four board duels, `draw.js`, `pong.js`, `wyr.js`, `scramble.js`,
 `react.js`) registers handlers for its message types and reuses those components. User-facing text is
 localized through `core/i18n.js`: the host's language rides in the `welcome` message and

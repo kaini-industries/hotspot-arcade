@@ -7,6 +7,6 @@
   "scripts": {
     "build": "node build.mjs",
     "mock": "node mock-server.mjs",
-    "test": "node test/socket-reconnect.mjs"
+    "test": "node test/socket-reconnect.mjs && node test/timer-transport.mjs && node test/numeric-clocks.mjs && node test/timer-source-contract.mjs && node test/match-roster-contract.mjs"
   }
 }

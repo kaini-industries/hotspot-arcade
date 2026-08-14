@@ -13,7 +13,7 @@
     var cols = m.cols || (m.kind === "ttt" ? 3 : 7);
     var rows = m.rows || (m.kind === "ttt" ? 3 : 6);
     var n = cols * rows;
-    var myTurn = m.turn === m.you;
+    var myTurn = !m.paused && m.turn === m.you;
     var board = $("duel-board");
     board.className = "board" + (m.kind === "ttt" ? " ttt" : "") + (myTurn ? " mine" : "");
     board.style.gridTemplateColumns = "repeat(" + cols + ",1fr)";
@@ -70,7 +70,7 @@
     var w = m.w, h = m.h;
     var hedges = m.hedges || [], vedges = m.vedges || [], boxes = m.boxes || [];
     var hoff = (h + 1) * w;               // vertical-edge index offset in move.n
-    var myTurn = m.turn === m.you;
+    var myTurn = !m.paused && m.turn === m.you;
     var board = $("duel-board");
     board.className = "dotsgrid" + (myTurn ? " mine" : "");
     // dot rows/cols are fixed and thin; edge + box tracks flex so the whole board
@@ -112,7 +112,7 @@
   /* ---- Reversi / Othello: 8x8, discs, server sends legal moves in `valid` ---- */
   function renderReversi(m) {
     var cols = 8, rows = 8, n = 64;
-    var myTurn = m.turn === m.you;
+    var myTurn = !m.paused && m.turn === m.you;
     var valid = m.valid || [];
     var vset = {};
     valid.forEach(function (i) { vset[i] = 1; });
@@ -161,14 +161,18 @@
     el.addEventListener("click", function () { move(n); });
   }
 
-  function move(n) { A.sfx("drop"); A.vibe(15); send({ t: "move", n: n }); }
+  function move(n) {
+    if (A.inputsPaused()) return;
+    A.sfx("drop"); A.vibe(15); send({ t: "move", n: n });
+  }
 
   /* ---- Phases ---- */
   function renderPlaying(m) {
     hide("duel-lobby"); hide("duel-over"); show("duel-match"); show("duel-leave");
-    var myTurn = m.turn === m.you;
+    var myTurn = !m.paused && m.turn === m.you;
     var turn = $("duel-turn");
-    turn.textContent = myTurn ? t("common.your_turn") : t("common.opp_turn", { nick: esc(m.opp) || t("common.opponent") });
+    turn.textContent = m.paused ? t("pause.player")
+      : myTurn ? t("common.your_turn") : t("common.opp_turn", { nick: esc(m.opp) || t("common.opponent") });
     turn.className = "turn" + (myTurn ? " you" : "");
 
     if (m.kind === "dots") renderDots(m);
@@ -180,7 +184,7 @@
     prev = m.kind === "dots"
       ? (m.hedges || []).concat(m.vedges || []).map(String)
       : (m.board || []).map(String);
-    prevTurnMine = myTurn;
+    if (!m.paused) prevTurnMine = myTurn;
   }
 
   function renderOver(m) {
@@ -199,6 +203,7 @@
 
   function renderLobby(m) {
     hide("duel-match"); hide("duel-over"); show("duel-lobby"); hide("duel-leave");
+    A.players = m.players || [];
     lobbyView($("duel-incoming"), $("duel-players"), m.challenges);
     prev = null; prevTurnMine = false;
   }

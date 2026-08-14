@@ -106,4 +106,46 @@ const exact = gs.find((g) => g.n === 2);
 assert.ok(exact && exact.pts === 1, "the exact guess is listed with +1");
 assert.ok(gs.filter((g) => g.pts > 0).length === 1, "only the exact guess scores");
 
+// Secrets exposes n, locked, yes, predictions, and scoring as one connected cohort.
+// Raw private choices remain reserved for resume, but a player who drops before reveal
+// cannot leave yes > n, a prediction above n, or an award in the public result.
+const grace = await newEngine();
+grace.reset();
+for (const [pid, nick] of [[1, "A"], [2, "B"], [3, "C"]]) grace.join(pid, nick);
+grace.loadContent(SEC, [{ name: "Grace", items: [{ q: "Connected cohort?" }] }]);
+for (const pid of [1, 2, 3]) grace.input(pid, { t: "ready", ready: true });
+let graceOut = [];
+for (let ms = 1000; ms <= 4000; ms += 1000) graceOut = graceOut.concat(grace.tick(ms));
+grace.input(1, { t: "reply", v: 1 });
+grace.input(3, { t: "reply", v: 1 });
+grace.disconnect(3);
+graceOut = grace.input(2, { t: "reply", v: 0 });
+let state = lastToWs(graceOut, 1, "secrets").msg;
+assert.equal(state.phase, "predict", "online answer quorum advances after the drop");
+assert.equal(state.n, 2);
+grace.input(2, { t: "predict", n: 2 });
+grace.disconnect(2);
+graceOut = grace.input(1, { t: "predict", n: 1 });
+state = lastToWs(graceOut, 1, "secrets").msg;
+assert.equal(state.phase, "reveal");
+assert.equal(state.n, 1, "reveal freezes the final online cohort size");
+assert.equal(state.total, 1);
+assert.equal(state.yes, 1, "offline yes answers are excluded from the coherent result");
+assert.equal(state.locked, 1, "locked never exceeds the final cohort");
+assert.deepEqual(state.guesses.map((g) => g.pid), [1], "only the final cohort is revealed/scored");
+assert.ok(state.guesses.every((g) => g.n >= 0 && g.n <= state.n), "every revealed prediction is in 0..n");
+assert.equal(state.mygain, 1, "the sole online exact prediction scores");
+const graceScores = graceOut.filter((x) => x.to === "uart" && x.kind === "score");
+assert.deepEqual(graceScores.map((x) => x.pid), [1], "offline reserved identities do not score");
+const resumedGrace = grace.join(
+  22,
+  "B",
+  "00000000000000000000000000000002",
+  null,
+);
+const resumedState = lastToWs(resumedGrace, 22, "secrets").msg;
+assert.equal(resumedState.n, 1, "reconnect during reveal does not change the latched scale");
+assert.deepEqual(resumedState.guesses.map((g) => g.pid), [1], "reconnect cannot rewrite reveal rows");
+assert.equal(resumedState.myprediction, -1, "an excluded prediction is not presented as part of the result");
+
 console.log("secrets: all checks passed");

@@ -87,4 +87,37 @@ const graceOut = grace.disconnect(2);
 const graceState = lastToWs(graceOut, 1, "wyr").msg;
 assert.equal(graceState.phase, "reveal", "offline noncritical player is excluded from quorum");
 
+// A ballot submitted before a transient drop remains stored for resume, but the live
+// poll reveal uses one online cohort and is immutable once latched. Rejoining during
+// the reveal must not retroactively rewrite the result.
+const latched = await newEngine();
+latched.reset();
+latched.join(1, "A");
+latched.join(2, "B");
+latched.join(3, "DROPPED");
+latched.selectGame(WYR);
+latched.contentClear();
+latched.contentPack(WYR, "Latch");
+latched.contentItem(JSON.stringify({ a: "A", b: "B" }));
+for (const pid of [1, 2, 3]) latched.input(pid, { t: "ready", ready: true });
+latched.tick(3000);
+latched.input(1, { t: "answer", c: 0 });
+latched.input(3, { t: "answer", c: 1 });
+latched.disconnect(3);
+const revealOut = latched.input(2, { t: "answer", c: 1 });
+assert.deepEqual(
+  lastToWs(revealOut, 1, "wyr").msg.counts,
+  [1, 1],
+  "a submitted ballot from an offline reserved seat is not in the connected poll",
+);
+const resumedOut = latched.join(
+  33,
+  "DROPPED",
+  "00000000000000000000000000000003",
+  null,
+);
+const resumed = lastToWs(resumedOut, 33, "wyr").msg;
+assert.deepEqual(resumed.counts, [1, 1], "reconnect during reveal cannot rewrite a latched split");
+assert.equal(resumed.myvote, 1, "the returning identity still has its stored private ballot");
+
 console.log("wyr: all checks passed");

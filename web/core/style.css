@@ -129,6 +129,11 @@ body{
   background:var(--surface-2); color:var(--orange); border-bottom:2px solid var(--orange);
   font-size:12px; font-weight:700; letter-spacing:.1em; text-transform:uppercase; padding:6px;
 }
+.game-pause{
+  position:sticky; top:48px; z-index:30; text-align:center;
+  background:var(--surface-2); color:var(--text); border-bottom:2px solid var(--orange);
+  font-size:12px; font-weight:700; letter-spacing:.06em; padding:8px 10px;
+}
 
 /* Screens */
 .screen{max-width:480px; margin:0 auto; display:flex; flex-direction:column; gap:16px;
@@ -218,6 +223,7 @@ h3{margin:0; font-weight:600}
 .timebar{height:6px; margin:10px 0; background:var(--surface-2); border:2px solid var(--line); overflow:hidden}
 .timebar>i{display:block; height:100%; width:100%; background:var(--orange); transform-origin:left}
 .timebar.hot>i{background:var(--bad)}
+.timebar.paused>i{background:var(--text-dim)}
 .question{font-size:20px; line-height:1.3; min-height:1.3em}
 .opts{display:flex; flex-direction:column; gap:12px; margin:6px 0}
 .opt{
@@ -476,6 +482,25 @@ h3{margin:0; font-weight:600}
 .captive-dismiss{display:block; width:100%; background:none; border:0;
   color:var(--text-mute); font-family:var(--font); font-size:13px;
   text-transform:uppercase; letter-spacing:.08em; padding:6px; cursor:pointer}
+
+/* Planned transport pause is deliberately above every other modal and has no
+   dismiss action: the rendered game state is frozen until the host restores it. */
+.transport{position:fixed; inset:0; z-index:90; display:flex; align-items:center;
+  justify-content:center; background:rgba(0,0,0,.9);
+  padding:calc(24px + env(safe-area-inset-top)) 24px calc(24px + env(safe-area-inset-bottom))}
+.transport.hide{display:none}
+.transport-card{width:100%; max-width:420px; background:var(--surface);
+  border:2px solid var(--line); border-top:3px solid var(--orange);
+  border-radius:var(--radius); padding:26px 22px; text-align:center}
+.transport-spinner{width:30px; height:30px; margin:0 auto 16px; border:3px solid var(--line);
+  border-top-color:var(--orange); border-radius:50%; animation:transport-spin 1s linear infinite}
+.transport-title{font-size:20px; font-weight:700; text-transform:uppercase;
+  letter-spacing:.06em; color:var(--orange); margin-bottom:10px}
+.transport-body{font-size:15px; color:var(--text); line-height:1.5; margin:0}
+.transport-ssid,.transport-hint{font-size:14px; color:var(--text-dim); line-height:1.5; margin:14px 0 0;
+  overflow-wrap:anywhere}
+@keyframes transport-spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.transport-spinner{animation:none}}
 
 /* Avatar picker (landing) */
 .avatars{display:grid; grid-template-columns:repeat(8,1fr); gap:6px}

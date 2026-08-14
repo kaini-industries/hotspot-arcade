@@ -103,4 +103,31 @@ const onlineStates = [2, 3].map((pid) => lastToWs(onlineOut, pid, "spectrum").ms
 assert.equal(onlineStates.filter((m) => m.iam).length, 1, "exactly one online player is psychic");
 assert.notEqual(onlineStates[0].psychic, "OFFLINE", "reserved offline seat cannot deadlock the round");
 
+// A noncritical guesser who submits and then drops no longer blocks online quorum, but
+// their already-valid guess remains in the round result and keeps its award.
+{
+  const g = await newEngine();
+  g.reset();
+  for (const pid of [1, 2, 3, 4]) g.join(pid, `P${pid}`);
+  g.loadContent(SP, [{ name: "Grace", items: [{ left: "Cold", right: "Hot" }] }]);
+  for (const pid of [1, 2, 3, 4]) g.input(pid, { t: "ready", ready: true });
+  const begun = g.tick(3000);
+  const role = [1, 2, 3, 4].map((pid) => lastToWs(begun, pid, "spectrum").msg);
+  const psychicPid = role.findIndex((m) => m.iam) + 1;
+  const targetValue = role[psychicPid - 1].target;
+  const liveGuessers = [1, 2, 3, 4].filter((pid) => pid !== psychicPid);
+  g.input(psychicPid, { t: "clue", text: "grace" });
+  const droppedPid = liveGuessers[0];
+  g.input(droppedPid, { t: "slide", n: targetValue });
+  g.disconnect(droppedPid);
+  g.input(liveGuessers[1], { t: "slide", n: 0 });
+  const revealed = g.input(liveGuessers[2], { t: "slide", n: 100 });
+  const state = lastToWs(revealed, psychicPid, "spectrum").msg;
+  const dropped = state.guesses.find((x) => x.nick === `P${droppedPid}`);
+  assert.ok(dropped && dropped.g === targetValue && dropped.pts === 4,
+    "submitted Spectrum guess survives grace and scores");
+  assert.ok(revealed.some((x) => x.to === "uart" && x.kind === "score" && x.pid === droppedPid),
+    "offline reserved guesser receives the latched score event");
+}
+
 console.log("spectrum: all checks passed");

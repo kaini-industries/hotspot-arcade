@@ -5,6 +5,7 @@
 (function () {
   var myready = false;
   var armedFor = -1, greenBuzzed = false;
+  function stopBar() { A.timebarStop("rc-bar"); hide("rc-bar"); }
 
   function sub(name) {
     ["lobby", "count", "arena", "final"].forEach(function (id) {
@@ -14,14 +15,16 @@
 
   function renderLobby(m) {
     sub("lobby");
+    stopBar();
     A.hideLead();
     myready = A.readyLobby({ players: m.players, listId: "rc-players", readyId: "rc-ready", meId: "rc-me" });
   }
 
   function renderCount(m) {
     sub("count");
+    stopBar();
     A.hideLead();
-    A.countdown("rc-count-num", m.sec);
+    A.countdown("rc-count-num", m.remaining_ms, m.paused);
   }
 
   function renderArmed(m) {
@@ -29,6 +32,9 @@
     $("rc-meta").textContent = t("common.round", { n: m.round, total: m.rounds });
     var pad = $("rc-pad");
     var go = m.light === "go";
+    // The random red delay is secret; only the public green window is rendered.
+    if (go) A.timebar("rc-bar", m.remaining_ms, m.duration_ms, m.paused, false);
+    else stopBar();
     var cls = "rc-pad " + (m.dq ? "dq" : go ? "go" : "wait");
     pad.className = cls;
     if (m.dq) pad.innerHTML = '<span class="rc-big">' + t("rc.too_soon") + '</span><span class="rc-sub">' + t("rc.wait_next") + '</span>';
@@ -42,6 +48,7 @@
 
   function renderReveal(m) {
     sub("arena");
+    A.timebar("rc-bar", m.remaining_ms, m.duration_ms, m.paused, false);
     A.showLead(m.scores || [], true);
     $("rc-meta").textContent = t("common.round", { n: m.round, total: m.rounds });
     var pad = $("rc-pad");
@@ -58,6 +65,7 @@
 
   function renderFinal(m) {
     sub("final");
+    stopBar();
     A.hideLead();
     var b = A.podium("rc-podium", m.board); // final JSON carries the scoreboard as `board`
     if (b.length && b[0].pid === A.pid) { A.sfx("win"); A.vibe([30, 50, 30]); }
@@ -87,6 +95,7 @@
     send({ t: "again" });
   });
   $("rc-pad").addEventListener("click", function () {
+    if (A.gamePaused || A.transportBlocked) return;
     send({ t: "tap" });
   });
 })();

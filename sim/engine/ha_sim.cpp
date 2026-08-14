@@ -200,11 +200,24 @@ void ha_input_at(uint32_t wsId, const char* json, uint32_t now) {
     engine.onInput(wsId, json, g_millis);
 }
 void ha_disconnect(uint32_t wsId) { engine.onWsDisconnect(wsId, g_millis); }
+int ha_transport_pause(int reason, const char* ssid, uint32_t reconnectMs) {
+    return (int)engine.pauseTransport(
+        (HaTransportReason)reason, ssid ? ssid : "", reconnectMs, g_millis);
+}
+int ha_transport_resume() { return (int)engine.resumeTransport(g_millis); }
+int ha_transport_fallback_ssid(const char* ssid) {
+    return engine.replacePausedTransportSsid(ssid) ? 1 : 0;
+}
+int ha_transport_paused() { return engine.transportPaused() ? 1 : 0; }
+uint32_t ha_transport_expected() { return engine.transportExpectedMask(); }
+uint32_t ha_transport_online_expected() { return engine.transportOnlineExpectedMask(); }
+uint32_t ha_session_now() { return engine.sessionNow(); }
+uint32_t ha_game_now() { return engine.gameNow(); }
 int ha_time_reached(uint32_t now, uint32_t deadline) { return haTimeReached(now, deadline); }
 uint32_t ha_time_remaining(uint32_t now, uint32_t deadline) {
     return haTimeRemaining(now, deadline);
 }
-int ha_select_game(int id) { return engine.selectGame((uint8_t)id) ? 1 : 0; }
+int ha_select_game(int id) { return engine.selectGame((uint8_t)id, g_millis) ? 1 : 0; }
 int ha_content_begin(int game, const char* lang) {
     return engine.contentBegin((uint8_t)game, lang) ? 1 : 0;
 }
@@ -214,7 +227,7 @@ int ha_content_pack(int game, const char* name) {
 int ha_content_item(const char* json) { return engine.contentItem(json) ? 1 : 0; }
 int ha_content_commit(int packs, int items) {
     if(packs < 0 || packs > 65535 || items < 0 || items > 65535) return 0;
-    return engine.contentCommit((uint16_t)packs, (uint16_t)items) ? 1 : 0;
+    return engine.contentCommit((uint16_t)packs, (uint16_t)items, g_millis) ? 1 : 0;
 }
 void ha_content_abort() { engine.contentAbort(); }
 void ha_content_fail_after(int checkpoints) { g_contentFailAfter = checkpoints; }
@@ -222,7 +235,7 @@ int ha_content_bank_count() { return engine.contentBankCount(); }
 int ha_content_bank_max() { return g_contentBanksMax; }
 int ha_content_active_game() { return engine.contentActiveGame(); }
 const char* ha_content_active_lang() { return engine.contentActiveLang(); }
-void ha_round_end() { engine.roundEnd(); }
+void ha_round_end() { engine.roundEnd(g_millis); }
 void ha_reset_scores() { engine.resetScores(); }
 // Test-only chess hooks (HA_CHESS_TEST), for positions the opening moves can't reach
 // quickly and for perft ground truth against the real move generator.

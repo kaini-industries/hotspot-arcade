@@ -7,6 +7,10 @@
   var myready = false;
   var gr = 128, gg = 128, gb = 128; // local guess, adjusted with the arrows
   var round = -1, submitted = false;
+  function stopBars() {
+    A.timebarStop("gc-bar"); hide("gc-bar");
+    A.timebarStop("gc-rbar"); hide("gc-rbar");
+  }
 
   function sub(name) {
     ["lobby", "count", "play", "reveal", "final"].forEach(function (id) {
@@ -35,6 +39,12 @@
     submitted = on;
     $("gc-submit").classList.toggle("hide", on);
     $("gc-wait").classList.toggle("hide", !on);
+    paintControlLock();
+  }
+
+  function paintControlLock() {
+    var on = submitted || A.inputsPaused();
+    $("gc-submit").disabled = on;
     ["gc-r-up", "gc-r-dn", "gc-g-up", "gc-g-dn", "gc-b-up", "gc-b-dn",
      "gc-r-slider", "gc-g-slider", "gc-b-slider"].forEach(function (id) {
       $(id).disabled = on;
@@ -43,18 +53,22 @@
 
   function renderLobby(m) {
     sub("lobby");
+    stopBars();
     A.hideLead();
     myready = A.readyLobby({ players: m.players, listId: "gc-players", readyId: "gc-ready", meId: "gc-me" });
   }
 
   function renderCount(m) {
     sub("count");
+    stopBars();
     A.hideLead();
-    A.countdown("gc-count-num", m.sec);
+    A.countdown("gc-count-num", m.remaining_ms, m.paused);
   }
 
   function renderPlay(m) {
     sub("play");
+    A.timebarStop("gc-rbar"); hide("gc-rbar");
+    A.timebar("gc-bar", m.remaining_ms, m.duration_ms, m.paused, false);
     $("gc-meta").textContent = t("common.round", { n: m.round, total: m.rounds });
     $("gc-target").style.background = m.color;
     if (m.round !== round) {           // new round: reset the guess and unlock
@@ -65,11 +79,14 @@
       A.sfx("start");
     }
     if (m.submitted && !submitted) lock(true);
+    paintControlLock();
     A.showLead(m.scores || [], false);
   }
 
   function renderReveal(m) {
     sub("reveal");
+    A.timebarStop("gc-bar"); hide("gc-bar");
+    A.timebar("gc-rbar", m.remaining_ms, m.duration_ms, m.paused, false);
     $("gc-rmeta").textContent = t("common.round", { n: m.round, total: m.rounds });
     $("gc-rtarget").style.background = m.color; // the answer color, shown big up top
     $("gc-answer").textContent = t("gc.answer_val", { r: m.r, g: m.g, b: m.b });
@@ -109,6 +126,7 @@
 
   function renderFinal(m) {
     sub("final");
+    stopBars();
     A.hideLead();
     var b = A.podium("gc-podium", m.board); // final JSON carries the scoreboard as `board`
     if (b.length && b[0].pid === A.pid) { A.sfx("win"); A.vibe([30, 50, 30]); }
@@ -140,7 +158,7 @@
     }
     function down(e) {
       e.preventDefault();
-      if (submitted) return;
+      if (submitted || A.inputsPaused()) return;
       apply();
       delay = 200;
       timer = setTimeout(step, delay);
@@ -158,7 +176,7 @@
       bindStep($("gc-" + ch + "-up"), function () { set(ch, get(ch) + 1); paintGuess(); A.vibe(4); });
       bindStep($("gc-" + ch + "-dn"), function () { set(ch, get(ch) - 1); paintGuess(); A.vibe(4); });
       $("gc-" + ch + "-slider").addEventListener("input", function (e) {
-        if (submitted) return;
+        if (submitted || A.inputsPaused()) return;
         set(ch, +e.target.value);
         paintGuess();
       });
@@ -168,7 +186,7 @@
       send({ t: "ready", ready: !myready });
     });
     $("gc-submit").addEventListener("click", function () {
-      if (submitted) return;
+      if (submitted || A.inputsPaused()) return;
       lock(true);
       A.sfx("score"); A.vibe(20);
       send({ t: "guess", r: gr, g: gg, b: gb });

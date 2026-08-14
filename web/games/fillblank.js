@@ -37,7 +37,7 @@
   function renderCount(m) {
     sub("count");
     stopBar();
-    A.countdown("fb-count-num", m.sec);
+    A.countdown("fb-count-num", m.remaining_ms, m.paused);
   }
 
   function clear(boxId) {
@@ -53,7 +53,7 @@
     var box = $("fb-hand");
     box.innerHTML = "";
     var cards = m.hand || [];
-    var locked = m.mine >= 0;
+    var locked = m.mine >= 0 || !!m.paused;
     var any = false;
     for (var i = 0; i < cards.length; i++) {
       if (!cards[i]) continue;
@@ -109,7 +109,7 @@
         if (i === m.pick && !isDeck) by.appendChild(el("b", "fb-pts", "+1"));
         b.appendChild(by);
         b.disabled = true;
-      } else if (m.iam) {
+      } else if (m.iam && !m.paused) {
         b.addEventListener("click", (function (idx) {
           return function () { A.sfx("buzz"); A.vibe(15); send({ t: "pick", i: idx }); };
         })(i));
@@ -127,8 +127,7 @@
     var stage = m.stage; // play | judge | reveal
     $("fb-meta").textContent = t("common.round", { n: m.round, total: m.rounds });
     $("fb-role").textContent = m.iam ? t("fb.you_czar") : t("fb.czar_is", { nick: m.czar });
-    noteDeadline(m.deadline, m.dur);
-    A.timebar("fb-bar", m.deadline, m.dur, false);
+    A.timebar("fb-bar", m.remaining_ms, m.duration_ms, m.paused, false);
     $("fb-prompt").textContent = m.prompt || "";
     var note = $("fb-note");
     var tally = t("fb.tally", { n: m.played, total: m.total });
