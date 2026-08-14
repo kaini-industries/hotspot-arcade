@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { newEngine, lastToWs } from "./harness-lib.mjs";
+import { newEngine, lastToWs, challengeId } from "./harness-lib.mjs";
 
 const e = await newEngine();
 e.reset();
@@ -84,5 +84,76 @@ assert.equal(lastToWs(out, 2, "welcome").msg.resumed, false);
 assert.equal(e.timeReached(0xfffffff0, 0x20), false);
 assert.equal(e.timeRemaining(0xfffffff0, 0x20), 48);
 assert.equal(e.timeReached(0x20, 0x20), true);
+
+// Challenge acceptance is bound to a server-issued id. Detaching either endpoint
+// removes the invitation immediately, so an old id cannot start a later match.
+const stale = await newEngine();
+stale.reset();
+stale.selectGame(2);
+const staleToken = "cccccccccccccccccccccccccccccccc";
+stale.join(1, "CHALLENGER", staleToken);
+stale.join(2, "TARGET");
+const staleInvite = stale.input(1, { t: "challenge", to: 2 });
+const staleId = challengeId(staleInvite, 2);
+assert.ok(Number.isInteger(staleId) && staleId > 0);
+assert.deepEqual(stale.input(1, { t: "challenge", to: 258 }), [],
+  "out-of-range challenge pids cannot wrap onto a real seat");
+assert.deepEqual(stale.input(1, { t: "challenge", to: -254 }), [],
+  "negative challenge pids cannot wrap onto a real seat");
+stale.tick(1000);
+stale.disconnect(1);
+assert.deepEqual(stale.input(2, { t: "accept", id: staleId }), []);
+stale.inputAt(3, {
+  t: "hello", proto: 2, nick: "CHALLENGER", avatar: "🙂", resume: staleToken,
+}, 2000);
+const laterInvite = stale.input(3, { t: "challenge", to: 2 });
+const laterId = challengeId(laterInvite, 2);
+assert.ok(Number.isInteger(laterId) && laterId > 0 && laterId !== staleId,
+  "a later invitation to the same endpoint gets a distinct id");
+assert.deepEqual(stale.input(2, { t: "accept", id: staleId }), [],
+  "the stale id cannot consume the later invitation");
+out = stale.input(2, { t: "accept", id: laterId });
+assert.equal(lastToWs(out, 2, "duel").msg.phase, "playing",
+  "only the new invitation id reserves the match");
+
+// Exhausting a fixed match table reports capacity to both players and leaves
+// the challenge available for a later retry. Pong has four slots by default.
+const cap = await newEngine();
+cap.reset();
+for (let ws = 1; ws <= 10; ws++) cap.join(ws, "M" + ws);
+cap.selectGame(6);
+for (let ws = 1; ws <= 7; ws += 2) {
+  const invite = cap.input(ws, { t: "challenge", to: ws + 1 });
+  cap.input(ws + 1, { t: "accept", id: challengeId(invite, ws + 1) });
+}
+const overflowInvite = cap.input(9, { t: "challenge", to: 10 });
+const overflowId = challengeId(overflowInvite, 10);
+out = cap.input(10, { t: "accept", id: overflowId });
+assert.equal(lastToWs(out, 9, "error").msg.code, "match_capacity");
+assert.equal(lastToWs(out, 10, "error").msg.code, "match_capacity");
+assert.equal(challengeId(out, 10), overflowId, "capacity failure keeps the invite retryable");
+
+// A simultaneous timeout is a double forfeit, not a score decided by ascending
+// pid iteration order.
+const doubleExpiry = await newEngine();
+doubleExpiry.resetAt(0);
+doubleExpiry.join(1, "LEFT");
+doubleExpiry.join(2, "RIGHT");
+doubleExpiry.selectGame(6);
+const doubleInvite = doubleExpiry.input(1, { t: "challenge", to: 2 });
+doubleExpiry.input(2, { t: "accept", id: challengeId(doubleInvite, 2) });
+doubleExpiry.disconnect(1);
+doubleExpiry.disconnect(2);
+out = doubleExpiry.tick(120000);
+assert.equal(out.some((x) => x.to === "uart" && x.kind === "score"), false,
+  "two expiring opponents cannot win by forfeit against each other");
+
+// The simulator's quorum override is still useful to an admitted player, but a
+// pending/unknown socket cannot alter it before hello.
+const authz = await newEngine();
+authz.reset();
+assert.deepEqual(authz.input(99, { t: "minoverride", on: true }), []);
+out = authz.join(1, "AUTHED");
+assert.equal(lastToWs(out, 1, "lobby").msg.minoverride, false);
 
 console.log("identity: protocol v2 checks passed");

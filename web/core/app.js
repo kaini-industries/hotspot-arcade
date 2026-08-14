@@ -358,7 +358,10 @@ function createResumeToken() {
   var bytes = new Uint8Array(16);
   window.crypto.getRandomValues(bytes);
   var token = "";
-  for (var i = 0; i < bytes.length; i++) token += bytes[i].toString(16).padStart(2, "0");
+  for (var i = 0; i < bytes.length; i++) {
+    var hex = bytes[i].toString(16);
+    token += hex.length === 1 ? "0" + hex : hex;
+  }
   return token;
 }
 
@@ -426,12 +429,24 @@ A.resume = resumeToken();
    which puts us on the normal reconnect path. This is purely the client judging its
    own connection; the host closes nothing on its behalf. The host already answers
    {t:"ping"} with {t:"pong"}, so no firmware change is involved. */
-var PING_MS = 2000, WARN_MS = 5000, DEAD_MS = 15000;
+var PING_MS = 2000, WARN_MS = 5000, DEAD_MS = 15000, CONNECT_MS = 10000;
 var liveTimer = null, lastRx = 0, warned = false;
 
 function stopLiveness() {
   if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
   warned = false;
+}
+
+// Closing is normally followed by onclose, but captive/half-open implementations
+// are precisely the ones that can omit that callback. Retire the same socket and
+// schedule recovery ourselves if the close handler did not do so synchronously.
+function closeAndReconnect(ws) {
+  try { ws.close(); } catch (e) {}
+  if (A.ws === ws) {
+    A.ws = null;
+    A.authenticated = false;
+    scheduleReconnect();
+  }
 }
 
 // Detect a link that has gone quiet and recover it fast. A half-open socket keeps
@@ -451,7 +466,7 @@ function startLiveness() {
     var quiet = Date.now() - lastRx;
     if (quiet > DEAD_MS) {
       stopLiveness();
-      try { A.ws.close(); } catch (e) {}   // onclose -> scheduleReconnect()
+      closeAndReconnect(A.ws);
       return;
     }
     if (quiet > WARN_MS && !warned) {
@@ -476,8 +491,10 @@ function connect() {
   }
   A.ws = ws;
   A.authenticated = false;
+  var connectTimer = null;
 
   ws.onopen = function () {
+    if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
     A.retry = 0;
     startLiveness();
     hide("netbar");
@@ -495,6 +512,7 @@ function connect() {
   };
 
   ws.onclose = function (ev) {
+    if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
     if (A.ws !== ws) return;
     stopLiveness();
     A.ws = null;
@@ -508,7 +526,11 @@ function connect() {
     }
     scheduleReconnect();
   };
-  ws.onerror = function () { try { ws.close(); } catch (e) {} };
+  ws.onerror = function () { closeAndReconnect(ws); };
+  connectTimer = setTimeout(function () {
+    connectTimer = null;
+    if (A.ws === ws && ws.readyState === 0) closeAndReconnect(ws);
+  }, CONNECT_MS);
 }
 
 function scheduleReconnect() {
@@ -594,6 +616,11 @@ function dispatch(m) {
     case "toast":
       toast(m.msg);
       break;
+    case "error":
+      if (m.code === "match_capacity") toast(t("error.match_capacity"));
+      else if (m.code === "challenge_capacity") toast(t("error.challenge_capacity"));
+      else toast(t("error.unknown"));
+      break;
     case "pong":
       // "pong" is overloaded: a bare {t:"pong"} is the keepalive reply, while
       // the Pong game sends {t:"pong", phase, ...}. Only the latter has a phase.
@@ -629,7 +656,7 @@ function lobbyView(incEl, listEl, challenges) {
     row.className = "challenge";
     if (c.to === A.pid) {
       row.innerHTML = '<span class="pn">' + esc(nickOf(c.from)) + " challenged you</span>";
-      btn(row, "Accept", "btn sm", function () { A.sfx("buzz"); send({ t: "accept", from: c.from }); });
+      btn(row, "Accept", "btn sm", function () { A.sfx("buzz"); send({ t: "accept", id: c.id }); });
       btn(row, "Decline", "btn ghost sm", function () { send({ t: "cancel" }); });
     } else if (c.from === A.pid) {
       row.innerHTML = '<span class="pn">Waiting on ' + esc(nickOf(c.to)) + "...</span>";
@@ -876,7 +903,10 @@ function notePlayerCount(m) {
   if (arr && arr.length !== undefined) A.nPlayers = arr.length;
   if (typeof m.minoverride === "boolean") {
     A.minOverride = m.minoverride;
+    show("test-min-row");
     paintMinSwitch();
+  } else {
+    hide("test-min-row");
   }
 }
 
@@ -1094,6 +1124,7 @@ if (typeof globalThis !== "undefined" && globalThis.__HA_TEST__) {
     sendHello: sendHello,
     connect: connect,
     createResumeToken: createResumeToken,
+    lobbyView: lobbyView,
   };
 }
 document.addEventListener("DOMContentLoaded", initApp);

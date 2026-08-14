@@ -184,8 +184,11 @@
       banner.textContent = t("werewolf.dawn");
       // Four distinct outcomes: a body, a blocked attack, an idle pack, or the
       // small-table opening night. Telling them apart is the doctor's whole point.
-      note.textContent = m.victim
-        ? t("werewolf.died", { nick: nickOfPid(m, m.victim), role: roleOfPid(m, m.victim) })
+      note.textContent = m.victim || m.victimNick
+        ? t("werewolf.died", {
+            nick: m.victimNick || nickOfPid(m, m.victim),
+            role: roleName(m.victimRole) || roleOfPid(m, m.victim),
+          })
         : m.dawnkind === "saved" ? t("werewolf.saved")
           : m.dawnkind === "nokill" ? t("werewolf.first_dawn")
             : t("werewolf.quiet_night");
@@ -208,8 +211,11 @@
       });
     } else { // dusk
       banner.textContent = t("werewolf.dusk");
-      note.textContent = m.lynched
-        ? t("werewolf.voted_out", { nick: nickOfPid(m, m.lynched), role: roleOfPid(m, m.lynched) })
+      note.textContent = m.lynched || m.lynchedNick
+        ? t("werewolf.voted_out", {
+            nick: m.lynchedNick || nickOfPid(m, m.lynched),
+            role: roleName(m.lynchedRole) || roleOfPid(m, m.lynched),
+          })
         : t("werewolf.no_majority");
       renderList(m, {});
     }
@@ -229,14 +235,22 @@
     (m.log || []).forEach(function (d) {
       var night = document.createElement("div");
       night.className = "ww-logrow";
-      night.textContent = d.victim
-        ? t("werewolf.log_night_died", { n: d.day, nick: nickOfPid(m, d.victim), role: roleOfPid(m, d.victim) })
+      night.textContent = d.victim || d.victimNick
+        ? t("werewolf.log_night_died", {
+            n: d.day,
+            nick: d.victimNick || nickOfPid(m, d.victim),
+            role: roleName(d.victimRole) || roleOfPid(m, d.victim),
+          })
         : t("werewolf.log_night_safe", { n: d.day });
       box.appendChild(night);
       var day = document.createElement("div");
       day.className = "ww-logrow day";
-      day.textContent = d.lynched
-        ? t("werewolf.log_day_out", { n: d.day, nick: nickOfPid(m, d.lynched), role: roleOfPid(m, d.lynched) })
+      day.textContent = d.lynched || d.lynchedNick
+        ? t("werewolf.log_day_out", {
+            n: d.day,
+            nick: d.lynchedNick || nickOfPid(m, d.lynched),
+            role: roleName(d.lynchedRole) || roleOfPid(m, d.lynched),
+          })
         : t("werewolf.log_day_none", { n: d.day });
       box.appendChild(day);
     });

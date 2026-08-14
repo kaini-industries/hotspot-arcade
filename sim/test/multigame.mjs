@@ -12,7 +12,7 @@
 // game, and the scoreboard resets. A stale union byte surfaces here as a UBSan "load of value
 // N, not valid for bool" or an ASan overflow; an aliasing read surfaces as a wrong assertion.
 import assert from "node:assert/strict";
-import { newEngine, lastToWs } from "./harness-lib.mjs";
+import { newEngine, lastToWs, challengeId } from "./harness-lib.mjs";
 
 const G = {
   TRIVIA: 1, CONNECT4: 2, TICTACTOE: 3, DOTS: 4, DRAW: 5, PONG: 6, REACT: 7, WYR: 8,
@@ -90,8 +90,8 @@ for (const id of ORDER) {
 //    _c challenge slot (outside the union). Switching to trivia must clear both; a stale _m
 //    match read as trivia's bytes would corrupt the room.
 e.selectGame(G.CONNECT4);
-e.input(1, { t: "challenge", to: 2 });
-e.input(2, { t: "accept", from: 1 }); // _m[0] now a live match
+const challenged = e.input(1, { t: "challenge", to: 2 });
+e.input(2, { t: "accept", id: challengeId(challenged, 2) }); // _m[0] now a live match
 let out = e.selectGame(G.TRIVIA);
 assert.equal(lobbyOf(out).game, "trivia", "switching off a live match returns a clean trivia lobby");
 

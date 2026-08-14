@@ -74,7 +74,7 @@ spellcheck="false" placeholder="e.g. NOVA" data-i18n-ph="landing.nick_ph" style=
 spellcheck="false" placeholder="Say something" data-i18n-ph="lobby.say_ph">
 <button class="btn sm" type="submit" data-i18n="common.send">Send</button>
 </form>
-<div class="testrow">
+<div id="test-min-row" class="testrow hide">
 <span data-i18n="test.minlabel">Testing: ignore player minimums</span>
 <button id="test-min" type="button" data-i18n="test.off">off</button>
 </div>
@@ -946,7 +946,10 @@ if (!window.crypto || !window.crypto.getRandomValues) return "";
 var bytes = new Uint8Array(16);
 window.crypto.getRandomValues(bytes);
 var token = "";
-for (var i = 0; i < bytes.length; i++) token += bytes[i].toString(16).padStart(2, "0");
+for (var i = 0; i < bytes.length; i++) {
+var hex = bytes[i].toString(16);
+token += hex.length === 1 ? "0" + hex : hex;
+}
 return token;
 }
 function setDot(cls) { $("dot").className = "dot" + (cls ? " " + cls : ""); }
@@ -984,11 +987,19 @@ if (v) localStorage.setItem(k, v);
 return v;
 }
 A.resume = resumeToken();
-var PING_MS = 2000, WARN_MS = 5000, DEAD_MS = 15000;
+var PING_MS = 2000, WARN_MS = 5000, DEAD_MS = 15000, CONNECT_MS = 10000;
 var liveTimer = null, lastRx = 0, warned = false;
 function stopLiveness() {
 if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
 warned = false;
+}
+function closeAndReconnect(ws) {
+try { ws.close(); } catch (e) {}
+if (A.ws === ws) {
+A.ws = null;
+A.authenticated = false;
+scheduleReconnect();
+}
 }
 function startLiveness() {
 stopLiveness();
@@ -998,7 +1009,7 @@ if (!A.ws || A.ws.readyState !== 1) return;
 var quiet = Date.now() - lastRx;
 if (quiet > DEAD_MS) {
 stopLiveness();
-try { A.ws.close(); } catch (e) {}   // onclose -> scheduleReconnect()
+closeAndReconnect(A.ws);
 return;
 }
 if (quiet > WARN_MS && !warned) {
@@ -1022,7 +1033,9 @@ catch (e) { scheduleReconnect(); return; }
 }
 A.ws = ws;
 A.authenticated = false;
+var connectTimer = null;
 ws.onopen = function () {
+if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
 A.retry = 0;
 startLiveness();
 hide("netbar");
@@ -1036,6 +1049,7 @@ try { m = JSON.parse(ev.data); } catch (e) { return; }
 dispatch(m);
 };
 ws.onclose = function (ev) {
+if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
 if (A.ws !== ws) return;
 stopLiveness();
 A.ws = null;
@@ -1049,7 +1063,11 @@ return;
 }
 scheduleReconnect();
 };
-ws.onerror = function () { try { ws.close(); } catch (e) {} };
+ws.onerror = function () { closeAndReconnect(ws); };
+connectTimer = setTimeout(function () {
+connectTimer = null;
+if (A.ws === ws && ws.readyState === 0) closeAndReconnect(ws);
+}, CONNECT_MS);
 }
 function scheduleReconnect() {
 if (A.takeover) return;
@@ -1111,6 +1129,11 @@ break;
 case "toast":
 toast(m.msg);
 break;
+case "error":
+if (m.code === "match_capacity") toast(t("error.match_capacity"));
+else if (m.code === "challenge_capacity") toast(t("error.challenge_capacity"));
+else toast(t("error.unknown"));
+break;
 case "pong":
 if (m.phase && A.handlers.pong) A.handlers.pong(m);
 break;
@@ -1137,7 +1160,7 @@ var row = document.createElement("div");
 row.className = "challenge";
 if (c.to === A.pid) {
 row.innerHTML = '<span class="pn">' + esc(nickOf(c.from)) + " challenged you</span>";
-btn(row, "Accept", "btn sm", function () { A.sfx("buzz"); send({ t: "accept", from: c.from }); });
+btn(row, "Accept", "btn sm", function () { A.sfx("buzz"); send({ t: "accept", id: c.id }); });
 btn(row, "Decline", "btn ghost sm", function () { send({ t: "cancel" }); });
 } else if (c.from === A.pid) {
 row.innerHTML = '<span class="pn">Waiting on ' + esc(nickOf(c.to)) + "...</span>";
@@ -1321,7 +1344,10 @@ var arr = m.players || m.p || m.scores || m.board;
 if (arr && arr.length !== undefined) A.nPlayers = arr.length;
 if (typeof m.minoverride === "boolean") {
 A.minOverride = m.minoverride;
+show("test-min-row");
 paintMinSwitch();
+} else {
+hide("test-min-row");
 }
 }
 function paintMinSwitch() {
@@ -1494,6 +1520,7 @@ dispatch: dispatch,
 sendHello: sendHello,
 connect: connect,
 createResumeToken: createResumeToken,
+lobbyView: lobbyView,
 };
 }
 document.addEventListener("DOMContentLoaded", initApp);
@@ -1536,6 +1563,9 @@ en: {
 "join.throttled": "Too many attempts. Wait a moment and try again.",
 "join.full": "This party is full.",
 "join.bad_protocol": "This page is out of date. Reconnect to the Wi-Fi and reload.",
+"error.match_capacity": "Every match slot is busy. Try accepting again in a moment.",
+"error.challenge_capacity": "Too many challenges are pending. Cancel one and try again.",
+"error.unknown": "That action could not be completed. Try again.",
 "net.quiet": "Connection lost?",
 "lobby.title": "Lobby",
 "lobby.pick": "Pick a game",
@@ -1893,6 +1923,9 @@ de: {
 "join.throttled": "Zu viele Versuche. Warte kurz und versuche es erneut.",
 "join.full": "Diese Party ist voll.",
 "join.bad_protocol": "Diese Seite ist veraltet. Verbinde dich neu mit dem WLAN und lade sie neu.",
+"error.match_capacity": "Alle Match-Plätze sind belegt. Versuche es gleich noch einmal.",
+"error.challenge_capacity": "Zu viele Herausforderungen sind offen. Brich eine ab und versuche es erneut.",
+"error.unknown": "Die Aktion konnte nicht ausgeführt werden. Versuche es erneut.",
 "net.quiet": "Verbindung weg?",
 "lobby.title": "Lobby",
 "lobby.pick": "Spiel wählen",
@@ -2251,6 +2284,9 @@ de: {
 "join.throttled": "Muitas tentativas. Aguarde e tente novamente.",
 "join.full": "Esta festa esta cheia.",
 "join.bad_protocol": "Esta pagina esta desatualizada. Reconecte ao Wi-Fi e recarregue.",
+"error.match_capacity": "Todas as vagas de partida estao ocupadas. Tente aceitar novamente em instantes.",
+"error.challenge_capacity": "Ha desafios demais pendentes. Cancele um e tente novamente.",
+"error.unknown": "Nao foi possivel concluir essa acao. Tente novamente.",
 "lobby.title": "Lobby",
 "lobby.pick": "Escolha um jogo",
 "lobby.chat": "Bate-papo",
@@ -4912,8 +4948,11 @@ renderList(m, {});
 }
 } else if (stage === "dawn") {
 banner.textContent = t("werewolf.dawn");
-note.textContent = m.victim
-? t("werewolf.died", { nick: nickOfPid(m, m.victim), role: roleOfPid(m, m.victim) })
+note.textContent = m.victim || m.victimNick
+? t("werewolf.died", {
+nick: m.victimNick || nickOfPid(m, m.victim),
+role: roleName(m.victimRole) || roleOfPid(m, m.victim),
+})
 : m.dawnkind === "saved" ? t("werewolf.saved")
 : m.dawnkind === "nokill" ? t("werewolf.first_dawn")
 : t("werewolf.quiet_night");
@@ -4935,8 +4974,11 @@ onPick: function (pid) { send({ t: "accuse", n: pid }); },
 });
 } else { // dusk
 banner.textContent = t("werewolf.dusk");
-note.textContent = m.lynched
-? t("werewolf.voted_out", { nick: nickOfPid(m, m.lynched), role: roleOfPid(m, m.lynched) })
+note.textContent = m.lynched || m.lynchedNick
+? t("werewolf.voted_out", {
+nick: m.lynchedNick || nickOfPid(m, m.lynched),
+role: roleName(m.lynchedRole) || roleOfPid(m, m.lynched),
+})
 : t("werewolf.no_majority");
 renderList(m, {});
 }
@@ -4952,14 +4994,22 @@ box.innerHTML = "";
 (m.log || []).forEach(function (d) {
 var night = document.createElement("div");
 night.className = "ww-logrow";
-night.textContent = d.victim
-? t("werewolf.log_night_died", { n: d.day, nick: nickOfPid(m, d.victim), role: roleOfPid(m, d.victim) })
+night.textContent = d.victim || d.victimNick
+? t("werewolf.log_night_died", {
+n: d.day,
+nick: d.victimNick || nickOfPid(m, d.victim),
+role: roleName(d.victimRole) || roleOfPid(m, d.victim),
+})
 : t("werewolf.log_night_safe", { n: d.day });
 box.appendChild(night);
 var day = document.createElement("div");
 day.className = "ww-logrow day";
-day.textContent = d.lynched
-? t("werewolf.log_day_out", { n: d.day, nick: nickOfPid(m, d.lynched), role: roleOfPid(m, d.lynched) })
+day.textContent = d.lynched || d.lynchedNick
+? t("werewolf.log_day_out", {
+n: d.day,
+nick: d.lynchedNick || nickOfPid(m, d.lynched),
+role: roleName(d.lynchedRole) || roleOfPid(m, d.lynched),
+})
 : t("werewolf.log_day_none", { n: d.day });
 box.appendChild(day);
 });

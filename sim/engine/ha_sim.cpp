@@ -17,6 +17,7 @@ uint32_t millis() { return g_millis; }
 // chessTestLoad/chessTestPerft) so the sim can drive positions the normal opening
 // moves can't reach quickly (mate/stalemate/draw setups, perft ground truth).
 #define HA_CHESS_TEST
+#define HA_ENABLE_MIN_OVERRIDE 1
 #include "../../esp32/hotspot-arcade-fw/ha_games.h"
 
 static Engine engine;

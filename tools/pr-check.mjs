@@ -56,14 +56,29 @@ H(gamesEqual, "HA_GAME_* ids match in both ha_proto.h",
 // different OS. The decompressed HTML is what actually differs when the bundle is stale.
 let bundleOk = false, bundleDetail = "";
 try {
-  const committedHtml = gunzipSync(execSync("git show HEAD:web/dist/index.html.gz", { cwd: REPO })).toString();
+  const committedGz = execSync("git show HEAD:web/dist/index.html.gz", { cwd: REPO });
+  const committedHtml = gunzipSync(committedGz).toString();
+  const committedManifest = JSON.parse(
+    execSync("git show HEAD:web/dist/manifest.json", { cwd: REPO, encoding: "utf8" }));
+  const route = committedManifest.find((a) => a.path === "/");
+  const crc32 = (b) => {
+    let c = 0xffffffff;
+    for(let i = 0; i < b.length; i++) {
+      c ^= b[i];
+      for(let k = 0; k < 8; k++) c = c & 1 ? (c >>> 1) ^ 0xedb88320 : c >>> 1;
+    }
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const committedCrcOk = route && route.crc === crc32(committedGz);
   sh("node web/build.mjs"); // overwrites web/dist in the working tree
   const builtHtml = gunzipSync(readFileSync(REPO + "web/dist/index.html.gz")).toString();
-  const manifestStale = sh("git status --porcelain -- web/dist/manifest.json").length > 0;
-  bundleOk = committedHtml === builtHtml && !manifestStale;
+  // gzip bytes (and therefore their CRC) may differ across Node/zlib versions even
+  // when the served HTML is identical. Validate the committed manifest against the
+  // committed gzip, then compare regenerated *content* rather than a host-specific CRC.
+  bundleOk = committedHtml === builtHtml && committedCrcOk;
   bundleDetail = bundleOk ? "up to date"
     : committedHtml !== builtHtml ? "the built bundle differs from web/dist — run `node web/build.mjs` and commit"
-      : "web/dist/manifest.json is stale — run `node web/build.mjs` and commit";
+      : "web/dist/manifest.json crc does not describe the committed gzip — rebuild and commit both";
 } catch (e) {
   bundleDetail = "could not check the web bundle: " + e.message.split("\n")[0];
 }

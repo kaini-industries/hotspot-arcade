@@ -18,6 +18,7 @@
 #include "ha_proto.h"
 #include "ha_json.h"
 #include "ha_assets.h"
+#include "ha_adapter_config.h"
 #include "ha_games.h"
 
 #define WS_MSG_MAX 512
@@ -222,6 +223,10 @@ static bool identityKnown(const char* identity) {
 static void rememberIdentity(const char* identity) {
     if(identityKnown(identity) || knownIdentityCount >= 32) return;
     strlcpy(knownIdentities[knownIdentityCount++], identity, sizeof(knownIdentities[0]));
+}
+static void clearKnownIdentities() {
+    memset(knownIdentities, 0, sizeof(knownIdentities));
+    knownIdentityCount = 0;
 }
 uint8_t haAuthorizeIdentity(
     uint32_t wsId, const char* identity, const char* code, uint32_t* retryMs) {
@@ -432,7 +437,11 @@ static void stopPortal() {
         portalRunning = false;
     }
     leasesClear();
+    // Admission memory is session-scoped. A player known to the old party must
+    // present the next party's join code after a host stop/new-session cycle.
     ENGINE_LOCK();
+    clearKnownIdentities();
+    joinCode[0] = '\0';
     engine.reset();
     ENGINE_UNLOCK();
     uartStatus("stopped");
@@ -469,19 +478,6 @@ static void handleFileBegin(const uint8_t* p, size_t len) {
     uint32_t total = (uint32_t)p[i] | ((uint32_t)p[i + 1] << 8) | ((uint32_t)p[i + 2] << 16) |
                      ((uint32_t)p[i + 3] << 24);
     assets.begin(path, mime, flags & 1, total);
-}
-
-static bool parseJoinCodeExact(const char* json, char out[7]) {
-    const char* value = ha_json_find(json, "code");
-    if(!value || *value != '"') return false;
-    value++;
-    for(int i = 0; i < 6; i++) {
-        if(value[i] < '0' || value[i] > '9') return false;
-        out[i] = value[i];
-    }
-    if(value[6] != '"') return false;
-    out[6] = '\0';
-    return true;
 }
 
 static void dispatchFrame() {
@@ -561,7 +557,7 @@ static void dispatchFrame() {
         }
         const char* codeValue = ha_json_find(configJson, "code");
         char code[7];
-        if(codeValue && !parseJoinCodeExact(configJson, code)) {
+        if(codeValue && !haParseJoinCodeExact(configJson, code)) {
             uartStatus("config_error");
             break;
         }
@@ -569,12 +565,14 @@ static void dispatchFrame() {
         if(ha_json_int(configJson, "max", &v) && v >= 1 && v <= HA_MAX_PLAYERS)
             apMaxConn = (uint8_t)v;
         char lang[8];
-        if(ha_json_str(configJson, "lang", lang, sizeof(lang))) {
-            ENGINE_LOCK();
-            engine.setLang(lang);
-            ENGINE_UNLOCK();
-        }
+        bool hasLang = ha_json_str(configJson, "lang", lang, sizeof(lang));
+        // The async WebSocket path reads admission state only while holding the
+        // engine mutex. Update the code and locale in that same synchronization
+        // domain so a hello cannot race a partial CONFIG transition.
+        ENGINE_LOCK();
+        if(hasLang) engine.setLang(lang);
         if(codeValue) strlcpy(joinCode, code, sizeof(joinCode));
+        ENGINE_UNLOCK();
         break;
     }
     case HA_MSG_RESET_SCORES:

@@ -100,6 +100,38 @@ async function toNight(n) {
   return g;
 }
 
+// Hello-side exact-boundary expiry must scrub top-level hidden-role references
+// before the numeric pid is handed to a different identity. Use the seer because
+// it owns both a private role and the engine's global seer/reading fields.
+{
+  const e = await newEngine();
+  e.reset();
+  for(let pid = 1; pid <= 6; pid++) e.join(pid, "P" + pid);
+  e.selectGame(WW);
+  for(let pid = 1; pid <= 6; pid++) e.input(pid, { t: "ready", ready: true });
+  let dealt = [];
+  for(let ms = 1000; ms <= 3000; ms += 1000) dealt = dealt.concat(e.tick(ms));
+  const seer = [1, 2, 3, 4, 5, 6].find(
+    (pid) => lastToWs(dealt, pid, "werewolf").msg.myrole === SEER);
+  assert.ok(seer, "six-player deal includes a seer");
+  e.disconnect(seer);
+  const reused = e.inputAt(90, {
+    t: "hello", proto: 2, nick: "NEWCOMER", avatar: "🙂",
+    resume: "91919191919191919191919191919191", code: "123456",
+  }, 123000);
+  const welcome = lastToWs(reused, 90, "welcome");
+  assert.equal(welcome.msg.resumed, false);
+  assert.equal(welcome.msg.pid, seer, "hello reuses only the fully scrubbed expired pid");
+  const fresh = lastToWs(reused, 90, "werewolf").msg;
+  assert.ok(fresh.myrole === undefined || fresh.myrole === 0,
+    "a fresh identity receives no inherited hidden role");
+  assert.equal(fresh.check, undefined, "a fresh identity receives no seer reading");
+  assert.equal(fresh.myguard, undefined, "a fresh identity receives no doctor authority");
+  assert.equal(fresh.packvotes, undefined, "a fresh identity receives no wolf authority");
+  assert.deepEqual(e.input(90, { t: "see", n: 1 }), [],
+    "the fresh identity cannot act as the departed seer");
+}
+
 // ---------------------------------------------------------------------------
 // 1. Eight players: the deal, secrecy, a fixed-length night, a live pack tally,
 //    a tied day that hangs nobody, the doctor's no-repeat rule, a village win
@@ -268,6 +300,31 @@ async function toNight(n) {
     assert.equal(row.score, want, `pid ${row.pid} scored ${row.score}, expected ${want}`);
   }
   assert.ok(survivors.length >= 1, "somebody survived to score");
+}
+
+// A public dawn record survives expiry and same-call pid reuse. The numeric pid is
+// deliberately scrubbed, while immutable name/role snapshots keep the announcement
+// attributable to the player who was actually dealt into this game.
+{
+  const g = await toNight(7);
+  const wolves = g.of(WOLF);
+  const prey = g.living().find((p) => g.role[p] !== WOLF);
+  for (const wolf of wolves) g.send(wolf, { t: "kill", n: prey });
+  g.tick(g.view[1].deadline);
+  assert.equal(g.stage(), "dawn");
+  const originalNick = NICKS[prey - 1];
+  const originalRole = g.role[prey];
+  g.e.disconnect(prey);
+  const out = g.e.inputAt(90, {
+    t: "hello", proto: 2, nick: "NEWCOMER", avatar: "🙂",
+    resume: "93939393939393939393939393939393", code: "123456",
+  }, g.ms + 120000);
+  const survivor = g.pids().find((p) => p !== prey);
+  const m = lastToWs(out, survivor, "werewolf").msg;
+  assert.equal(m.stage, "dawn");
+  assert.equal(m.victim, 0, "the recycled numeric pid is not retained as attribution");
+  assert.equal(m.victimNick, originalNick, "the dawn keeps the departed player's name");
+  assert.equal(m.victimRole, originalRole, "the dawn keeps the departed player's role");
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +518,9 @@ for (const N of [4, 5, 6, 8]) {
   assert.equal(g.view[1].phase, "countdown", "and the fifth ready re-arms it");
   for (let ms = 1000; ms <= 4000; ms += 1000) g.tick(ms);
   assert.equal(g.view[1].phase, "play", "the re-armed countdown reaches play");
+  const reserved = g.view[1].players.find((p) => p.pid === 5);
+  assert.equal(reserved.in, false, "the grace-reserved offline seat is not dealt in");
+  assert.equal(reserved.role, undefined, "the offline seat receives no secret role");
 }
 
 // A fifth player arriving completes the quorum without anyone re-readying.

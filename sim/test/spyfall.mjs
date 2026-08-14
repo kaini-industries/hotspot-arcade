@@ -221,6 +221,25 @@ function toNominations(g) {
   for (const p of others) gain[p] = 1;
   v = checkReveal(g, spy, loc, "caught", gain);
   assert.equal(v[others[1]].misses.length, 2, "the two earlier misses are still on record");
+
+  // Expire and immediately reuse a participant's pid during the reveal. Public miss,
+  // blame and role attribution must remain tied to the original dealt identity.
+  const departed = others[0];
+  g.e.disconnect(departed);
+  const reused = g.e.inputAt(90, {
+    t: "hello", proto: 2, nick: "NEWCOMER", avatar: "🙂",
+    resume: "94949494949494949494949494949494", code: "123456",
+  }, g.t + 120000);
+  const survivor = g.pids.find((p) => p !== departed);
+  const stable = lastToWs(reused, survivor, "spyfall").msg;
+  assert.equal(stable.stage, "reveal");
+  assert.equal(stable.spyNick, "P" + spy, "the original spy name survives pid reuse");
+  assert.equal(stable.roles.length, g.pids.length, "the dealt reveal roster is immutable");
+  assert.ok(stable.roles.some((r) => r.pid === departed && r.nick === "P" + departed),
+    "the departed player's original role row survives");
+  assert.equal(stable.misses.length, 2, "failed accusations remain visible after expiry");
+  assert.ok(stable.misses.some((x) => x.by === "P" + departed || x.of === "P" + departed),
+    "miss attribution uses immutable names rather than the recycled pid");
 }
 
 // ---- 3: the spy calls the location, correctly --------------------------------------
@@ -254,6 +273,7 @@ function toNominations(g) {
 {
   const g = await table(4); // need = 3 agreements, so a lone ally is not enough
   const { spy, others, loc } = g.readCards();
+  let firstReveal;
   let v = toNominations(g);
   const first = v[g.pids[0]].nominator;
   assert.equal(first, g.pids[0], "the round-robin starts at the first seat");
@@ -291,14 +311,25 @@ function toNominations(g) {
     const gain = {};
     gain[spy] = 1;
     const rv = checkReveal(g, spy, loc, "escaped", gain);
+    firstReveal = rv;
     assert.equal(rv[spy].blamedNick, "P" + others[0], "the reveal names who was condemned");
   } else {
     for (const p of g.pids.filter((x) => x !== second)) g.in(p, { t: "agree", in: true });
     const gain = {};
     for (const p of others) gain[p] = 1;
     const rv = checkReveal(g, spy, loc, "caught", gain);
+    firstReveal = rv;
     assert.equal(rv[spy].blamedNick, "P" + spy, "the reveal names who was condemned");
   }
+
+  // The next round ends by location solve, which has no blamed player. A condemned
+  // name from the previous round must not bleed into this reveal.
+  g.tickTo(firstReveal[spy].deadline);
+  const round2 = g.readCards();
+  const solve = g.views()[round2.spy].locs.indexOf(round2.loc);
+  g.in(round2.spy, { t: "solve", loc: solve });
+  for (const p of g.pids)
+    assert.equal(g.views()[p].blamedNick, undefined, "blame is scoped to one round");
 }
 
 // ---- 6: everyone nominates in vain -> the spy wins outright ------------------------
@@ -365,6 +396,24 @@ function toNominations(g) {
   assert.equal(lastToWs(out, 1, "spyfall").msg.need, 3, "the lobby advertises the quorum");
 }
 {
+  const e = await newEngine();
+  e.reset();
+  for (const p of [1, 2, 3, 4]) e.join(p, "P" + p);
+  e.selectGame(SF);
+  e.contentClear(); e.contentPack(SF, "Test");
+  for (const it of ITEMS) e.contentItem(it);
+  e.disconnect(1);
+  for (const p of [2, 3]) e.input(p, { t: "ready", ready: true });
+  let out = e.input(4, { t: "ready", ready: true });
+  for (let ms = 1000; ms <= 3000; ms += 1000) out = out.concat(e.tick(ms));
+  let views = [2, 3, 4].map((p) => lastToWs(out, p, "spyfall").msg);
+  assert.equal(views.filter((m) => m.spy).length, 1, "one online player is the spy");
+  assert.equal(views[0].total, 3, "the offline reserved seat is not dealt into the round");
+  for (const p of [2, 3, 4]) out = out.concat(e.input(p, { t: "seen" }));
+  views = [2, 3, 4].map((p) => lastToWs(out, p, "spyfall").msg);
+  assert.ok(!views[0].cands.some((p) => p.pid === 1), "the offline seat is not accusable");
+}
+{
   const g = await table(3);
   const { spy, others } = g.readCards();
   g.out = g.e.disconnect(spy);
@@ -375,6 +424,11 @@ function toNominations(g) {
     const m = lastToWs(g.out, p, "spyfall");
     assert.equal(m.msg.stage, "reveal", "the round ends when the spy walks out");
     assert.equal(m.msg.outcome, "aborted", "an abandoned round has no result");
+    assert.equal(m.msg.spyPid, spy, "the abort still identifies the originally dealt spy");
+    assert.equal(m.msg.spyNick, "P" + spy, "the abort keeps the spy's immutable name");
+    assert.equal(m.msg.roles.length, g.pids.length, "the abort reveals the full dealt roster");
+    assert.ok(m.msg.roles.some((r) => r.pid === spy && r.nick === "P" + spy && r.spy),
+      "the expired spy remains correctly attributed in the reveal");
     assert.equal(m.msg.mygain, 0, "nobody scores off an abandoned round");
     for (const row of m.msg.scores) assert.equal(row.score, 0, "no score moved");
   }
@@ -390,10 +444,16 @@ function toNominations(g) {
   const dropPid = others[others.length - 1]; // a non-spy leaves mid-round
   const out = [
     ...g.e.disconnect(dropPid),
-    ...g.e.tick(g.t + 120000), // only expiry frees the stable pid
-    ...g.e.join(90, "NEWCOMER"), // a fresh device, handed the vacated pid
-    ...g.e.tick(g.t + 120050),
+    // No intervening tick: the hello itself must finalize and scrub the expired
+    // seat before handing that numeric pid to a different identity.
+    ...g.e.inputAt(90, {
+      t: "hello", proto: 2, nick: "NEWCOMER", avatar: "🙂",
+      resume: "90909090909090909090909090909090", code: "123456",
+    }, g.t + 120000),
   ];
+  const welcome = lastToWs(out, 90, "welcome");
+  assert.equal(welcome.msg.resumed, false);
+  assert.equal(welcome.msg.pid, dropPid, "hello reuses only the fully scrubbed expired pid");
   const m = lastToWs(out, 90, "spyfall");
   assert.ok(m, "the newcomer receives a spyfall payload");
   assert.notEqual(m.msg.stage, "reveal",

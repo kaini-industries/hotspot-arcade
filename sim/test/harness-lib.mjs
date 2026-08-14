@@ -89,3 +89,14 @@ export function lastToWs(items, wsId, type) {
     .filter((o) => o.to === "ws" && o.id === wsId && o.msg && o.msg.t === type)
     .pop();
 }
+
+/** Challenge id allocated in a lobby push, optionally narrowed to its recipient. */
+export function challengeId(items, to = undefined) {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const cs = items[i]?.msg?.challenges;
+    if (!Array.isArray(cs)) continue;
+    const c = [...cs].reverse().find((x) => to === undefined || x.to === to);
+    if (c) return c.id;
+  }
+  return undefined;
+}

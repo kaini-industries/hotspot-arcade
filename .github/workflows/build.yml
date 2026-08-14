@@ -44,6 +44,9 @@ jobs:
           elif [ -f package.json ]; then
             npm install
           fi
+      - name: Test browser protocol
+        working-directory: web
+        run: npm test
       - name: Build web bundle
         working-directory: web
         run: node build.mjs
@@ -211,29 +214,27 @@ jobs:
           fi
 
   simulator:
-    # Compile-only guard for the local simulator (sim/), which builds the REAL game
-    # engine to WebAssembly. sim/engine/Arduino.h implements exactly the Arduino
-    # surface ha_games.h uses TODAY; the first time the firmware gains a String
-    # method or an ESP-IDF call, the simulator stops building. Without this job that
-    # failure is silent until someone next tries to run it, possibly months later.
-    # Compiling is the guard — the headless tests deliberately aren't run here.
-    name: Simulator engine compiles
+    # Build and execute the REAL game engine under both its normal WebAssembly
+    # configuration and ASan/UBSan. Protocol/session changes are not protected by
+    # compile-only CI: the browser and all headless game regressions must run.
+    name: Simulator engine tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # 'latest' rather than a pin on purpose: the question this job answers is
-      # "does the engine still build with a current toolchain", and the emcc flags
-      # used (MODULARIZE / EXPORT_ES6 / EXPORTED_FUNCTIONS) have been stable for
-      # years. If a future emscripten release breaks the build, that is a real
-      # finding, not noise to be pinned away.
       - uses: mymindstorm/setup-emsdk@v14
         with:
-          version: latest
+          version: 6.0.6
           actions-cache-folder: emsdk-cache
 
-      - name: Build the WASM engine
-        run: sim/engine/build.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.19.0"
+
+      - name: Build and test the WASM engine
+        run: |
+          sim/engine/build.sh
+          sim/test/all.sh
 
       - name: Confirm the build produced a loadable module
         # A zero-byte or missing artifact would otherwise pass as "compiled".
@@ -245,3 +246,8 @@ jobs:
             fi
           done
           ls -l sim/web/engine.js sim/web/engine.wasm
+
+      - name: Run ASan and UBSan engine tests
+        run: |
+          sim/engine/build.sh --asan
+          sim/test/all.sh
