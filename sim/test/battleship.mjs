@@ -4,7 +4,7 @@
 // leave, rematch, and -- most importantly -- that a player's view never exposes an
 // un-hit enemy ship cell (hidden information). Drives the real engine headless.
 import assert from "node:assert/strict";
-import { newEngine, lastToWs } from "./harness-lib.mjs";
+import { newEngine, lastToWs, challengeId } from "./harness-lib.mjs";
 
 const BS = 12;
 // All five ships laid out horizontally, one per row (fixed ship order 5,4,3,3,2).
@@ -19,8 +19,8 @@ e.join(2, "BOB");
 e.selectGame(BS);
 
 // challenge -> accept -> placement
-e.input(1, { t: "challenge", to: 2 });
-let out = e.input(2, { t: "accept", from: 1 });
+const challenged = e.input(1, { t: "challenge", to: 2 });
+let out = e.input(2, { t: "accept", id: challengeId(challenged, 2) });
 assert.equal(lastToWs(out, 1, "bs").msg.phase, "place", "match starts in placement");
 
 // invalid layout (ships 0 and 1 overlap at row 0) is rejected: no state push

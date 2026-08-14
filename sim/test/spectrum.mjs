@@ -57,4 +57,50 @@ assert.ok(Array.isArray(rev.msg.guesses) && rev.msg.guesses.length === 2, "revea
 const near = rev.msg.guesses.find((x) => x.g === target);
 assert.ok(near && near.pts >= 4, "an exact guess earns the bullseye (got " + (near && near.pts) + ")");
 
+// Exact-boundary pid reuse during the hidden clue stage cannot transfer the
+// psychic marker, target, or clue authority to a fresh identity.
+{
+  const g = await newEngine();
+  g.reset();
+  for (const pid of [1, 2, 3]) g.join(pid, "P" + pid);
+  g.selectGame(SP);
+  g.contentClear(); g.contentPack(SP, "Test");
+  g.contentItem(JSON.stringify({ left: "Cold", right: "Hot" }));
+  for (const pid of [1, 2, 3]) g.input(pid, { t: "ready", ready: true });
+  let hidden = [];
+  for (let ms = 1000; ms <= 4000; ms += 1000) hidden = hidden.concat(g.tick(ms));
+  const oldPsychic = [1, 2, 3].find((pid) => lastToWs(hidden, pid, "spectrum").msg.iam);
+  g.disconnect(oldPsychic);
+  const reused = g.inputAt(99, {
+    t: "hello", proto: 2, nick: "NEW PLAYER", avatar: "🙂",
+    resume: "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd", code: "123456",
+  }, 124000);
+  assert.equal(lastToWs(reused, 99, "welcome").msg.resumed, false);
+  const state = lastToWs(reused, 99, "spectrum").msg;
+  assert.equal(state.iam, false, "a recycled pid does not inherit psychic authority");
+  assert.equal(state.target, undefined, "a recycled pid does not receive the hidden target");
+  assert.equal(state.stage, "guess", "expiry advances an abandoned clue stage safely");
+  assert.deepEqual(g.input(99, { t: "clue", text: "stolen" }), [],
+    "the fresh identity cannot submit the departed psychic's clue");
+}
+
+// A detached player keeps a reserved engine seat during grace, but cannot be
+// assigned the round-critical psychic role after the online quorum starts.
+const offline = await newEngine();
+offline.reset();
+offline.join(1, "OFFLINE");
+offline.join(2, "ONLINE-A");
+offline.join(3, "ONLINE-B");
+offline.contentClear();
+offline.contentPack(SP, "Test");
+offline.contentItem(JSON.stringify({ left: "Cold", right: "Hot" }));
+offline.selectGame(SP);
+offline.disconnect(1);
+offline.input(2, { t: "ready", ready: true });
+let onlineOut = offline.input(3, { t: "ready", ready: true });
+for (let ms = 1000; ms <= 4000; ms += 1000) onlineOut = onlineOut.concat(offline.tick(ms));
+const onlineStates = [2, 3].map((pid) => lastToWs(onlineOut, pid, "spectrum").msg);
+assert.equal(onlineStates.filter((m) => m.iam).length, 1, "exactly one online player is psychic");
+assert.notEqual(onlineStates[0].psychic, "OFFLINE", "reserved offline seat cannot deadlock the round");
+
 console.log("spectrum: all checks passed");

@@ -2,6 +2,7 @@
 #include "ha_storage.h"
 #include "../hotspot_arcade_i.h"
 #include "../ha_json.h"
+#include "ha_roster.h"
 
 // Everything here runs on the GUI thread (RX drained from the global custom event
 // handler), so app state is single-threaded: no locking needed.
@@ -46,46 +47,18 @@ int ha_player_count(HotspotArcadeApp* app) {
     return n;
 }
 
-static int player_find(HotspotArcadeApp* app, uint8_t pid) {
-    for(int i = 0; i < HA_MAX_PLAYERS; i++)
-        if(app->players[i].used && app->players[i].pid == pid) return i;
-    return -1;
-}
-
-// Nicknames are shown uppercase everywhere. The ESP already uppercases on hello,
-// but a board running older firmware doesn't, and the roster is on every screen
-// here. ASCII only, so UTF-8 nicknames pass through untouched.
-static void nick_upper(char* s) {
-    for(; s && *s; s++)
-        if(*s >= 'a' && *s <= 'z') *s -= 32;
-}
-
-static void player_join(HotspotArcadeApp* app, uint8_t pid, const char* nick) {
-    int idx = player_find(app, pid);
-    if(idx < 0) {
-        for(int i = 0; i < HA_MAX_PLAYERS; i++) {
-            if(!app->players[i].used) {
-                idx = i;
-                break;
-            }
-        }
-    }
-    if(idx < 0) return;
-    HaPlayer* p = &app->players[idx];
-    p->used = true;
-    p->pid = pid;
-    strlcpy(p->nick, (nick && nick[0]) ? nick : "PLAYER", HA_NICK_LEN);
-    nick_upper(p->nick);
-    p->score = 0;
+static bool player_join(HotspotArcadeApp* app, uint8_t pid, const char* nick) {
+    bool fresh = haRosterFind(app->players, pid) < 0;
+    return haRosterUpsert(app->players, pid, nick) && fresh;
 }
 
 static void player_leave(HotspotArcadeApp* app, uint8_t pid) {
-    int idx = player_find(app, pid);
+    int idx = haRosterFind(app->players, pid);
     if(idx >= 0) app->players[idx].used = false;
 }
 
 static void player_score(HotspotArcadeApp* app, uint8_t pid, int delta) {
-    int idx = player_find(app, pid);
+    int idx = haRosterFind(app->players, pid);
     if(idx >= 0) app->players[idx].score += delta;
 }
 
@@ -547,13 +520,18 @@ static void dispatch_frame(HotspotArcadeApp* app) {
             size_t nl = len - 1 < HA_NICK_LEN - 1 ? (size_t)(len - 1) : HA_NICK_LEN - 1;
             memcpy(nick, p + 1, nl);
             nick[nl] = '\0';
-            nick_upper(nick);
-            player_join(app, p[0], nick);
-            FuriString* c = furi_string_alloc();
-            furi_string_printf(c, "JOIN %s", nick);
-            console_add(app, furi_string_get_cstr(c));
-            furi_string_free(c);
-            feedback_blip(app);
+            // Stable JOIN is an idempotent upsert. Only a genuinely new seat is
+            // a host-visible arrival; resume/takeover/profile updates must not
+            // spam the console or vibration cue on a flaky connection.
+            if(player_join(app, p[0], nick)) {
+                int idx = haRosterFind(app->players, p[0]);
+                const char* shown = idx >= 0 ? app->players[idx].nick : nick;
+                FuriString* c = furi_string_alloc();
+                furi_string_printf(c, "JOIN %s", shown);
+                console_add(app, furi_string_get_cstr(c));
+                furi_string_free(c);
+                feedback_blip(app);
+            }
         }
         break;
     case HA_MSG_LEAVE:

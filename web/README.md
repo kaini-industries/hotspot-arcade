@@ -73,9 +73,11 @@ rules. Set `PORT` to change the port: `PORT=8091 npm run mock`.
 ## Protocol
 
 One flat JSON object per message, specified per game in `docs/PROTOCOL.md`
-(client intents like `hello`/`challenge`/`move`, server state like `welcome`/
-`lobby`/per-game payloads). The ESP is authoritative; the client sends intents
-and renders server state. The trivia countdown is cosmetic: the client learns the server
+(client intents like protocol-v2 `hello`/`challenge`/`move`, server state like `welcome`/
+`reject`/`lobby`/per-game payloads). The browser generates and stores a cryptographically
+random 128-bit resume credential; the raw value is sent only in `hello`, while the engine
+and host retain only its SHA-256-derived identity. The ESP is authoritative; the client
+sends intents and renders server state. The trivia countdown is cosmetic: the client learns the server
 clock offset from the first timed message (`deadline` is a server `millis()`
 value) and animates a bar toward the deadline. The server is the real referee.
 

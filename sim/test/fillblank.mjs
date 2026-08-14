@@ -245,4 +245,39 @@ const czarOf = (out) => [1, 2, 3].find((p) => lastToWs(out, p, "fillblank").msg.
 
 await twoPlayersPlay();
 
+// A grace-reserved offline seat cannot become the next Czar or be dealt into the round.
+{
+  const e = await newEngine();
+  e.reset();
+  e.join(1, "OFFLINE"); e.join(2, "ONLINE-A"); e.join(3, "ONLINE-B");
+  e.selectGame(FB);
+  e.contentClear(); e.contentPack(FB, "Test");
+  for (const p of PROMPTS) e.contentItem(JSON.stringify({ p }));
+  for (let i = 0; i < 30; i++) e.contentItem(JSON.stringify({ a: "answer-" + i }));
+  e.disconnect(1);
+  e.input(2, { t: "ready", ready: true });
+  let out = e.input(3, { t: "ready", ready: true });
+  for (let ms = 1000; ms <= 6000; ms += 1000) out = out.concat(e.tick(ms));
+  const states = [2, 3].map((pid) => lastToWs(out, pid, "fillblank").msg);
+  assert.equal(states.filter((m) => m.iam).length, 1, "exactly one online player is Czar");
+  assert.notEqual(states[0].czar, "OFFLINE", "offline seat cannot become Czar");
+}
+
+// A fresh identity reusing an expired Czar's pid cannot judge the old round.
+{
+  const { e, out: started } = await startGame();
+  const czar = czarOf(started);
+  e.disconnect(czar);
+  const out = e.inputAt(99, {
+    t: "hello", proto: 2, nick: "NEW PLAYER", avatar: "🙂",
+    resume: "abababababababababababababababab", code: "123456",
+  }, 126000);
+  assert.equal(lastToWs(out, 99, "welcome").msg.resumed, false);
+  const state = lastToWs(out, 99, "fillblank").msg;
+  assert.equal(state.iam, false, "a recycled pid does not inherit Czar authority");
+  assert.equal(state.stage, "reveal", "an expired Czar ends the abandoned round");
+  assert.deepEqual(e.input(99, { t: "pick", i: 0 }), [],
+    "the fresh identity cannot judge as the departed Czar");
+}
+
 console.log("fillblank: all checks passed");

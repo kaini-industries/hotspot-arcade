@@ -64,4 +64,52 @@ const partial = rev.msg.guesses.find((x) => x.pts === 1);
 assert.ok(exact, "the exact guess scores the full 3");
 assert.ok(partial, "the one-position guess scores 1");
 
+// Exact-boundary pid reuse during the hidden choose stage cannot transfer the
+// chooser marker, answer, or assignment authority to a fresh identity.
+{
+  const g = await newEngine();
+  g.reset();
+  for (const pid of [1, 2, 3]) g.join(pid, "P" + pid);
+  g.selectGame(KMK);
+  g.contentClear(); g.contentPack(KMK, "Test");
+  for (const n of ["A", "B", "C", "D"])
+    g.contentItem(JSON.stringify({ name: n }));
+  for (const pid of [1, 2, 3]) g.input(pid, { t: "ready", ready: true });
+  let hidden = [];
+  for (let ms = 1000; ms <= 4000; ms += 1000) hidden = hidden.concat(g.tick(ms));
+  const oldChooser = [1, 2, 3].find((pid) => lastToWs(hidden, pid, "kmk").msg.iam);
+  g.disconnect(oldChooser);
+  const reused = g.inputAt(99, {
+    t: "hello", proto: 2, nick: "NEW PLAYER", avatar: "🙂",
+    resume: "edededededededededededededededed", code: "123456",
+  }, 124000);
+  assert.equal(lastToWs(reused, 99, "welcome").msg.resumed, false);
+  const state = lastToWs(reused, 99, "kmk").msg;
+  assert.equal(state.iam, false, "a recycled pid does not inherit chooser authority");
+  assert.equal(state.answer, undefined, "a recycled pid does not receive the hidden answer");
+  assert.equal(state.stage, "guess", "expiry advances an abandoned choose stage safely");
+  assert.deepEqual(g.input(99, { t: "assign", kiss: 0, marry: 1, kill: 2 }), [],
+    "the fresh identity cannot assign as the departed chooser");
+}
+
+// A grace-reserved offline seat also cannot be selected for a new round-critical role.
+const offline = await newEngine();
+offline.reset();
+offline.join(1, "OFFLINE");
+offline.join(2, "ONLINE-A");
+offline.join(3, "ONLINE-B");
+offline.selectGame(KMK);
+offline.contentClear();
+offline.contentPack(KMK, "Test");
+for (const n of ["A", "B", "C", "D"]) offline.contentItem(JSON.stringify({ name: n }));
+offline.disconnect(1);
+offline.input(2, { t: "ready", ready: true });
+let onlineOut = offline.input(3, { t: "ready", ready: true });
+for (let ms = 1000; ms <= 4000; ms += 1000) onlineOut = onlineOut.concat(offline.tick(ms));
+const onlineStates = [2, 3].map((pid) => lastToWs(onlineOut, pid, "kmk").msg);
+assert.equal(onlineStates.filter((m) => m.iam).length, 1,
+  "exactly one online player is chooser");
+assert.notEqual(onlineStates[0].chooser, "OFFLINE",
+  "reserved offline seat cannot deadlock the round");
+
 console.log("kmk: all checks passed");

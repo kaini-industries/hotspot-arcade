@@ -47,7 +47,10 @@ const drainRaw = () => JSON.parse(M.ccall("ha_drain", "string", [], []));
 
 function routeNow(items) {
   for (const it of items) {
-    if (it.to === "ws") deliver(it.id, JSON.stringify(it.msg));
+    if (it.to === "ws" && it.kind === "close") {
+      const sock = getSocket(it.id);
+      if (sock) sock.close(it.code, it.reason);
+    } else if (it.to === "ws") deliver(it.id, JSON.stringify(it.msg));
     else if (it.to === "all") broadcast(JSON.stringify(it.msg));
     else if (it.to === "uart") uartSubscribers.forEach((fn) => fn(it));
   }

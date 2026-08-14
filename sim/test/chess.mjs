@@ -11,7 +11,7 @@
 // read 0 when chessStart() stamps lastStamp, which is harmless for correctness but
 // would make every subsequent clock computation start from a zero baseline.
 import assert from "node:assert/strict";
-import { newEngine, lastToWs } from "./harness-lib.mjs";
+import { newEngine, lastToWs, challengeId } from "./harness-lib.mjs";
 
 const CHESS = 15; // HA_GAME_CHESS in ha_proto.h
 
@@ -40,9 +40,9 @@ function startGame() {
   e.selectGame(CHESS);
   e.join(1, "ALICE");
   e.join(2, "BOB");
-  e.input(1, { t: "challenge", to: 2 });
+  const challenged = e.input(1, { t: "challenge", to: 2 });
   e.tick(1000);
-  return e.input(2, { t: "accept", from: 1 });
+  return e.input(2, { t: "accept", id: challengeId(challenged, 2) });
 }
 
 function mv(pid, from, to, promo) {
@@ -406,11 +406,14 @@ function mv(pid, from, to, promo) {
   assert.equal(score.reason, "chesswin");
 }
 
-// ---- 16. Disconnect forfeit ----------------------------------------------------------------
+// ---- 16. Disconnect grace, then forfeit -----------------------------------------------------
 {
   startGame();
-  const out = e.disconnect(1);
-  const b = lastToWs(out, 2, "chess");
+  let out = e.disconnect(1);
+  let b = lastToWs(out, 2, "chess");
+  assert.equal(b.msg.phase, "playing", "the match seat is reserved during reconnect grace");
+  out = e.tick(121000); // startGame advanced raw millis to 1,000 before disconnect
+  b = lastToWs(out, 2, "chess");
   assert.equal(b.msg.phase, "over");
   assert.equal(b.msg.reason, "left");
   assert.equal(b.msg.result, "win");

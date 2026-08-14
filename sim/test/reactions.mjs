@@ -6,7 +6,7 @@
 // assertions below would fail — which is the point of testing it here rather than
 // with three phones and a dev board.
 import assert from "node:assert/strict";
-import { newEngine } from "./harness-lib.mjs";
+import { newEngine, challengeId } from "./harness-lib.mjs";
 
 const HA_GAME_CONNECT4 = 2;
 
@@ -28,8 +28,8 @@ e.join(2, "bo");
 e.join(3, "cy");
 
 // 1 and 2 pair off; 3 stays in the lobby.
-e.input(1, { t: "challenge", to: 2 });
-e.input(2, { t: "accept", from: 1 });
+const challenged = e.input(1, { t: "challenge", to: 2 });
+e.input(2, { t: "accept", id: challengeId(challenged, 2) });
 
 // --- a reaction from inside the match ---------------------------------------
 const fromMatch = e.input(1, { t: "react", emoji: "🔥" });

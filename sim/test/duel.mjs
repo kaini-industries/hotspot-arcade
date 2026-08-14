@@ -6,7 +6,7 @@
 //   - A move's column is keyed "n" (`ha_json_int(json, "n", &v)` -> duelMove(pid, v)),
 //     not "c".
 import assert from "node:assert/strict";
-import { newEngine, lastToWs } from "./harness-lib.mjs";
+import { newEngine, lastToWs, challengeId } from "./harness-lib.mjs";
 
 const HA_GAME_C4 = 2; // HA_GAME_CONNECT4 in ha_proto.h
 
@@ -30,7 +30,7 @@ assert.ok(
   "the toast names the challenger",
 );
 
-e.input(2, { t: "accept", from: 1 });
+e.input(2, { t: "accept", id: challengeId(challenged, 2) });
 
 // Vertical four in column 0 for player 1, player 2 answering in column 1.
 let out = [];

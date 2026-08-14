@@ -26,13 +26,13 @@ export function makeSocket(wsId, onSend, onTeardown) {
       if (typeof data === "string" && new TextEncoder().encode(data).length >= WS_MSG_MAX) return;
       onSend(wsId, data);
     },
-    close() {
+    close(code, reason) {
       if (closed) return; // already torn down (e.g. the harness got here first) — no-op
       closed = true;
       sock.readyState = 3;
       sockets.delete(wsId);
       if (onTeardown) onTeardown(wsId);
-      if (sock.onclose) sock.onclose({});
+      if (sock.onclose) sock.onclose({ code: code || 1000, reason: reason || "" });
     },
   };
   sockets.set(wsId, sock);

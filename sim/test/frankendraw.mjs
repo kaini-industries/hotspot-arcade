@@ -220,6 +220,61 @@ const lob = view(out, 1);
 assert.equal(lob.phase, "lobby", "two ready players do not start a game");
 assert.equal(lob.need, 3);
 
+// A reserved offline seat is not captured into a new game's rotation.
+{
+  const g = await newEngine();
+  g.reset();
+  for (const pid of [1, 2, 3, 4]) g.join(pid, "P" + pid);
+  g.selectGame(FD);
+  g.disconnect(1);
+  g.input(2, { t: "ready", ready: true });
+  g.input(3, { t: "ready", ready: true });
+  let o = g.input(4, { t: "ready", ready: true });
+  for (let ms = 1000; ms <= 4000; ms += 1000) o = o.concat(g.tick(ms));
+  const sheets = [2, 3, 4].map((pid) => view(o, pid).sheet).sort();
+  assert.deepEqual(sheets, [0, 1, 2], "only online seats enter the three-sheet rotation");
+}
+
+// Exact-boundary expiry vacates an active drawing seat before its pid is reused.
+// The new identity waits for the next game and cannot inherit the old sheet,
+// strokes, contributor credit, thumbs, or finale score.
+{
+  const g = await start({ 1: "OLD ARTIST", 2: "P2", 3: "P3" });
+  const oldSheet = view(g.out, 1).sheet;
+  const y = (view(g.out, 1).top + 2) / view(g.out, 1).unit;
+  g.e.input(1, { t: "stroke", x0: 0.2, y0: y, x1: 0.3, y1: y });
+  g.e.disconnect(1);
+  let o = g.e.inputAt(99, {
+    t: "hello", proto: 2, nick: "NEW ARTIST", avatar: "🙂",
+    resume: "fafafafafafafafafafafafafafafafa", code: "123456",
+  }, 124000);
+  assert.equal(lastToWs(o, 99, "welcome").msg.resumed, false);
+  const fresh = view(o, 99);
+  assert.equal(fresh.wait, true, "the fresh identity has no inherited drawing seat");
+  assert.equal(fresh.panel, -1);
+  assert.equal(fresh.sheet, undefined, "the departed artist's sheet stays private");
+  assert.deepEqual(g.e.input(99, { t: "done" }), [],
+    "the fresh identity cannot advance the departed seat");
+
+  // Finish the remaining panels with the two surviving seats, then make the
+  // departed artist's original sheet score positively in the gallery.
+  for (let panel = 0; panel < 3; panel++) {
+    g.e.input(2, { t: "done" });
+    o = g.e.input(3, { t: "done" });
+  }
+  assert.equal(view(o, 99).phase, "show");
+  while (view(o, 99).n !== oldSheet) {
+    const deadline = view(o, 99).deadline;
+    o = g.e.tick(deadline);
+  }
+  o = g.e.input(99, { t: "thumb", sheet: oldSheet, v: 1 });
+  for (let i = 0; i < 3; i++) o = o.concat(g.e.tick(view(o, 99).deadline));
+  const inheritedAwards = o.filter((item) =>
+    item.to === "uart" && item.kind === "score" && item.pid === 1 && item.reason === "frankendraw");
+  assert.equal(inheritedAwards.length, 0,
+    "the reused pid receives no finale credit for the departed artist's panel");
+}
+
 // --- the ink budget ------------------------------------------------------------
 // A panel holds a fixed number of segments. Past the cap the engine refuses them, and
 // the client is told (`used`/`cap`) so its ink bar can stop the pen instead of letting

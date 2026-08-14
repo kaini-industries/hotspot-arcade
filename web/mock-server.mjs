@@ -202,7 +202,7 @@ function handle(socket) {
     duel = null;
     lobby(GAME_OF[kind]);
     at(300, () => send({ t: "duel", kind, phase: "lobby", you: ME, me: 1,
-      opp: nicks[CATHY], challenges: [{ from: CATHY, to: ME }] }));
+      opp: nicks[CATHY], challenges: [{ id: 1, from: CATHY, to: ME }] }));
   }
 
   function newDuel(kind, first) {
@@ -395,7 +395,7 @@ function handle(socket) {
   function runPong() {
     pong = null;
     lobby("pong");
-    at(300, () => send({ t: "pong", phase: "lobby", challenges: [{ from: CATHY, to: ME }] }));
+    at(300, () => send({ t: "pong", phase: "lobby", challenges: [{ id: 2, from: CATHY, to: ME }] }));
   }
   function startPong() {
     pong = { p1: 0.5, p2: 0.5, s1: 0, s2: 0, bx: 0.5, by: 0.5, vx: 0.012, vy: 0.008, dir: 0 };
@@ -488,7 +488,7 @@ function handle(socket) {
       return;
     }
     if (cur === "c4" || cur === "ttt" || cur === "dots") {
-      if (m.t === "accept" || m.t === "challenge") startDuelMatch(cur, ME);
+      if ((m.t === "accept" && m.id === 1) || (m.t === "challenge" && m.to === CATHY)) startDuelMatch(cur, ME);
       else if (m.t === "cancel") send({ t: "duel", kind: cur, phase: "lobby", you: ME, me: 1, opp: nicks[CATHY], challenges: [] });
       else if (m.t === "move" && typeof m.n === "number") playerMove(m.n);
       else if (m.t === "rematch" && duel) startDuelMatch(cur, duel.first === ME ? CATHY : ME);
@@ -508,7 +508,7 @@ function handle(socket) {
       return;
     }
     if (cur === "pong") {
-      if (m.t === "accept" || m.t === "challenge") startPong();
+      if ((m.t === "accept" && m.id === 2) || (m.t === "challenge" && m.to === CATHY)) startPong();
       else if (m.t === "cancel") send({ t: "pong", phase: "lobby", challenges: [] });
       else if (m.t === "paddle" && pong) pong.dir = m.dir | 0;
       return;

@@ -56,7 +56,7 @@ All control messages are framed so the link can resync after noise:
 | 0x17 | QUESTION     | JSON: `{"i":<n>,"q":"..","o":["a","b","c","d"],"c":<0-3>,"dur":<sec>}` (trivia) |
 | 0x18 | REVEAL       | (none) — close the current question, broadcast the correct answer |
 | 0x19 | ROUND_END    | (none) — back to lobby for the active game |
-| 0x1A | CONFIG       | JSON: `{"max":8,"lang":"pt-br"}` — station cap and the host's phone-UI language (`""`/absent = English). The ESP stores `lang` and echoes it back in each `welcome`. |
+| 0x1A | CONFIG       | JSON: `{"max":8,"lang":"pt-br","code":"123456"}` — station cap, phone-UI language (`""`/absent = English), and optional six-digit party admission code. `code:""` disables code admission; omitting `code` leaves the current/default policy unchanged. The ESP stores `lang` and echoes it in each `welcome`; the raw code is never sent to a phone after admission. |
 | 0x1B | RESET_SCORES | (none) — zero the ESP live score mirror |
 | 0x1C | CONTENT_CLEAR | (none) — drop all packs, for every game |
 | 0x1D | CONTENT_PACK | game byte + pack name — begin a pack for that game |
@@ -77,7 +77,7 @@ All control messages are framed so the link can resync after noise:
 | Type | Name         | Payload |
 |------|--------------|---------|
 | 0x80 | STATUS       | token: `boot` `files_ok` `ap_ok` `up ip=..` `stopped` `err ..` |
-| 0x81 | JOIN         | `pid(1)` `nick` — a player joined |
+| 0x81 | JOIN         | `pid(1)` `nick` — idempotent roster upsert on first join, resume/takeover, or profile update. A repeated pid updates its profile without resetting the mirrored host score; LEAVE followed by pid reuse creates a fresh zero-score seat. |
 | 0x82 | LEAVE        | `pid(1)` |
 | 0x83 | SCORE        | `pid(1)` `delta(2 LE, signed)` `reason` — authoritative-persist on Flipper |
 | 0x84 | ROUND_RESULT | JSON, game-specific (trivia: `{"correct":[pid..]}`, c4: `{"win":pid,"lose":pid}` or `{"draw":[a,b]}`) |
@@ -136,10 +136,10 @@ REVEAL/ROUND_END flow down as the host drives rounds. PING beacons throughout.
 
 | `t`        | Fields | Meaning |
 |------------|--------|---------|
-| `hello`    | `nick` | Join / re-join with a nickname (from localStorage) |
+| `hello`    | `proto` (2), `resume` (32 lowercase hex), `nick`, `avatar`, optional `code` (six digits) | Authenticate, join, or resume. Unknown identities need the host code when admission control is enabled; a known identity may omit it. |
 | `answer`   | `c` (0-3) | Trivia: buzz an answer for the current question |
 | `challenge`| `to` (pid) | Connect4: challenge a player in the lobby |
-| `accept`   | `from` (pid) | Connect4: accept a pending challenge |
+| `accept`   | `id` (server-issued challenge id) | Accept that exact pending challenge; stale ids are rejected |
 | `cancel`   | | Connect4: withdraw my challenge / decline |
 | `move`     | `col` (0-6) | Connect4: drop a disc in a column |
 | `leaveGame`| | Connect4: forfeit/exit the current match |
@@ -149,10 +149,11 @@ REVEAL/ROUND_END flow down as the host drives rounds. PING beacons throughout.
 
 | `t`      | Fields | Meaning |
 |----------|--------|---------|
-| `welcome`| `pid`, `nick`, `avatar`, `lang` | Assigned player id after `hello`, with the identity the server holds for this device (see §10 — on a rebind these are the existing player's, not what the client just sent); `lang` is the host's phone-UI language (`""` = English), which the client uses to pick its message catalog |
-| `lobby`  | `game` ("none"/"trivia"/"connect4"), `players` (`[{pid,nick,score}]`), `me` (pid) | Lobby snapshot; sent on change |
+| `welcome`| `proto` (2), `session` (32 lowercase hex), `pid`, `resumed`, `nick`, `avatar`, `lang` | Successful authentication. `resumed` is true when an existing engine seat was recovered; `lang` is the host's phone-UI language (`""` = English). |
+| `reject` | `code`, optional `retry_ms` | Authentication failure: `auth_required`, `bad_code`, `throttled`, `full`, or `bad_protocol`. |
+| `lobby`  | `game`, `players` (`[{pid,nick,avatar,score,online,busy}]`), `me` (pid) | Lobby snapshot. An offline player is reserved during reconnect grace, cannot be challenged, and does not satisfy quorum. |
 | `trivia` | `phase` ("idle"/"question"/"reveal"), `i`, `q`, `o` (opts), `dur`, `deadline` (ms epoch-ish, server `millis`), `mine` (my choice or -1), `counts` ([n0..n3]), `correct` (reveal only), `scores` | Full trivia view for this client |
-| `c4`     | `phase` ("lobby"/"playing"/"over"), lobby: `challenges` (`[{from,to}]`); playing: `mid`, `board` (42 ints: 0 empty/1/2), `turn` (pid), `me` (1 or 2), `opp` (nick), `you` (pid); over: `result` ("win"/"lose"/"draw") | Full connect4 view for this client |
+| `c4`     | `phase` ("lobby"/"playing"/"over"), lobby: `challenges` (`[{id,from,to}]`); playing: `mid`, `board` (42 ints: 0 empty/1/2), `turn` (pid), `me` (1 or 2), `opp` (nick), `you` (pid); over: `result` ("win"/"lose"/"draw") | Full connect4 view for this client |
 | `toast`  | `msg` | Transient message to show |
 | `pong`   | | keepalive reply |
 
@@ -178,7 +179,7 @@ New game ids (UART `SELECT_GAME` / lobby `game`): `3` tictactoe, `4` dots,
 ### 3.1 Duels (connect4, tictactoe, dots) — unified
 
 All three are 1v1 and share the same lobby flow. Client intents:
-`challenge{to}`, `accept{from}`, `cancel`, `move{n}`, `rematch`, `leaveGame`.
+`challenge{to}`, `accept{id}`, `cancel`, `move{n}`, `rematch`, `leaveGame`.
 `move.n` is a grid index whose meaning depends on `kind` (below). `rematch` in an
 `over` match restarts the same pairing (first move alternates) if the opponent is
 still present.
@@ -186,7 +187,9 @@ still present.
 Server -> client message `t:"duel"`, common fields: `kind`
 ("c4"/"ttt"/"dots"), `phase` ("lobby"/"playing"/"over"), `you` (pid), `me`
 (1 or 2), `opp` (nick), `turn` (pid), `result` ("win"/"lose"/"draw", over only),
-`challenges` (`[{from,to}]`, lobby only).
+`challenges` (`[{id,from,to}]`, lobby only). Challenge ids are server-issued and
+game-specific. If every match slot is occupied, acceptance returns
+`error{code:"match_capacity"}` to both players without consuming the invitation.
 
 - **c4** (`kind:"c4"`): `cols:7`, `rows:6`, `need:4`, `gravity:true`, `board`
   (42 ints, row-major, row 0 top, 0/1/2). `move.n` = column 0..6.
@@ -423,8 +426,7 @@ Server `{t:"chess",phase,...}`:
   `material`/`rep3`/`rep5`/`move50`/`move75`/`agree`/`left`). **Quirk:** the server keeps
   recomputing `deadline` off the current time even after the game ends, so clients must
   read the clocks from `run`/`oms` (which the server does freeze on finish) rather than
-  animate a countdown from `deadline` here. `offer` is also stale in this phase — it is not
-  cleared when the game ends — so clients should ignore it once `phase` is `"over"`.
+  animate a countdown from `deadline` here. `turn` and `offer` are `0` in this phase.
 - `"lobby"`: `challenges` only.
 
 Clocks: fixed 5+0 blitz, no increment, server-authoritative. `run` is the milliseconds left
@@ -476,65 +478,44 @@ Server `{t:"secrets",phase,...}`:
 - `"final"`: `board` (the shared leaderboard).
 ---
 
-## 11. Player identity — one phone = one player
+## 11. Player identity and reconnect grace
 
-Firmware **v18**. A player is bound to the **device**, not to the WebSocket. The ESP
-resolves each connection to the station's **MAC address** and keys the player on that; the
-WebSocket layer only knows a peer IP, and that IP is something the ESP's own DHCP server
-made up, so it is a derived value, not an identity.
+Firmware **v21** replaces network-derived identity with browser protocol v2. On first use,
+the phone creates 16 bytes with `crypto.getRandomValues`, encodes them as exactly 32
+lowercase hexadecimal characters, and retains that resume credential in browser storage.
+It sends the raw credential only in `hello`; on this open Wi-Fi/WebSocket transport the
+credential is exposed in transit to a nearby sniffer. It is never echoed, logged, persisted,
+or forwarded over UART to the host adapter. The engine computes SHA-256 and retains the
+first 128 bits as the stable identity digest.
 
-Why it is needed: a phone could show up as two or three players at once.
+An unknown digest must supply the current six-digit join code when host admission control
+is enabled. A digest the host already knows may resume without the code. The code controls
+party admission only: the AP and WebSocket remain open and unencrypted.
 
-- iOS (and Android) open a **captive mini-browser** for the portal. It is a separate
-  browser context from Safari/Chrome with its own `localStorage`, so the saved-identity
-  auto-rejoin the client does cannot help — play in the captive window *and* open
-  `192.168.4.1` in Safari and the ESP used to see two joins. A second tab, or a second
-  browser, is the same story.
-- A phone that drops (screen lock, WiFi off) closes nothing; the ESP only learns about it
-  when TCP times out, which can take minutes. If the phone comes back first, it used to
-  become a new player while the old one lingered as a ghost on the leaderboard.
+Rules the engine applies to a valid protocol-v2 `hello`:
 
-How the MAC is obtained (all firmware-side, the wire protocol is unchanged): the AP's DHCP
-server reports the assigned address *and* the client MAC together
-(`ip_event_ap_staipassigned_t`), so the firmware keeps a small IP → MAC table from that
-event. A station whose lease predates the handler is looked up in lwIP's ARP cache
-instead, and if the MAC still cannot be resolved the IP itself is used as the key. The
-engine never sees any of this — it stores an opaque 64-bit device key, `0` = unknown.
+1. **Unknown identity** → ask the host adapter to authorize it, then allocate a free pid.
+2. **Detached identity inside grace** → restore its pid, score, nickname, avatar, and
+   reserved in-memory game data, and mark it online. Existing game timers continue to
+   advance in this foundation release, so a timed phase may have progressed meanwhile.
+3. **Identity already online** → bind the pid to the newest socket and close the displaced
+   socket with policy code 1008 and reason `identity takeover`.
+4. **Identity whose grace already expired** → the old game seat is finalized first. A host
+   that remembers the digest may authorize a fresh pid without asking for the join code;
+   this is a new engine seat, so `welcome.resumed` is false.
 
-Modern phones present a randomized "private" MAC, but it is **stable per SSID**: it
-survives reconnects and only changes if the AP is renamed, which is exactly the lifetime a
-session needs.
+A normal socket disconnect does not immediately remove the participant. The roster reports
+`online:false`, challenges involving that pid are removed, and its engine seat remains
+reserved for exactly 120,000 ms. During that window it does not count toward quorum and
+cannot be challenged. At the boundary, the active game's ordinary leave/forfeit handler
+runs exactly once and the pid becomes reusable. Closing or sending through an older socket
+after a takeover cannot detach or control the current player.
 
-Rules the ESP applies to `hello`:
-
-1. **Known socket** → the existing player; `nick`/`avatar` in the message are an edit from
-   the header identity editor and are applied (unchanged behaviour).
-2. **New socket, device already playing** → *rebind*: the existing player is re-pointed at
-   the new socket, keeping their `pid`, `nick`, `avatar` and `score`. Never a second
-   player. The `hello`'s own `nick`/`avatar` are ignored (a fresh context sends a name of
-   its own, and letting that rename a player mid-session is the bug, not the fix). No UART
-   `JOIN` is emitted — nobody joined. The `welcome` reply carries the *existing* identity,
-   and the client adopts it, so the second context immediately shows the same name and
-   avatar.
-3. **New socket, new or unknown device** → a new player, exactly as before.
-
-A `DISCONNECT` only removes a player if the closing socket is still that player's **current**
-socket. The superseded context's late close — and any message it still sends — is ignored.
-
-Device key `0` means "unknown" (reported for anything that is not a joined station,
-including the AP's own address) and never matches, so those clients fall back to one player
-per connection.
-
-The ESP traces each decision to its serial console:
-`[ha] JOIN pid=2 ip=192.168.4.3 mac=AA:BB:CC:DD:EE:FF nick="..."` and
-`[ha] NEW BROWSER same device ip=192.168.4.2 mac=AA:BB:CC:DD:EE:FF -> pid=1 nick="..." (consolidated)`.
-
-**Trade-off, deliberate:** two people can no longer share one phone as two players — the
-second `hello` from that phone joins the first player instead of creating a second. Playing
-one phone per person is the assumption everywhere else in the UI (the phone is the
-controller), and duplicate players from a single phone were the far more common failure. A
-phone whose MAC changes (the AP was renamed) simply becomes a new player, which is the
-pre-existing behaviour.
+The engine uses rollover-safe signed-difference helpers for reconnect deadlines. Game
+payloads in this release still carry their existing raw `deadline`/`dur` fields and game
+ticks continue during a disconnect. Conversion to a host-pausable logical clock, true
+critical-round freezing, and relative timer fields is a separate Kaini protocol-v21
+integration step; this foundation does not claim exact timed-state restoration.
 
 ---
 
@@ -752,12 +733,16 @@ Server `{t:"werewolf",phase,...}`:
   - `check` (`pid`/`nick`/`wolf`) goes **only to the seer**, from the moment they look until
     the next night falls.
   - `nokill` marks the small-table opening night (public: it follows from the player count).
-  - `dawn` adds `victim` (pid, `0` = nobody died) and `dawnkind`; `dusk` adds `lynched`
-    (pid, `0` = nobody); `day` adds the public `myvote`, `votes` (`by`/`pid`), `waiting`,
-    `voters` and `needed` (the hammer threshold).
+  - `dawn` adds `victim` (pid, `0` = nobody died), `victimNick`, `victimRole`, and
+    `dawnkind`; `dusk` adds `lynched` (pid, `0` = nobody), `lynchedNick`, and
+    `lynchedRole`. The additive name/role snapshots keep public attribution stable after a
+    departed PID expires or is reused. `day` adds the public `myvote`, `votes`
+    (`by`/`pid`), `waiting`, `voters` and `needed` (the hammer threshold).
 - `"final"`: `winner` (`"villagers"` | `"wolves"`), `myrole`, `players` with every role
-  revealed, `log` (per night: `day`, `victim`, `kind`, `lynched`), and `board` (the shared
-  leaderboard).
+  revealed, `log` (per night: `day`, `victim`, `victimNick`, `victimRole`, `kind`,
+  `lynched`, `lynchedNick`, `lynchedRole`), and `board` (the shared leaderboard). Numeric
+  PID fields remain for compatibility; the immutable snapshots are authoritative after
+  seat expiry or reuse.
 
 ## 10. Spyfall (`spyfall`) — game id `19`
 

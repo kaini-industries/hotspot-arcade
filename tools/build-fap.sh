@@ -160,8 +160,24 @@ for entry in "${BOARDS[@]}"; do
     fi
 done
 
-# Record which ESP sources these images came from, so CI can catch a stale commit.
-"$REPO/tools/asset-stamp.sh" > "$REPO/flipper/hotspot-arcade/.bundled-fw.sha256"
+# Record which ESP sources these images came from only after every board was freshly
+# compiled above. In fallback mode the committed binaries are immutable inputs: never
+# bless them with the hash of newer source. Instead require their existing stamp to
+# already match, or fail closed and ask for a real firmware rebuild.
+STAMP_FILE="$REPO/flipper/hotspot-arcade/.bundled-fw.sha256"
+if [ -n "$ACLI" ]; then
+    "$REPO/tools/asset-stamp.sh" > "$STAMP_FILE"
+else
+    current_stamp="$("$REPO/tools/asset-stamp.sh")"
+    recorded_stamp=""
+    [ -f "$STAMP_FILE" ] && recorded_stamp="$(tr -d '[:space:]' < "$STAMP_FILE")"
+    if [ -z "$recorded_stamp" ] || [ "$recorded_stamp" != "$current_stamp" ]; then
+        echo "ERROR: committed firmware images are stale for the current ESP sources." >&2
+        echo "       Install arduino-cli and rebuild all bundled board images." >&2
+        exit 1
+    fi
+    echo "==> Committed firmware stamp matches current sources"
+fi
 ls -la "$ASSETS_FW"
 
 # --- populate assets/web/ and assets/packs/ ---

@@ -5,11 +5,95 @@
 // functions below, which the .ino implements (WS send, UART report).
 #pragma once
 #include <Arduino.h>
+#include <math.h>
 #include "ha_json.h"
 #include "ha_proto.h"
 
+#ifndef HA_MAX_PLAYERS
 #define HA_MAX_PLAYERS 12
+#endif
 #define HA_NICK_LEN 20
+#define HA_RESUME_TOKEN_LEN 32
+#define HA_IDENTITY_LEN (HA_IDENTITY_BYTES * 2)
+#define HA_RESUME_GRACE_MS 120000UL
+
+// The reduced-quorum switch is a simulator/developer aid, never a production
+// player control. The off-target harness opts in explicitly for its small-room
+// game tests; firmware builds leave it disabled and do not advertise it.
+#ifndef HA_ENABLE_MIN_OVERRIDE
+#define HA_ENABLE_MIN_OVERRIDE 0
+#endif
+
+enum HaJoinAuthResult : uint8_t {
+    HA_JOIN_AUTH_OK = 0,
+    HA_JOIN_AUTH_REQUIRED = 1,
+    HA_JOIN_AUTH_BAD_CODE = 2,
+    HA_JOIN_AUTH_THROTTLED = 3,
+    HA_JOIN_AUTH_KNOWN = 4,
+    HA_JOIN_AUTH_FULL = 5,
+};
+
+// Resume tokens are browser-held bearer credentials. The engine retains only a
+// stable 128-bit identity: the first half of SHA-256(token), rendered as lowercase
+// hexadecimal. A token is exactly one SHA-256 block including padding, so this
+// deliberately small implementation needs no general-purpose hash context.
+static void haIdentityDigest(const char token[HA_RESUME_TOKEN_LEN + 1],
+                             char out[HA_IDENTITY_LEN + 1]) {
+    static const uint32_t K[64] = {
+        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
+    };
+    uint8_t block[64] = {};
+    memcpy(block, token, HA_RESUME_TOKEN_LEN);
+    block[HA_RESUME_TOKEN_LEN] = 0x80;
+    block[62] = 0x01; // 32 bytes = 256 bits, big-endian in the final eight bytes
+    uint32_t w[64];
+    for(int i = 0; i < 16; i++)
+        w[i] = ((uint32_t)block[i * 4] << 24) | ((uint32_t)block[i * 4 + 1] << 16) |
+               ((uint32_t)block[i * 4 + 2] << 8) | block[i * 4 + 3];
+    auto rotr = [](uint32_t x, uint8_t n) { return (x >> n) | (x << (32 - n)); };
+    for(int i = 16; i < 64; i++) {
+        uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    uint32_t h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+                     0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+    uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+    for(int i = 0; i < 64; i++) {
+        uint32_t s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+        uint32_t ch = (e & f) ^ (~e & g);
+        uint32_t t1 = hh + s1 + ch + K[i] + w[i];
+        uint32_t s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t t2 = s0 + maj;
+        hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+    }
+    h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d;
+    static const char HEX_DIGITS[] = "0123456789abcdef";
+    for(int i = 0; i < HA_IDENTITY_BYTES; i++) {
+        uint8_t value = (uint8_t)(h[i / 4] >> (24 - (i % 4) * 8));
+        out[i * 2] = HEX_DIGITS[value >> 4];
+        out[i * 2 + 1] = HEX_DIGITS[value & 15];
+    }
+    out[HA_IDENTITY_LEN] = '\0';
+}
+
+// Signed-difference comparisons are safe for all game windows (< 2^31 ms),
+// including when the ESP32's raw millisecond counter rolls over.
+static inline bool haTimeReached(uint32_t now, uint32_t deadline) {
+    return (int32_t)(now - deadline) >= 0;
+}
+static inline uint32_t haTimeRemaining(uint32_t now, uint32_t deadline) {
+    int32_t remain = (int32_t)(deadline - now);
+    return remain > 0 ? (uint32_t)remain : 0;
+}
 
 // Nicknames are uppercased once, here at the door, so every downstream consumer
 // (phone UI, Flipper roster, and the strings this engine composes like "A vs B")
@@ -25,8 +109,12 @@ static inline void ha_upper(char* s) {
 // system, parameterized by the active game's kind. Only one game is active at a
 // time, so all live matches are the active kind.
 #define DUEL_MAX_CELLS 64 // c4 = 7x6; ttt = 3x3; reversi = 8x8
+#ifndef DUEL_MAX_MATCHES
 #define DUEL_MAX_MATCHES 6
+#endif
+#ifndef DUEL_MAX_CHALLENGES
 #define DUEL_MAX_CHALLENGES 16
+#endif
 #define DOTS_W 5 // boxes across
 #define DOTS_H 5 // boxes down
 #define DOTS_HEDGES ((DOTS_H + 1) * DOTS_W) // horizontal edges
@@ -40,11 +128,15 @@ static inline void ha_upper(char* s) {
 #define BS_N (BS_SIZE * BS_SIZE) // 100
 #define BS_SHIPS 5
 #define BS_TOTAL 17 // sum of BS_LEN, the win threshold
+#ifndef BATTLE_MAX
 #define BATTLE_MAX 4 // concurrent matches
+#endif
 
 // Chess: 1v1, full FIDE rules refereed here. Squares are 0..63 with a1 = 0, b1 = 1 ...
 // h8 = 63, so rank = sq >> 3 and file = sq & 7. A move is encoded as from * 64 + to.
+#ifndef CHESS_MAX
 #define CHESS_MAX 4 // concurrent matches
+#endif
 #define CH_HIST 154 // repetition ring: 1 + 150 halfmoves (75-move bound) + slack
 #define CH_CLOCK_MS 300000UL // 5:00 per side, no increment
 #define CH_MAX_MOVES 220 // legal-move buffer (theoretical max is 218)
@@ -82,7 +174,9 @@ static inline int haUtf8Len(const char* s) {
 
 #define DRAW_SECS 70 // per drawing round
 #define DRAW_REVEAL_MS 4000 // reveal pause before the next round
+#ifndef PONG_MAX
 #define PONG_MAX 4 // concurrent pong matches
+#endif
 #define PONG_WIN 5 // points to win
 #define PONG_TICK_MS 33 // ~30 Hz
 // Court geometry, as fractions of the canvas width. The ball must reverse when its
@@ -286,27 +380,15 @@ static inline int haUtf8Len(const char* s) {
 
 // ---- sinks implemented in the .ino ----
 void haWsSendWs(uint32_t wsId, const String& msg); // to one socket (0 = no-op)
+void haWsCloseWs(uint32_t wsId); // duplicate-token takeover; newest socket wins
 void haWsBroadcast(const String& msg); // to all connected sockets
-void haUartJoin(uint8_t pid, const char* nick);
+uint8_t haAuthorizeIdentity(
+    uint32_t wsId, const char* identity, const char* code, uint32_t* retryMs);
+void haUartJoinStable(uint8_t pid, const char* identity, const char* nick, const char* avatar);
 void haUartLeave(uint8_t pid);
 void haUartScore(uint8_t pid, int delta, const char* reason);
 void haUartEvent(const String& json);
 void haUartRoundResult(const String& json);
-// Human-readable trace of every identity decision (see onHello): a genuinely new
-// device, or a second browser context on a phone that is already playing being
-// consolidated onto its existing player. `deviceKey` is opaque here -- the .ino
-// renders it, since it is the side that knows what it was made of.
-void haLogJoin(uint8_t pid, uint64_t deviceKey, const char* nick, bool consolidated);
-
-// One phone = one player. `wsId` identifies a *connection*; `deviceKey` identifies
-// the *phone*, and every browser context on it (the iOS captive mini-browser, Safari,
-// a second tab, a socket that came back after the screen unlocked) presents the same
-// one. Keying identity on the device instead of the socket is what stops one phone
-// from turning into two or three players -- see onHello() for the rebind and
-// onWsDisconnect() for the stale-socket rule.
-//
-// The key is deliberately opaque to the engine: the .ino derives it from the station's
-// MAC (falling back to its IP), and only that side knows or cares. 0 = unknown.
 // Finished artwork, for the host to keep. Called once with HA_ART_BEGIN, then once per
 // line segment with HA_ART_STROKE, then once with HA_ART_END -- a picture is streamed
 // as it is handed over, never buffered, so this costs the engine no RAM at all. The
@@ -316,25 +398,12 @@ void haUartArt(uint8_t op, const String& json);
 struct Player {
     bool used;
     uint32_t wsId; // 0 = not connected
-    uint64_t deviceKey; // which phone, 0 = unknown (see onHello)
+    char identity[HA_IDENTITY_LEN + 1]; // derived digest; raw token stays browser-only
+    bool detached;
+    uint32_t detachedAt; // raw millis so planned game-clock pauses do not extend grace
     char nick[HA_NICK_LEN];
     char avatar[8]; // emoji avatar (UTF-8), player-picked on the landing screen
     int32_t score;
-};
-
-// A phone that drops out keeps its identity for the rest of the session. When the
-// socket closes the player's nick, avatar and score are parked under their device
-// key; the same phone coming back -- a WiFi blip, a locked screen, a browser
-// restart, a tab swiped away -- is handed all three back instead of arriving as a
-// stranger on zero. Ten slots is the softAP's station cap, so a full room's worth
-// of leavers fits; beyond that the stalest is evicted.
-#define HA_PARKED_MAX 10
-struct ParkedPlayer {
-    uint64_t deviceKey; // 0 = free slot
-    char nick[HA_NICK_LEN];
-    char avatar[8];
-    int32_t score;
-    uint32_t at; // millis when parked, for evicting the stalest first
 };
 
 // Trivia content, streamed from the Flipper at session start (the packs become
@@ -370,6 +439,7 @@ struct DuelMatch {
     bool used;
     uint8_t kind; // HA_GAME_CONNECT4 / TICTACTOE / DOTS
     uint8_t a, b; // pids; a plays mark 1, b plays mark 2
+    char aNick[HA_NICK_LEN], bNick[HA_NICK_LEN]; // immutable result attribution
     bool aIn, bIn; // still attached (not returned to lobby)
     uint8_t turn; // pid to move
     uint8_t phase; // 1 playing, 2 over
@@ -384,6 +454,8 @@ struct DuelMatch {
 
 struct DuelChallenge {
     bool used;
+    uint16_t id;
+    uint8_t game;
     uint8_t from, to;
 };
 
@@ -504,6 +576,7 @@ struct SpectrumState {
     uint8_t stage; // 0 clue, 1 guess
     int target; // hidden target 0..100
     char clue[SPECTRUM_CLUE_LEN]; // psychic's clue text
+    bool inRound[HA_MAX_PLAYERS + 1]; // online when this round began; mid-round joins wait
     int8_t guess[HA_MAX_PLAYERS + 1]; // 0..100, -1 = not guessed
     int gained[HA_MAX_PLAYERS + 1]; // points earned this round (shown on reveal)
 };
@@ -522,6 +595,7 @@ struct KmkState {
     uint8_t chooserSeq; // rotates the chooser across rounds
     uint8_t stage; // 0 choose, 1 guess
     int8_t cLabel[3]; // chooser's label per person, -1 = unset
+    bool inRound[HA_MAX_PLAYERS + 1]; // online when this round began; mid-round joins wait
     int8_t gLabel[HA_MAX_PLAYERS + 1][3]; // each guesser's labels per person
     bool guessed[HA_MAX_PLAYERS + 1];
     int gained[HA_MAX_PLAYERS + 1]; // points earned this round (shown on reveal)
@@ -608,6 +682,8 @@ struct WwDay {
     uint8_t victim; // pid taken that night, 0 = nobody
     uint8_t kind; // WW_D_*, why nobody died when victim is 0
     uint8_t lynched; // pid voted out that day, 0 = nobody
+    char victimNick[HA_NICK_LEN], lynchedNick[HA_NICK_LEN];
+    uint8_t victimRole, lynchedRole;
 };
 
 struct WerewolfState {
@@ -675,10 +751,18 @@ struct SpyfallState {
     int8_t agree[HA_MAX_PLAYERS + 1]; // poll answer: -1 unanswered, 0 no, 1 in
     uint8_t missBy[HA_MAX_PLAYERS]; // failed accusations this round: who pressed...
     uint8_t missOf[HA_MAX_PLAYERS]; // ...and who they got wrong
+    char missByNick[HA_MAX_PLAYERS][HA_NICK_LEN];
+    char missOfNick[HA_MAX_PLAYERS][HA_NICK_LEN];
     uint8_t missCount;
     uint8_t outcome; // SPYFALL_OUT_*, set on reveal
     int8_t called; // location index the spy called, -1 = they never did
     uint8_t blamed; // pid the round ended on, 0 = nobody was pinned
+    char blamedNick[HA_NICK_LEN];
+    bool revealIn[HA_MAX_PLAYERS + 1];
+    int8_t revealRole[HA_MAX_PLAYERS + 1];
+    uint8_t revealSpy;
+    char revealNick[HA_MAX_PLAYERS + 1][HA_NICK_LEN];
+    char revealSpyNick[HA_NICK_LEN];
     int gained[HA_MAX_PLAYERS + 1]; // points earned this round (shown on reveal)
 };
 
@@ -727,6 +811,7 @@ struct FrankenState {
 struct PongMatch {
     bool used;
     uint8_t a, b; // a = left paddle, b = right paddle
+    char aNick[HA_NICK_LEN], bNick[HA_NICK_LEN]; // immutable result attribution
     bool aIn, bIn;
     uint8_t phase; // 1 playing, 2 over
     float bx, by, vx, vy; // ball position (0..1) + velocity per tick
@@ -741,6 +826,7 @@ struct PongMatch {
 struct BattleMatch {
     bool used;
     uint8_t a, b; // pids
+    char aNick[HA_NICK_LEN], bNick[HA_NICK_LEN]; // immutable result attribution
     bool aIn, bIn;
     uint8_t phase; // 0 placement, 1 firing, 2 over
     uint8_t turn; // pid to fire (firing phase)
@@ -807,6 +893,7 @@ struct ChessUndo {
 struct ChessMatch {
     bool used;
     uint8_t a, b; // pids
+    char aNick[HA_NICK_LEN], bNick[HA_NICK_LEN]; // immutable result attribution
     bool aIn, bIn;
     uint8_t white; // pid playing white this game
     uint8_t phase; // 1 playing, 2 over
@@ -832,11 +919,15 @@ public:
         strlcpy(_lang, (l && l[0]) ? l : "", sizeof(_lang));
     }
 
-    void reset() {
+    void reset(uint32_t rawNow = 0) {
         for(int i = 0; i <= HA_MAX_PLAYERS; i++) _p[i] = Player{};
+        makeSessionId(_session);
+        _lastRawNow = rawNow;
         _active = HA_GAME_NONE;
+        _minOverride = false;
         gsZero();          // all game runtime state back to zero (no active game left to re-default)
         challengesClear(); // shared 1v1 challenge list is outside the union -> clear it here
+        _nextChallengeId = 1;
         gameVoteClear();
         fdSheetsFree();    // no game active after a reset -> release the stroke store
     }
@@ -849,66 +940,32 @@ public:
         return 0;
     }
 
-    // The player sitting on a given device, or 0. An unknown device (key 0) never
-    // matches, so those clients keep the old one-player-per-connection behaviour
-    // instead of all collapsing into a single player.
-    ParkedPlayer _parked[HA_PARKED_MAX] = {};
-
-    // Park a leaving player's identity so their return can restore it.
-    void parkPlayer(uint8_t pid) {
-        if(!_p[pid].deviceKey) return; // nothing to recognise them by later
-        int slot = -1;
-        for(int i = 0; i < HA_PARKED_MAX; i++) {
-            if(_parked[i].deviceKey == _p[pid].deviceKey) { slot = i; break; }
-            if(!_parked[i].deviceKey && slot < 0) slot = i;
-        }
-        if(slot < 0) { // all taken: evict the stalest
-            slot = 0;
-            for(int i = 1; i < HA_PARKED_MAX; i++)
-                if((int32_t)(_parked[i].at - _parked[slot].at) < 0) slot = i;
-        }
-        _parked[slot].deviceKey = _p[pid].deviceKey;
-        strlcpy(_parked[slot].nick, _p[pid].nick, HA_NICK_LEN);
-        strlcpy(_parked[slot].avatar, _p[pid].avatar, sizeof(_parked[slot].avatar));
-        _parked[slot].score = _p[pid].score;
-        _parked[slot].at = millis();
-    }
-
-    // Take a parked identity back out of the store (consumed, not copied).
-    bool unparkPlayer(uint64_t deviceKey, uint8_t pid) {
-        if(!deviceKey) return false;
-        for(int i = 0; i < HA_PARKED_MAX; i++) {
-            if(_parked[i].deviceKey != deviceKey) continue;
-            strlcpy(_p[pid].nick, _parked[i].nick, HA_NICK_LEN);
-            strlcpy(_p[pid].avatar, _parked[i].avatar, sizeof(_p[pid].avatar));
-            _p[pid].score = _parked[i].score;
-            _parked[i] = ParkedPlayer{};
-            return true;
-        }
-        return false;
-    }
-
-    uint8_t pidByDevice(uint64_t deviceKey) {
-        if(!deviceKey) return 0;
-        for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++)
-            if(_p[i].used && _p[i].deviceKey == deviceKey) return i;
+    uint8_t pidByIdentity(const char* identity) const {
+        if(!identity || strlen(identity) != HA_IDENTITY_LEN) return 0;
+        for(uint8_t pid = 1; pid <= HA_MAX_PLAYERS; pid++)
+            if(_p[pid].used && strcmp(_p[pid].identity, identity) == 0) return pid;
         return 0;
     }
 
-    void onWsDisconnect(uint32_t wsId) {
+    bool playerOnline(uint8_t pid) const {
+        return pid >= 1 && pid <= HA_MAX_PLAYERS && _p[pid].used && _p[pid].wsId != 0;
+    }
+
+    void onWsDisconnect(uint32_t wsId, uint32_t rawNow) {
         // pidByWs() matches only a player whose CURRENT wsId is this socket, which is
-        // exactly the guard the rebind needs: once a phone has moved to a new
-        // connection the old socket owns nobody, so its close -- which on a locked
-        // phone arrives minutes late, when TCP finally times out -- can no longer
-        // take the live player down with it.
+        // the takeover guard: once a token has moved to a newer socket, closing the
+        // stale socket cannot detach the live player.
         uint8_t pid = pidByWs(wsId);
         if(!pid) return;
-        anyOnLeave(pid); // forfeit any active match
+        _lastRawNow = rawNow;
+        _p[pid].wsId = 0;
+        _p[pid].detached = true;
+        _p[pid].detachedAt = rawNow;
         bool wasProposer = (_gvActive && pid == _gvProposer);
-        parkPlayer(pid);  // keep nick/avatar/score for this phone's return
-        _p[pid] = Player{};
         _gvVote[pid] = -1; // drop any pending game-change vote from the departed player
-        haUartLeave(pid);
+        // A challenge is not authoritative game state and cannot survive either
+        // endpoint going offline. Live match/round state remains reserved for grace.
+        duelRemoveChallengesInvolving(pid);
         // While a game-change vote is pending the active game is frozen, so its roster
         // handlers must not run (a leaver mustn't, say, complete a paused trivia reveal).
         if(_gvActive) {
@@ -925,60 +982,66 @@ public:
         pushAll();
     }
 
-    // `deviceKey` says which phone this socket is on (0 = unknown); see the Player
-    // comment for why it, not the socket, is the identity.
-    void onHello(uint32_t wsId, uint64_t deviceKey, const char* nick, const char* avatar,
-                 bool named) {
-        uint8_t pid = pidByWs(wsId);
-        // A hello on a NEW socket from a device that is already playing: the phone
-        // opened the page in a second browser context (the captive mini-browser next
-        // to Safari, another tab) or reconnected before the old socket's close was
-        // noticed. Adopt the new connection for the existing player rather than
-        // minting a second one -- pid, nick, avatar and score all stay put, and the
-        // `welcome` below hands that identity to the new context, which adopts it.
-        bool rebound = false;
-        if(!pid) {
-            pid = pidByDevice(deviceKey);
-            if(pid) {
-                _p[pid].wsId = wsId;
-                rebound = true;
-                haLogJoin(pid, deviceKey, _p[pid].nick, true);
-            }
+    void onHello(uint32_t wsId, const char* nick, const char* avatar,
+                 const char* resume, const char* code, uint32_t rawNow) {
+        // Enforce the exact boundary here too: a hello may arrive before loop() has
+        // ticked, and a 120s-old credential must not revive stale match state.
+        if(expireDetached(rawNow)) pushAll();
+        if(!validResumeToken(resume)) {
+            haWsSendWs(wsId, "{\"t\":\"reject\",\"code\":\"bad_protocol\",\"proto\":2}");
+            return;
         }
+        char identity[HA_IDENTITY_LEN + 1];
+        haIdentityDigest(resume, identity);
+        uint8_t pid = pidByWs(wsId);
+        bool resumed = false;
+        if(pid && strcmp(_p[pid].identity, identity) != 0) {
+            haWsSendWs(wsId, "{\"t\":\"reject\",\"code\":\"bad_protocol\",\"proto\":2}");
+            return;
+        }
+        if(!pid) { pid = pidByIdentity(identity); resumed = pid != 0; }
         if(!pid) {
+            uint32_t retryMs = 0;
+            uint8_t auth = haAuthorizeIdentity(wsId, identity, code ? code : "", &retryMs);
+            if(auth != HA_JOIN_AUTH_OK && auth != HA_JOIN_AUTH_KNOWN) {
+                const char* reason = auth == HA_JOIN_AUTH_REQUIRED ? "auth_required" :
+                                     auth == HA_JOIN_AUTH_THROTTLED ? "throttled" :
+                                     auth == HA_JOIN_AUTH_FULL ? "full" : "bad_code";
+                String reject = String("{\"t\":\"reject\",\"code\":\"") + reason + "\"";
+                if(auth == HA_JOIN_AUTH_THROTTLED) reject += String(",\"retry_ms\":") + retryMs;
+                reject += "}";
+                haWsSendWs(wsId, reject);
+                return;
+            }
             pid = freePid();
-            if(!pid) return; // full
+            if(!pid) {
+                haWsSendWs(wsId, "{\"t\":\"reject\",\"code\":\"full\"}");
+                return;
+            }
+            clearPidState(pid);
             _p[pid].used = true;
             _p[pid].wsId = wsId;
-            _p[pid].deviceKey = deviceKey;
+            strlcpy(_p[pid].identity, identity, sizeof(_p[pid].identity));
             _p[pid].score = 0;
-            // This phone played earlier and dropped out: hand back its own name,
-            // avatar and score instead of starting it over at zero. A name the
-            // player has just typed still wins over the restored one.
-            bool restored = unparkPlayer(deviceKey, pid);
-            if(!restored || (named && nick && nick[0])) {
-                strlcpy(_p[pid].nick, (nick && nick[0]) ? nick : "PLAYER", HA_NICK_LEN);
-                ha_upper(_p[pid].nick);
-            }
-            if(!restored || (named && avatar && avatar[0]))
-                strlcpy(_p[pid].avatar, (avatar && avatar[0]) ? avatar : "\xF0\x9F\x99\x82", sizeof(_p[pid].avatar));
-            haUartJoin(pid, _p[pid].nick);
-            haLogJoin(pid, deviceKey, _p[pid].nick, restored);
-        } else if(!rebound || named) {
-            // Re-hello from a known socket = the player changed their name/avatar in
-            // the header editor. Re-announce over UART so the Flipper's leaderboard
-            // updates (player_join there updates an existing pid's nick in place).
-            // A rebind is deliberately NOT this case: the second context sends
-            // whatever name it happens to have saved (often a freshly generated one),
-            // and letting that rename the player mid-session is the bug, not the fix.
+            strlcpy(_p[pid].nick, (nick && nick[0]) ? nick : "PLAYER", HA_NICK_LEN);
+            ha_upper(_p[pid].nick);
+            strlcpy(_p[pid].avatar, (avatar && avatar[0]) ? avatar : "\xF0\x9F\x99\x82", sizeof(_p[pid].avatar));
+        } else {
+            uint32_t oldWs = _p[pid].wsId;
+            _p[pid].wsId = wsId;
+            _p[pid].detached = false;
+            if(oldWs && oldWs != wsId) haWsCloseWs(oldWs);
             if(nick && nick[0]) {
                 strlcpy(_p[pid].nick, nick, HA_NICK_LEN);
                 ha_upper(_p[pid].nick);
-                haUartJoin(pid, _p[pid].nick);
             }
             if(avatar && avatar[0]) strlcpy(_p[pid].avatar, avatar, sizeof(_p[pid].avatar));
         }
-        String w = String("{\"t\":\"welcome\",\"pid\":") + pid + ",\"nick\":\"" +
+        _p[pid].detached = false;
+        haUartJoinStable(pid, _p[pid].identity, _p[pid].nick, _p[pid].avatar);
+        String w = String("{\"t\":\"welcome\",\"proto\":2,\"session\":\"") + _session +
+                   "\",\"pid\":" + pid + ",\"resumed\":" + (resumed ? "true" : "false") +
+                   ",\"nick\":\"" +
                    ha_json_escape(_p[pid].nick) + "\",\"avatar\":\"" +
                    ha_json_escape(_p[pid].avatar) + "\",\"lang\":\"" + _lang + "\"}";
         haWsSendWs(wsId, w);
@@ -1347,9 +1410,12 @@ public:
 
     // Time-based updates (trivia phases, drawing timers, pong physics). From loop().
     void tick(uint32_t now) {
+        _lastRawNow = now;
+        bool rosterChanged = expireDetached(now);
         // A pending game-change vote freezes the active game: advance only its timeout.
         if(_gvActive) {
             gameVoteResolve(now);
+            if(rosterChanged) pushAll();
             return;
         }
         if(_active == HA_GAME_TRIVIA)
@@ -1383,50 +1449,27 @@ public:
             spyfallTick(now);
         else if(_active == HA_GAME_FRANKENDRAW)
             fdTick(now);
+        if(rosterChanged) pushAll();
     }
 
     // ---- player input (parsed WS JSON) ----
-    // `deviceKey` says which phone the sending socket is on (0 = unknown). It is
-    // threaded in here rather than cached in a wsId -> key table because it is needed
-    // at exactly one moment -- when `hello` decides whether this is a new player or a
-    // phone that is already playing -- and a table would be a second connection
-    // lifecycle to keep in sync with disconnects and resets for no gain.
-    void onInput(uint32_t wsId, uint64_t deviceKey, const char* json) {
+    void onInput(uint32_t wsId, const char* json, uint32_t rawNow) {
+        _lastRawNow = rawNow;
+        if(!ha_json_flat_object_valid(json)) return;
         char type[20];
         if(!ha_json_str(json, "t", type, sizeof(type))) return;
         if(strcmp(type, "hello") == 0) {
-            char nick[HA_NICK_LEN], avatar[8];
+            int proto = 0;
+            if(!ha_json_int(json, "proto", &proto) || proto != 2) {
+                haWsSendWs(wsId, "{\"t\":\"reject\",\"code\":\"bad_protocol\",\"proto\":2}");
+                return;
+            }
+            char nick[HA_NICK_LEN], avatar[8], resume[HA_RESUME_TOKEN_LEN + 1], code[7];
             ha_json_str(json, "nick", nick, sizeof(nick));
             if(!ha_json_str(json, "avatar", avatar, sizeof(avatar))) avatar[0] = '\0';
-            // "named" marks a hello the player actually typed (pressed Play, or edited
-            // their name) as opposed to the silent auto-rejoin a reconnecting socket
-            // replays. Only a typed name may rename an existing player -- see onHello.
-            int named = 0;
-            ha_json_int(json, "named", &named);
-            // A phone can send a stable client id it stores itself (localStorage). When
-            // present it becomes the device key, so restoring a returning player survives
-            // iOS Wi-Fi MAC randomization -- a "forget network" or OS change gives a new MAC,
-            // which would otherwise look like a brand-new phone with no score. Falls back to
-            // the MAC-derived key when the phone sends no cid (older clients).
-            char cid[24];
-            if(ha_json_str(json, "cid", cid, sizeof(cid)) && cid[0]) {
-                uint64_t h = 1469598103934665603ULL; // FNV-1a 64
-                for(const char* p = cid; *p; p++) {
-                    h ^= (uint8_t)*p;
-                    h *= 1099511628211ULL;
-                }
-                if(h) deviceKey = h; // never 0 (0 means "unknown")
-            }
-            onHello(wsId, deviceKey, nick, avatar, named != 0);
-            return;
-        }
-        // Debug: let a two-person room reach the games that need more. Any player may
-        // flip it -- this is a testing aid, not a permission system -- and everyone sees
-        // the new state on the next push so the switch cannot disagree with the host.
-        if(strcmp(type, "minoverride") == 0) {
-            const char* v = ha_json_find(json, "on");
-            _minOverride = v && strncmp(v, "true", 4) == 0;
-            pushAll();
+            if(!parseResumeToken(json, resume)) resume[0] = '\0';
+            parseJoinCode(json, code);
+            onHello(wsId, nick, avatar, resume, code, rawNow);
             return;
         }
         if(strcmp(type, "ping") == 0) {
@@ -1435,6 +1478,16 @@ public:
         }
         uint8_t pid = pidByWs(wsId);
         if(!pid) return;
+#if HA_ENABLE_MIN_OVERRIDE
+        // Debug: let an AUTHENTICATED simulator player reach games that need a
+        // larger room. Production firmware compiles this input out entirely.
+        if(strcmp(type, "minoverride") == 0) {
+            const char* v = ha_json_find(json, "on");
+            _minOverride = v && strncmp(v, "true", 4) == 0;
+            pushAll();
+            return;
+        }
+#endif
         // A pending game-change vote freezes the active game: honor only the vote itself
         // (and a player leaving); every other game intent is dropped until it resolves.
         if(_gvActive) {
@@ -1537,10 +1590,12 @@ public:
         } else if(strcmp(type, "say") == 0) {
             char t[120];
             if(ha_json_str(json, "text", t, sizeof(t))) onSay(pid, t);
-        } else if(strcmp(type, "challenge") == 0 && ha_json_int(json, "to", &v)) {
+        } else if(strcmp(type, "challenge") == 0 && ha_json_int(json, "to", &v) &&
+                  v >= 1 && v <= HA_MAX_PLAYERS) {
             matchChallenge(pid, (uint8_t)v);
-        } else if(strcmp(type, "accept") == 0 && ha_json_int(json, "from", &v)) {
-            matchAccept(pid, (uint8_t)v);
+        } else if(strcmp(type, "accept") == 0 && ha_json_int(json, "id", &v) &&
+                  v >= 1 && v <= 65535) {
+            matchAccept(pid, v);
         } else if(strcmp(type, "cancel") == 0) {
             duelCancel(pid);
         } else if(strcmp(type, "move") == 0 && ha_json_int(json, "n", &v)) {
@@ -1606,6 +1661,8 @@ public:
 private:
     Player _p[HA_MAX_PLAYERS + 1] = {};
     uint8_t _active = HA_GAME_NONE;
+    char _session[HA_IDENTITY_LEN + 1] = {};
+    uint32_t _lastRawNow = 0;
     char _lang[8] = {0}; // UI language code for the phone client, "" = English
     // ---- always-resident state (kept OUT of the per-game union below) ----
     TriviaTopic _topics[TRIVIA_MAX_TOPICS] = {}; // trivia's content (its runtime state _t is in the union)
@@ -1628,6 +1685,7 @@ private:
     // live across all of them regardless of which is active, so it lives OUTSIDE the game-state
     // union (which only ever holds one game's match array). Cleared on selectGame()/reset().
     DuelChallenge _c[DUEL_MAX_CHALLENGES] = {};
+    uint16_t _nextChallengeId = 1;
     // Frankendraw's per-sheet stroke store (~28 KB), lifted out of FrankenState so it never
     // occupies static DRAM. Allocated on demand (PSRAM on the S2/C5, plain heap on the WROOM)
     // only while Frankendraw is the active game; freed on any other selectGame() and on reset().
@@ -1681,6 +1739,231 @@ private:
         memset((void*)&_t, 0, (size_t)((uintptr_t)&_gsSentinel - (uintptr_t)&_t));
     }
 
+    static bool validResumeToken(const char* token) {
+        if(!token || strlen(token) != HA_RESUME_TOKEN_LEN) return false;
+        for(int i = 0; i < HA_RESUME_TOKEN_LEN; i++) {
+            char c = token[i];
+            if(!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+        }
+        return true;
+    }
+
+    static bool parseResumeToken(const char* json, char out[HA_RESUME_TOKEN_LEN + 1]) {
+        return ha_json_str(json, "resume", out, HA_RESUME_TOKEN_LEN + 1) &&
+               validResumeToken(out);
+    }
+
+    // ha_json_str intentionally truncates to its output buffer. Reject a code
+    // that is not exactly six ASCII digits before it can authenticate as a prefix.
+    static void parseJoinCode(const char* json, char out[7]) {
+        out[0] = '\0';
+        const char* value = ha_json_find(json, "code");
+        if(!value) return;
+        if(*value != '"') { out[0] = '!'; out[1] = '\0'; return; }
+        value++;
+        for(int i = 0; i < 6; i++) {
+            if(value[i] < '0' || value[i] > '9') {
+                out[0] = '!'; out[1] = '\0'; return;
+            }
+            out[i] = value[i];
+        }
+        if(value[6] != '"') { out[0] = '!'; out[1] = '\0'; return; }
+        out[6] = '\0';
+    }
+
+    static void makeSessionId(char out[HA_IDENTITY_LEN + 1]) {
+        static const char HEX_DIGITS[] = "0123456789abcdef";
+        for(int word = 0; word < 4; word++) {
+            uint32_t r = esp_random();
+            for(int nib = 0; nib < 8; nib++)
+                out[word * 8 + nib] = HEX_DIGITS[(r >> ((7 - nib) * 4)) & 0x0F];
+        }
+        out[HA_IDENTITY_LEN] = '\0';
+    }
+
+    // A pid may be reused after its grace expires. Clear the active game's
+    // per-player cells so a new identity cannot inherit a ready flag, secret
+    // role, hand, vote, or reveal marker from the previous occupant.
+    void clearPidState(uint8_t pid) {
+        if(pid < 1 || pid > HA_MAX_PLAYERS) return;
+        if(_active == HA_GAME_TRIVIA) {
+            _t.ready[pid] = false; _t.vote[pid] = -1; _t.answer[pid] = -1;
+            _t.answerMs[pid] = 0; _t.gained[pid] = 0;
+        } else if(_active == HA_GAME_DRAW) {
+            _d.vote[pid] = -1;
+        } else if(_active == HA_GAME_WYR) {
+            _wyr.pt.ready[pid] = false; _wyr.vote[pid] = -1; _wyr.choice[pid] = -1;
+        } else if(_active == HA_GAME_SCRAMBLE) {
+            _scr.pt.ready[pid] = false; _scr.vote[pid] = -1; _scr.solved[pid] = false;
+        } else if(_active == HA_GAME_REACT) {
+            _react.pt.ready[pid] = false; _react.tapped[pid] = false; _react.dq[pid] = false;
+        } else if(_active == HA_GAME_GUESSCOLOR) {
+            _gc.pt.ready[pid] = false; _gc.guessed[pid] = false;
+            _gc.gr[pid] = _gc.gg[pid] = _gc.gb[pid] = 0;
+            _gc.submitMs[pid] = 0; _gc.gained[pid] = 0;
+        } else if(_active == HA_GAME_SPECTRUM) {
+            _spec.pt.ready[pid] = false; _spec.vote[pid] = -1;
+            _spec.inRound[pid] = false;
+            _spec.guess[pid] = -1; _spec.gained[pid] = 0;
+        } else if(_active == HA_GAME_KMK) {
+            _kmk.pt.ready[pid] = false; _kmk.vote[pid] = -1;
+            _kmk.inRound[pid] = false;
+            for(int k = 0; k < 3; k++) _kmk.gLabel[pid][k] = -1;
+            _kmk.guessed[pid] = false; _kmk.gained[pid] = 0;
+        } else if(_active == HA_GAME_SECRETS) {
+            _secrets.pt.ready[pid] = false; _secrets.vote[pid] = -1;
+            _secrets.predict[pid] = -1; _secrets.answer[pid] = -1; _secrets.gained[pid] = 0;
+        } else if(_active == HA_GAME_FILLBLANK) {
+            _fb.pt.ready[pid] = false; _fb.vote[pid] = -1; _fb.inRound[pid] = false;
+            _fb.played[pid] = -1;
+            for(int k = 0; k < FB_HAND; k++) _fb.hand[pid][k] = -1;
+        } else if(_active == HA_GAME_WEREWOLF) {
+            _ww.pt.ready[pid] = false; _ww.role[pid] = 0; _ww.alive[pid] = false;
+            _ww.revealed[pid] = false; _ww.kill[pid] = -1; _ww.accuse[pid] = -1;
+        } else if(_active == HA_GAME_SPYFALL) {
+            _sf.pt.ready[pid] = false; _sf.vote[pid] = -1; _sf.inRound[pid] = false;
+            _sf.role[pid] = -1; _sf.seen[pid] = false; _sf.spent[pid] = false;
+            _sf.nominated[pid] = false; _sf.agree[pid] = -1; _sf.gained[pid] = 0;
+        } else if(_active == HA_GAME_FRANKENDRAW) {
+            _fd.pt.ready[pid] = false; _fd.done[pid] = false;
+            _fd.artSent[pid] = -1;
+            for(int sheet = 0; sheet < HA_MAX_PLAYERS; sheet++) _fd.thumb[pid][sheet] = 0;
+        }
+        _gvVote[pid] = -1;
+    }
+
+    // Per-player arrays are not the only places a pid can live. Once a detached
+    // seat actually expires, scrub every active-game role/reference before that
+    // numeric pid becomes available to a different identity. This must happen
+    // before _p[pid] is cleared: onHello() may expire and reuse a seat in the
+    // same call, without an intervening loop tick.
+    void releasePidRoles(uint8_t pid) {
+        if(_active == HA_GAME_DRAW) {
+            if(_d.drawer == pid) {
+                if(_d.phase == 1) {
+                    _d.phase = 2;
+                    _d.winner = 0;
+                    _d.revealUntil = _lastRawNow + DRAW_REVEAL_MS;
+                }
+                _d.drawer = 0;
+            }
+            if(_d.winner == pid) _d.winner = 0;
+        } else if(_active == HA_GAME_REACT) {
+            if(_react.winner == pid) _react.winner = 0;
+        } else if(_active == HA_GAME_GUESSCOLOR) {
+            if(_gc.winner == pid) _gc.winner = 0;
+        } else if(_active == HA_GAME_SPECTRUM) {
+            if(_spec.psychic == pid) {
+                _spec.psychic = 0;
+                if(_spec.pt.phase == 2 && _spec.stage == 0) {
+                    _spec.stage = 1;
+                    _spec.pt.deadline =
+                        _lastRawNow + (uint32_t)SPECTRUM_GUESS_SECS * 1000;
+                }
+            }
+        } else if(_active == HA_GAME_KMK) {
+            if(_kmk.chooser == pid) {
+                _kmk.chooser = 0;
+                if(_kmk.pt.phase == 2 && _kmk.stage == 0) {
+                    _kmk.cLabel[0] = 0;
+                    _kmk.cLabel[1] = 1;
+                    _kmk.cLabel[2] = 2;
+                    _kmk.stage = 1;
+                    _kmk.pt.deadline = _lastRawNow + (uint32_t)KMK_GUESS_SECS * 1000;
+                }
+            }
+        } else if(_active == HA_GAME_FILLBLANK) {
+            if(_fb.czar == pid) _fb.czar = 0;
+            if(_fb.winner == pid) _fb.winner = 0;
+            // Submissions survive into judging/reveal. Keep the card, but make
+            // its author anonymous so a new identity at this pid is not credited.
+            for(uint8_t i = 0; i < _fb.subCount; i++)
+                if(_fb.subPid[i] == pid) _fb.subPid[i] = 0;
+        } else if(_active == HA_GAME_WEREWOLF) {
+            if(_ww.seer == pid) _ww.seer = 0;
+            if(_ww.seerTarget == pid) {
+                _ww.seerTarget = 0;
+                _ww.seerResult = false;
+            }
+            if(_ww.doctor == pid) _ww.doctor = 0;
+            if(_ww.docTarget == pid) _ww.docTarget = 0;
+            if(_ww.docLast == pid) _ww.docLast = 0;
+            if(_ww.victim == pid) _ww.victim = 0;
+            if(_ww.lynched == pid) _ww.lynched = 0;
+            for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
+                if(_ww.kill[i] == (int8_t)pid) _ww.kill[i] = -1;
+                if(_ww.accuse[i] == (int8_t)pid) _ww.accuse[i] = -1;
+            }
+            for(uint8_t i = 0; i < _ww.logN; i++) {
+                if(_ww.log[i].victim == pid) _ww.log[i].victim = 0;
+                if(_ww.log[i].lynched == pid) _ww.log[i].lynched = 0;
+            }
+        } else if(_active == HA_GAME_SPYFALL) {
+            if(_sf.spy == pid) _sf.spy = 0;
+            if(_sf.nominator == pid) _sf.nominator = 0;
+            if(_sf.nominee == pid) _sf.nominee = 0;
+            if(_sf.blamed == pid) _sf.blamed = 0;
+            for(uint8_t i = 0; i < _sf.missCount; i++) {
+                if(_sf.missBy[i] == pid) _sf.missBy[i] = 0;
+                if(_sf.missOf[i] == pid) _sf.missOf[i] = 0;
+            }
+        }
+    }
+
+    void finalizeLeave(uint8_t pid) {
+        if(pid < 1 || pid > HA_MAX_PLAYERS || !_p[pid].used) return;
+        bool wasProposer = _gvActive && _gvProposer == pid;
+        anyOnLeave(pid);
+        duelRemoveChallengesInvolving(pid);
+        releasePidRoles(pid);
+        clearPidState(pid);
+        _p[pid] = Player{};
+        haUartLeave(pid);
+        if(_gvActive) {
+            if(wasProposer)
+                gameVoteReject();
+            else
+                gameVoteResolve(_lastRawNow);
+        }
+    }
+
+    bool expireDetached(uint32_t rawNow) {
+        bool expiring[HA_MAX_PLAYERS + 1] = {false};
+        for(uint8_t pid = 1; pid <= HA_MAX_PLAYERS; pid++)
+            expiring[pid] = _p[pid].used && _p[pid].detached &&
+                            (uint32_t)(rawNow - _p[pid].detachedAt) >= HA_RESUME_GRACE_MS;
+
+        // If both sides of a 1v1 expire in the same sweep, neither is present to
+        // win by forfeit. Clear that match before the ordered pid walk so outcome
+        // and score do not depend on which numeric pid happens to be lower.
+        if(isDuel(_active)) {
+            for(int i = 0; i < DUEL_MAX_MATCHES; i++)
+                if(_m[i].used && expiring[_m[i].a] && expiring[_m[i].b])
+                    _m[i] = DuelMatch{};
+        } else if(_active == HA_GAME_PONG) {
+            for(int i = 0; i < PONG_MAX; i++)
+                if(_pm[i].used && expiring[_pm[i].a] && expiring[_pm[i].b])
+                    _pm[i] = PongMatch{};
+        } else if(_active == HA_GAME_BATTLESHIP) {
+            for(int i = 0; i < BATTLE_MAX; i++)
+                if(_bm[i].used && expiring[_bm[i].a] && expiring[_bm[i].b])
+                    _bm[i] = BattleMatch{};
+        } else if(_active == HA_GAME_CHESS) {
+            for(int i = 0; i < CHESS_MAX; i++)
+                if(_cm[i].used && expiring[_cm[i].a] && expiring[_cm[i].b])
+                    _cm[i] = ChessMatch{};
+        }
+
+        bool changed = false;
+        for(uint8_t pid = 1; pid <= HA_MAX_PLAYERS; pid++) {
+            if(!expiring[pid]) continue;
+            finalizeLeave(pid);
+            changed = true;
+        }
+        if(changed) { triviaOnRosterChange(); partyRosterChanged(); }
+        return changed;
+    }
+
     uint8_t freePid() {
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++)
             if(!_p[i].used) return i;
@@ -1689,16 +1972,20 @@ private:
     int connectedCount() {
         int n = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++)
-            if(_p[i].used) n++;
+            if(playerOnline(i)) n++;
         return n;
     }
 
-    // Debug override for the per-game player minimums. Off by default and never
-    // persisted: a room that has it on is testing, not playing. Werewolf's roles do not
-    // work with two people and Spyfall's spy is obvious -- the override does not pretend
-    // otherwise, it just lets a developer reach the screens.
+    // Debug-only override for the simulator's small-room tests. Firmware builds
+    // compile out the input and enoughPlayers() constant-folds to the real quorum.
     bool _minOverride = false;
-    bool enoughPlayers(int need) { return _minOverride || connectedCount() >= need; }
+    bool enoughPlayers(int need) {
+#if HA_ENABLE_MIN_OVERRIDE
+        return _minOverride || connectedCount() >= need;
+#else
+        return connectedCount() >= need;
+#endif
+    }
 
     // ---------- broadcast ----------
     void pushAll() {
@@ -1766,10 +2053,12 @@ private:
             s += ha_json_escape(_p[pid].avatar);
             s += "\",\"score\":";
             s += _p[pid].score;
+            s += ",\"online\":";
+            s += playerOnline(pid) ? "true" : "false";
             // In a 1v1 match (playing OR still on the over screen): don't let others
             // challenge them until they return to the lobby.
             s += ",\"busy\":";
-            s += inAnyMatch(pid) ? "true" : "false";
+            s += (inAnyMatch(pid) || !playerOnline(pid)) ? "true" : "false";
             s += "}";
             first = false;
         }
@@ -1825,8 +2114,14 @@ private:
     }
 
     String lobbyJson() {
-        return String("{\"t\":\"lobby\",\"game\":\"") + gameName(_active) +
-               "\",\"players\":" + playersJson() + ",\"minoverride\":" + (_minOverride ? "true" : "false") + "}";
+        String s = String("{\"t\":\"lobby\",\"game\":\"") + gameName(_active) +
+                   "\",\"players\":" + playersJson();
+#if HA_ENABLE_MIN_OVERRIDE
+        s += ",\"minoverride\":";
+        s += _minOverride ? "true" : "false";
+#endif
+        s += "}";
+        return s;
     }
 
     static bool isDuel(uint8_t g) {
@@ -1879,7 +2174,7 @@ private:
     bool triviaAllReady() {
         int n = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used) continue;
+            if(!playerOnline(i)) continue;
             n++;
             if(!_t.ready[i]) return false;
         }
@@ -1889,7 +2184,7 @@ private:
     bool triviaAllAnswered() {
         int n = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used) continue;
+            if(!playerOnline(i)) continue;
             n++;
             if(_t.answer[i] < 0) return false;
         }
@@ -1935,7 +2230,7 @@ private:
         int votes[TRIVIA_MAX_TOPICS] = {0};
         int total = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++)
-            if(_p[i].used && _t.vote[i] >= 0 && _t.vote[i] < _topicCount) {
+            if(playerOnline(i) && _t.vote[i] >= 0 && _t.vote[i] < _topicCount) {
                 votes[_t.vote[i]]++;
                 total++;
             }
@@ -2211,6 +2506,19 @@ private:
             if(_c[i].used && (_c[i].from == pid || _c[i].to == pid)) _c[i] = DuelChallenge{};
     }
 
+    uint16_t allocChallengeId() {
+        for(uint32_t tries = 0; tries < 0xFFFFUL; tries++) {
+            uint16_t id = _nextChallengeId++;
+            if(_nextChallengeId == 0) _nextChallengeId = 1;
+            if(id == 0) continue;
+            bool collision = false;
+            for(int i = 0; i < DUEL_MAX_CHALLENGES; i++)
+                if(_c[i].used && _c[i].id == id) { collision = true; break; }
+            if(!collision) return id;
+        }
+        return 0;
+    }
+
     // Challenge/accept are shared by all 1v1 games (duels + pong + battleship + chess).
     bool isMatchGame() {
         return isDuel(_active) || _active == HA_GAME_PONG ||
@@ -2222,16 +2530,27 @@ private:
 
     void matchChallenge(uint8_t from, uint8_t to) {
         if(!isMatchGame()) return;
-        if(to == from || to < 1 || to > HA_MAX_PLAYERS || !_p[to].used) return;
+        if(to == from || to < 1 || to > HA_MAX_PLAYERS || !playerOnline(to) ||
+           !playerOnline(from)) return;
         if(inAnyMatch(from) || inAnyMatch(to)) return;
         // one outstanding challenge per challenger
         for(int i = 0; i < DUEL_MAX_CHALLENGES; i++)
             if(_c[i].used && _c[i].from == from) _c[i] = DuelChallenge{};
+        bool allocated = false;
         for(int i = 0; i < DUEL_MAX_CHALLENGES; i++) {
             if(!_c[i].used) {
-                _c[i] = DuelChallenge{true, from, to};
+                uint16_t id = allocChallengeId();
+                if(!id) break;
+                _c[i] = DuelChallenge{true, id, _active, from, to};
+                allocated = true;
                 break;
             }
+        }
+        if(!allocated) {
+            if(_p[from].wsId)
+                haWsSendWs(_p[from].wsId,
+                           "{\"t\":\"error\",\"code\":\"challenge_capacity\"}");
+            return;
         }
         if(_p[to].wsId)
             haWsSendWs(
@@ -2248,6 +2567,8 @@ private:
         m->kind = _active;
         m->a = a;
         m->b = b;
+        strlcpy(m->aNick, _p[a].nick, sizeof(m->aNick));
+        strlcpy(m->bNick, _p[b].nick, sizeof(m->bNick));
         m->aIn = m->bIn = true;
         m->turn = first;
         m->first = first;
@@ -2263,38 +2584,62 @@ private:
         }
     }
 
-    void matchAccept(uint8_t pid, uint8_t from) {
+    void matchAccept(uint8_t pid, int challengeId) {
         if(!isMatchGame()) return;
-        bool found = false;
+        uint8_t from = 0;
         for(int i = 0; i < DUEL_MAX_CHALLENGES; i++)
-            if(_c[i].used && _c[i].from == from && _c[i].to == pid) found = true;
-        if(!found) return;
-        if(inAnyMatch(pid) || inAnyMatch(from)) return;
+            if(_c[i].used && _c[i].id == challengeId && _c[i].to == pid &&
+               _c[i].game == _active) {
+                from = _c[i].from;
+                break;
+            }
+        if(!from) return;
+        if(!playerOnline(pid) || !playerOnline(from)) return;
+        if(inAnyMatch(pid) || inAnyMatch(from)) {
+            duelRemoveChallengesInvolving(pid);
+            duelRemoveChallengesInvolving(from);
+            pushAll();
+            return;
+        }
+        bool allocated = false;
         if(_active == HA_GAME_PONG) {
             for(int i = 0; i < PONG_MAX; i++)
                 if(!_pm[i].used) {
                     pongStart(&_pm[i], from, pid);
+                    allocated = true;
                     break;
                 }
         } else if(_active == HA_GAME_BATTLESHIP) {
             for(int i = 0; i < BATTLE_MAX; i++)
                 if(!_bm[i].used) {
                     battleStart(&_bm[i], from, pid, from); // challenger fires first
+                    allocated = true;
                     break;
                 }
         } else if(_active == HA_GAME_CHESS) {
             for(int i = 0; i < CHESS_MAX; i++)
                 if(!_cm[i].used) {
                     chessStart(&_cm[i], from, pid, from); // challenger plays white
+                    allocated = true;
                     break;
                 }
         } else {
             for(int i = 0; i < DUEL_MAX_MATCHES; i++)
                 if(!_m[i].used) {
                     duelStart(&_m[i], from, pid, from); // challenger moves first
+                    allocated = true;
                     break;
                 }
         }
+        if(!allocated) {
+            const String err = "{\"t\":\"error\",\"code\":\"match_capacity\"}";
+            if(_p[from].wsId) haWsSendWs(_p[from].wsId, err);
+            if(_p[pid].wsId) haWsSendWs(_p[pid].wsId, err);
+            pushAll();
+            return;
+        }
+        // Acceptance consumes the invitation only once an authoritative match
+        // slot exists. A full table leaves the challenge available for retry.
         duelRemoveChallengesInvolving(pid);
         duelRemoveChallengesInvolving(from);
         const char* key = (_active == HA_GAME_PONG)       ? "pong" :
@@ -2498,6 +2843,7 @@ private:
         if(m->phase != 1) return;
         m->phase = 2;
         m->winner = winnerPid;
+        m->turn = 0;
         uint8_t loser = (winnerPid == m->a) ? m->b : (winnerPid == m->b) ? m->a : 0;
         if(winnerPid) {
             _p[winnerPid].score += 300;
@@ -2514,8 +2860,14 @@ private:
         if(!m) return;
         uint8_t opp = (pid == m->a) ? m->b : m->a;
         if(m->phase == 1) duelFinish(m, opp); // forfeit
-        if(pid == m->a) m->aIn = false;
-        if(pid == m->b) m->bIn = false;
+        if(pid == m->a) {
+            m->aIn = false;
+            m->a = 0;
+        }
+        if(pid == m->b) {
+            m->bIn = false;
+            m->b = 0;
+        }
         if(!m->aIn && !m->bIn) *m = DuelMatch{}; // both gone: free the slot
     }
 
@@ -2552,9 +2904,13 @@ private:
         String s = "[";
         bool first = true;
         for(int i = 0; i < DUEL_MAX_CHALLENGES; i++) {
-            if(!_c[i].used) continue;
+            if(!_c[i].used || _c[i].game != _active || !playerOnline(_c[i].from) ||
+               !playerOnline(_c[i].to))
+                continue;
             if(!first) s += ",";
-            s += "{\"from\":";
+            s += "{\"id\":";
+            s += _c[i].id;
+            s += ",\"from\":";
             s += _c[i].from;
             s += ",\"to\":";
             s += _c[i].to;
@@ -2583,12 +2939,11 @@ private:
                    "\",\"phase\":\"lobby\",\"challenges\":" + duelChallengesJson() + "}";
         }
         kind = kindStr(m->kind);
-        uint8_t opp = (pid == m->a) ? m->b : m->a;
         uint8_t me = (pid == m->a) ? 1 : 2;
         const char* phase = (m->phase == 2) ? "over" : "playing";
         String s = String("{\"t\":\"duel\",\"kind\":\"") + kind + "\",\"phase\":\"" + phase +
                    "\",\"turn\":" + m->turn + ",\"me\":" + me + ",\"you\":" + pid + ",\"opp\":\"" +
-                   ha_json_escape(_p[opp].nick) + "\"";
+                   ha_json_escape(pid == m->a ? m->bNick : m->aNick) + "\"";
         if(m->kind == HA_GAME_DOTS) {
             s += ",\"w\":";
             s += DOTS_W;
@@ -2751,7 +3106,7 @@ private:
         int target = _d.drawerSeq % used, i = 0;
         uint8_t drawer = 0;
         for(uint8_t pid = 1; pid <= HA_MAX_PLAYERS; pid++)
-            if(_p[pid].used) {
+            if(playerOnline(pid)) {
                 if(i == target) {
                     drawer = pid;
                     break;
@@ -2831,6 +3186,19 @@ private:
         }
     }
 
+    static bool jsonFloat01(const char* s, const char* key, char* out, size_t n) {
+        const char* q = ha_json_find(s, key);
+        if(!q) return false;
+        char* end = nullptr;
+        float value = strtof(q, &end);
+        if(end == q || !isfinite(value) || value < 0.0f || value > 1.0f) return false;
+        while(*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
+        if(*end != ',' && *end != '}') return false;
+        return snprintf(out, n, "%.4f", value) > 0;
+    }
+
+    // Frankendraw quantizes a wider numeric coordinate domain separately, so it
+    // still needs the bounded numeric-token extractor rather than Draw's 0..1 gate.
     static bool jsonNum(const char* s, const char* key, char* out, size_t n) {
         const char* q = ha_json_find(s, key);
         if(!q) return false;
@@ -2848,14 +3216,15 @@ private:
         if(_active != HA_GAME_DRAW || _d.phase != 1 || pid != _d.drawer) return;
         String ink = "{\"t\":\"ink\"";
         static const char* keys[4] = {"x0", "y0", "x1", "y1"};
-        char num[16];
+        char nums[4][16];
         for(int k = 0; k < 4; k++)
-            if(jsonNum(json, keys[k], num, sizeof(num))) {
-                ink += ",\"";
-                ink += keys[k];
-                ink += "\":";
-                ink += num;
-            }
+            if(!jsonFloat01(json, keys[k], nums[k], sizeof(nums[k]))) return;
+        for(int k = 0; k < 4; k++) {
+            ink += ",\"";
+            ink += keys[k];
+            ink += "\":";
+            ink += nums[k];
+        }
         ink += "}";
         for(uint8_t p = 1; p <= HA_MAX_PLAYERS; p++)
             if(_p[p].used && _p[p].wsId && p != _d.drawer) haWsSendWs(_p[p].wsId, ink);
@@ -2943,6 +3312,8 @@ private:
         m->used = true;
         m->a = a;
         m->b = b;
+        strlcpy(m->aNick, _p[a].nick, sizeof(m->aNick));
+        strlcpy(m->bNick, _p[b].nick, sizeof(m->bNick));
         m->aIn = m->bIn = true;
         m->phase = 1;
         pongServe(m, 1);
@@ -2974,8 +3345,14 @@ private:
         if(!m) return;
         uint8_t opp = (pid == m->a) ? m->b : m->a;
         if(m->phase == 1) pongFinish(m, opp);
-        if(pid == m->a) m->aIn = false;
-        if(pid == m->b) m->bIn = false;
+        if(pid == m->a) {
+            m->aIn = false;
+            m->a = 0;
+        }
+        if(pid == m->b) {
+            m->bIn = false;
+            m->b = 0;
+        }
         if(!m->aIn && !m->bIn) *m = PongMatch{};
     }
 
@@ -3045,7 +3422,6 @@ private:
         if(!m)
             return String("{\"t\":\"pong\",\"phase\":\"lobby\",\"challenges\":") +
                    duelChallengesJson() + "}";
-        uint8_t opp = (pid == m->a) ? m->b : m->a;
         uint8_t me = (pid == m->a) ? 1 : 2;
         String s = "{\"t\":\"pong\",\"phase\":\"";
         s += (m->phase == 2) ? "over" : "playing";
@@ -3054,7 +3430,7 @@ private:
         s += ",\"me\":";
         s += me;
         s += ",\"opp\":\"";
-        s += ha_json_escape(_p[opp].nick);
+        s += ha_json_escape(pid == m->a ? m->bNick : m->aNick);
         s += "\",\"ball\":{\"x\":" + pongF(m->bx) + ",\"y\":" + pongF(m->by) + "}";
         s += ",\"p1\":" + pongF(m->p1) + ",\"p2\":" + pongF(m->p2);
         s += ",\"s1\":";
@@ -3087,7 +3463,7 @@ private:
     bool partyAllReady(const Party& pt) {
         int n = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used) continue;
+            if(!playerOnline(i)) continue;
             n++;
             if(!pt.ready[i]) return false;
         }
@@ -3110,6 +3486,8 @@ private:
             s += ha_json_escape(_p[pid].avatar);
             s += "\",\"ready\":";
             s += pt.ready[pid] ? "true" : "false";
+            s += ",\"online\":";
+            s += playerOnline(pid) ? "true" : "false";
             s += "}";
         }
         s += "]";
@@ -3140,23 +3518,36 @@ private:
 
     // A join/leave can complete a vote/round or cancel a pending start.
     void partyRosterChanged() {
-        if(_active == HA_GAME_WYR)
+        uint32_t now = millis();
+        if(_active == HA_GAME_WYR) {
             wyrCheckStart();
-        else if(_active == HA_GAME_SCRAMBLE)
+            if(_wyr.pt.phase == 2 && wyrAllVoted()) wyrReveal(now);
+        } else if(_active == HA_GAME_SCRAMBLE) {
             scrambleCheckStart();
-        else if(_active == HA_GAME_REACT)
+            if(_scr.pt.phase == 2 && scrambleAllSolved()) scrambleReveal(now);
+        } else if(_active == HA_GAME_REACT) {
             reactCheckStart();
-        else if(_active == HA_GAME_GUESSCOLOR)
+            if(_react.pt.phase == 2 && reactAllResolved()) reactReveal(now);
+        } else if(_active == HA_GAME_GUESSCOLOR) {
             gcCheckStart();
-        else if(_active == HA_GAME_SPECTRUM)
+            if(_gc.pt.phase == 2 && gcAllGuessed()) gcReveal(now);
+        } else if(_active == HA_GAME_SPECTRUM) {
             spectrumCheckStart();
-        else if(_active == HA_GAME_KMK)
+            if(_spec.pt.phase == 2 && _spec.stage == 1 && playerOnline(_spec.psychic) &&
+               spectrumAllGuessed()) spectrumReveal(now);
+        } else if(_active == HA_GAME_KMK) {
             kmkCheckStart();
-        else if(_active == HA_GAME_SECRETS)
+            if(_kmk.pt.phase == 2 && _kmk.stage == 1 && playerOnline(_kmk.chooser) &&
+               kmkAllGuessed()) kmkReveal(now);
+        } else if(_active == HA_GAME_SECRETS) {
             secretsCheckStart();
-        else if(_active == HA_GAME_FILLBLANK)
+            if(_secrets.pt.phase == 2 && _secrets.stage == 0 && secretsAllAnswered())
+                secretsToPredict(now);
+            else if(_secrets.pt.phase == 2 && _secrets.stage == 1 && secretsAllPredicted())
+                secretsReveal(now);
+        } else if(_active == HA_GAME_FILLBLANK) {
             fillblankRosterChanged();
-        else if(_active == HA_GAME_WEREWOLF)
+        } else if(_active == HA_GAME_WEREWOLF)
             wwRosterChanged();
         else if(_active == HA_GAME_SPYFALL)
             spyfallRosterChanged();
@@ -3244,7 +3635,7 @@ private:
     bool wyrAllVoted() {
         int n = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used) continue;
+            if(!playerOnline(i)) continue;
             n++;
             if(_wyr.choice[i] < 0) return false;
         }
@@ -3486,7 +3877,7 @@ private:
     bool scrambleAllSolved() {
         int n = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used) continue;
+            if(!playerOnline(i)) continue;
             n++;
             if(!_scr.solved[i]) return false;
         }
@@ -3651,7 +4042,7 @@ private:
     bool reactAllResolved() {
         int n = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used) continue;
+            if(!playerOnline(i)) continue;
             n++;
             if(!_react.tapped[i] && !_react.dq[i]) return false;
         }
@@ -3810,7 +4201,7 @@ private:
     bool gcAllGuessed() {
         int n = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used) continue;
+            if(!playerOnline(i)) continue;
             n++;
             if(!_gc.guessed[i]) return false;
         }
@@ -3986,6 +4377,8 @@ private:
         m->used = true;
         m->a = a;
         m->b = b;
+        strlcpy(m->aNick, _p[a].nick, sizeof(m->aNick));
+        strlcpy(m->bNick, _p[b].nick, sizeof(m->bNick));
         m->aIn = m->bIn = true;
         m->phase = 0; // placement
         m->first = first;
@@ -3996,6 +4389,7 @@ private:
     void battleFinish(BattleMatch* m, uint8_t winner) {
         m->phase = 2;
         m->winner = winner;
+        m->turn = 0;
     }
 
     // Parse one base-10 int from `p`, advancing past it. Own parser (no strtol, which
@@ -4118,8 +4512,14 @@ private:
         if(!m) return;
         uint8_t opp = (pid == m->a) ? m->b : m->a;
         if(m->phase == 0 || m->phase == 1) battleFinish(m, opp); // forfeit
-        if(pid == m->a) m->aIn = false;
-        if(pid == m->b) m->bIn = false;
+        if(pid == m->a) {
+            m->aIn = false;
+            m->a = 0;
+        }
+        if(pid == m->b) {
+            m->bIn = false;
+            m->b = 0;
+        }
         if(!m->aIn && !m->bIn) *m = BattleMatch{}; // both gone: free the slot
     }
 
@@ -4139,12 +4539,12 @@ private:
             return String("{\"t\":\"bs\",\"phase\":\"lobby\",\"challenges\":") +
                    duelChallengesJson() + "}";
         uint8_t me = (pid == m->a) ? 1 : 2;
-        uint8_t opp = (pid == m->a) ? m->b : m->a;
         if(m->phase == 0) {
             bool ready = (pid == m->a) ? m->readyA : m->readyB;
             bool oppReady = (pid == m->a) ? m->readyB : m->readyA;
             return String("{\"t\":\"bs\",\"phase\":\"place\",\"you\":") + pid + ",\"me\":" + me +
-                   ",\"opp\":\"" + ha_json_escape(_p[opp].nick) + "\",\"ready\":" +
+                   ",\"opp\":\"" +
+                   ha_json_escape(pid == m->a ? m->bNick : m->aNick) + "\",\"ready\":" +
                    (ready ? "true" : "false") + ",\"oppReady\":" +
                    (oppReady ? "true" : "false") + "}";
         }
@@ -4169,7 +4569,7 @@ private:
         s += pid;
         s += ",\"me\":";
         s += me;
-        s += ",\"opp\":\"" + ha_json_escape(_p[opp].nick) + "\"";
+        s += ",\"opp\":\"" + ha_json_escape(pid == m->a ? m->bNick : m->aNick) + "\"";
         s += ",\"turn\":";
         s += m->turn;
         s += ",\"yourTurn\":";
@@ -4584,6 +4984,8 @@ private:
         m->used = true;
         m->a = a;
         m->b = b;
+        strlcpy(m->aNick, _p[a].nick, sizeof(m->aNick));
+        strlcpy(m->bNick, _p[b].nick, sizeof(m->bNick));
         m->aIn = m->bIn = true;
         m->white = whitePid;
         m->phase = 1;
@@ -4616,6 +5018,7 @@ private:
         m->phase = 2;
         m->winner = winnerPid;
         m->reason = reason;
+        m->offerBy = 0;
         uint8_t loser = (winnerPid == m->a) ? m->b : (winnerPid == m->b) ? m->a : 0;
         if(winnerPid) {
             _p[winnerPid].score += 300;
@@ -4762,8 +5165,15 @@ private:
         if(!m) return;
         uint8_t opp = (pid == m->a) ? m->b : m->a;
         if(m->phase == 1) chessFinish(m, opp, CH_R_LEFT); // forfeit
-        if(pid == m->a) m->aIn = false;
-        if(pid == m->b) m->bIn = false;
+        if(pid == m->a) {
+            m->aIn = false;
+            m->a = 0;
+        }
+        if(pid == m->b) {
+            m->bIn = false;
+            m->b = 0;
+        }
+        if(m->white == pid) m->white = 0;
         if(!m->aIn && !m->bIn) *m = ChessMatch{}; // both gone: free the slot
     }
 
@@ -4824,8 +5234,7 @@ private:
         if(!m)
             return String("{\"t\":\"chess\",\"phase\":\"lobby\",\"challenges\":") +
                    duelChallengesJson() + "}";
-        uint8_t opp = (pid == m->a) ? m->b : m->a;
-        uint8_t stm = m->core.stm, turn = chessTurnPid(m);
+        uint8_t stm = m->core.stm, turn = m->phase == 1 ? chessTurnPid(m) : 0;
         bool yourTurn = (turn == pid);
         // One clock reading for the whole message, so `run` and `deadline` agree. The
         // running clock freezes once the game is over -- the over screen is not a place
@@ -4839,7 +5248,7 @@ private:
         s += (m->phase == 2) ? "over" : "playing";
         s += "\",\"you\":";
         s += pid;
-        s += ",\"opp\":\"" + ha_json_escape(_p[opp].nick) + "\"";
+        s += ",\"opp\":\"" + ha_json_escape(pid == m->a ? m->bNick : m->aNick) + "\"";
         s += ",\"white\":";
         s += (chessSideOf(m, pid) == 0) ? "true" : "false";
         s += ",\"turn\":";
@@ -4954,6 +5363,7 @@ private:
         _spec.clue[0] = '\0';
         for(int i = 0; i <= HA_MAX_PLAYERS; i++) {
             _spec.vote[i] = -1;
+            _spec.inRound[i] = false;
             _spec.guess[i] = -1;
             _spec.gained[i] = 0;
         }
@@ -4994,7 +5404,7 @@ private:
         int want = _spec.psychicSeq % n;
         int seen = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used) continue;
+            if(!playerOnline(i)) continue;
             if(seen == want) return i;
             seen++;
         }
@@ -5018,6 +5428,7 @@ private:
         _spec.stage = 0; // clue first
         _spec.clue[0] = '\0';
         for(int i = 0; i <= HA_MAX_PLAYERS; i++) {
+            _spec.inRound[i] = playerOnline((uint8_t)i);
             _spec.guess[i] = -1;
             _spec.gained[i] = 0;
         }
@@ -5040,7 +5451,7 @@ private:
     bool spectrumAllGuessed() {
         int guessers = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used || i == _spec.psychic) continue;
+            if(!_spec.inRound[i] || !playerOnline(i) || i == _spec.psychic) continue;
             guessers++;
             if(_spec.guess[i] < 0) return false;
         }
@@ -5049,7 +5460,7 @@ private:
 
     void spectrumGuess(uint8_t pid, int val) {
         if(_active != HA_GAME_SPECTRUM || _spec.pt.phase != 2 || _spec.stage != 1) return;
-        if(pid == _spec.psychic) return; // the clue-giver doesn't guess
+        if(!_spec.inRound[pid] || pid == _spec.psychic) return; // mid-round joins wait
         if(val < 0) val = 0;
         if(val > 100) val = 100;
         _spec.guess[pid] = (int8_t)val;
@@ -5072,7 +5483,8 @@ private:
     void spectrumReveal(uint32_t now) {
         int sum = 0, guessers = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used || i == _spec.psychic || _spec.guess[i] < 0) continue;
+            if(!_spec.inRound[i] || !_p[i].used || i == _spec.psychic || _spec.guess[i] < 0)
+                continue;
             int pts = spectrumPoints(_spec.target, _spec.guess[i]);
             _spec.gained[i] = pts;
             _p[i].score += pts;
@@ -5240,6 +5652,7 @@ private:
         }
         for(int i = 0; i <= HA_MAX_PLAYERS; i++) {
             _kmk.vote[i] = -1;
+            _kmk.inRound[i] = false;
             _kmk.guessed[i] = false;
             _kmk.gained[i] = 0;
             for(int j = 0; j < 3; j++) _kmk.gLabel[i][j] = -1;
@@ -5280,7 +5693,7 @@ private:
         if(n <= 0) return 0;
         int want = _kmk.chooserSeq % n, seen = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used) continue;
+            if(!playerOnline(i)) continue;
             if(seen == want) return i;
             seen++;
         }
@@ -5309,6 +5722,7 @@ private:
         _kmk.stage = 0; // chooser assigns first
         for(int i = 0; i < 3; i++) _kmk.cLabel[i] = -1;
         for(int i = 0; i <= HA_MAX_PLAYERS; i++) {
+            _kmk.inRound[i] = playerOnline((uint8_t)i);
             _kmk.guessed[i] = false;
             _kmk.gained[i] = 0;
             for(int j = 0; j < 3; j++) _kmk.gLabel[i][j] = -1;
@@ -5334,7 +5748,7 @@ private:
     bool kmkAllGuessed() {
         int guessers = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used || i == _kmk.chooser) continue;
+            if(!_kmk.inRound[i] || !playerOnline(i) || i == _kmk.chooser) continue;
             guessers++;
             if(!_kmk.guessed[i]) return false;
         }
@@ -5343,6 +5757,7 @@ private:
 
     void kmkAssign(uint8_t pid, int kiss, int marry, int kill) {
         if(_active != HA_GAME_KMK || _kmk.pt.phase != 2) return;
+        if(!_kmk.inRound[pid]) return;
         int8_t labels[3];
         if(!kmkToLabels(kiss, marry, kill, labels)) return;
         if(_kmk.stage == 0) {
@@ -5364,7 +5779,8 @@ private:
     void kmkReveal(uint32_t now) {
         int sum = 0, guessers = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used || i == _kmk.chooser || !_kmk.guessed[i]) continue;
+            if(!_kmk.inRound[i] || !_p[i].used || i == _kmk.chooser || !_kmk.guessed[i])
+                continue;
             int hit = 0;
             for(int j = 0; j < 3; j++)
                 if(_kmk.gLabel[i][j] == _kmk.cLabel[j]) hit++;
@@ -5563,7 +5979,7 @@ private:
     bool secretsAllPredicted() {
         int n = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used) continue;
+            if(!playerOnline(i)) continue;
             n++;
             if(_secrets.predict[i] < 0) return false;
         }
@@ -5573,7 +5989,7 @@ private:
     bool secretsAllAnswered() {
         int n = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used) continue;
+            if(!playerOnline(i)) continue;
             n++;
             if(_secrets.answer[i] < 0) return false;
         }
@@ -5837,7 +6253,7 @@ private:
         if(!_gvActive) return false;
         int others = 0, yes = 0, no = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used || i == _gvProposer) continue;
+            if(!playerOnline(i) || i == _gvProposer) continue;
             others++;
             if(_gvVote[i] == 1) yes++;
             else if(_gvVote[i] == 0) no++;
@@ -5872,7 +6288,7 @@ private:
     String gameVoteJson(uint8_t pid) {
         int yes = 0, no = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used) continue;
+            if(!playerOnline(i)) continue;
             if(_gvVote[i] == 1) yes++; // includes the proposer's implicit YES
             else if(_gvVote[i] == 0) no++;
         }
@@ -5975,7 +6391,7 @@ private:
         if(n <= 0) return 0;
         int want = _fb.czarSeq % n, seen = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used) continue;
+            if(!playerOnline(i)) continue;
             if(seen == want) return i;
             seen++;
         }
@@ -6023,7 +6439,7 @@ private:
     void fillblankDealHands() {
         if(_fbPacks[_fb.pack].acount == 0) return;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used) continue;
+            if(!playerOnline(i)) continue;
             for(int j = 0; j < FB_HAND; j++) {
                 if(_fb.hand[i][j] >= 0) continue;
                 int c = fillblankDraw();
@@ -6057,7 +6473,7 @@ private:
         for(int i = 0; i <= HA_MAX_PLAYERS; i++) {
             if(_fb.played[i] >= 0 && _fb.played[i] < FB_HAND) _fb.hand[i][_fb.played[i]] = -1;
             _fb.played[i] = -1;
-            _fb.inRound[i] = _p[i].used;
+            _fb.inRound[i] = playerOnline((uint8_t)i);
         }
         fillblankDealHands();
         pt.deadline = now + (uint32_t)FB_PLAY_SECS * 1000;
@@ -6068,7 +6484,7 @@ private:
     bool fillblankAllPlayed() {
         int players = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used || i == _fb.czar || !_fb.inRound[i]) continue;
+            if(!playerOnline(i) || i == _fb.czar || !_fb.inRound[i]) continue;
             players++;
             if(_fb.played[i] < 0) return false;
         }
@@ -6260,6 +6676,8 @@ private:
             return;
         }
         if(_fb.pt.phase != 2) return;
+        // The Czar is role-critical: keep the round intact for reconnect grace.
+        if(_fb.czar && !playerOnline(_fb.czar)) return;
         // The Czar left: nobody can judge this round, so end it with no winner and let
         // the rotation carry on rather than sitting on the deadline.
         if(!_fb.czar || !_p[_fb.czar].used) {
@@ -6494,7 +6912,7 @@ private:
         uint8_t ord[HA_MAX_PLAYERS];
         int n = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++)
-            if(_p[i].used) ord[n++] = i;
+            if(playerOnline(i)) ord[n++] = i;
         for(int i = n - 1; i > 0; i--) {
             int j = (int)(esp_random() % (uint32_t)(i + 1));
             uint8_t t = ord[i];
@@ -6615,12 +7033,22 @@ private:
     void wwLog(uint8_t victim, uint8_t kind, uint8_t lynched, bool day) {
         if(!day) { // a night opens the entry
             if(_ww.logN >= WW_MAX_LOG) return;
-            _ww.log[_ww.logN].victim = victim;
-            _ww.log[_ww.logN].kind = kind;
-            _ww.log[_ww.logN].lynched = 0;
+            WwDay& entry = _ww.log[_ww.logN];
+            entry.victim = victim;
+            entry.kind = kind;
+            entry.lynched = 0;
+            if(victim) {
+                strlcpy(entry.victimNick, _p[victim].nick, sizeof(entry.victimNick));
+                entry.victimRole = _ww.role[victim];
+            }
             _ww.logN++;
         } else if(_ww.logN) { // the day that follows closes it
-            _ww.log[_ww.logN - 1].lynched = lynched;
+            WwDay& entry = _ww.log[_ww.logN - 1];
+            entry.lynched = lynched;
+            if(lynched) {
+                strlcpy(entry.lynchedNick, _p[lynched].nick, sizeof(entry.lynchedNick));
+                entry.lynchedRole = _ww.role[lynched];
+            }
         }
     }
 
@@ -6905,10 +7333,18 @@ private:
             s += (i + 1);
             s += ",\"victim\":";
             s += _ww.log[i].victim;
+            s += ",\"victimNick\":\"";
+            s += ha_json_escape(_ww.log[i].victimNick);
+            s += "\",\"victimRole\":";
+            s += _ww.log[i].victimRole;
             s += ",\"kind\":\"";
             s += wwDawnName(_ww.log[i].kind);
             s += "\",\"lynched\":";
             s += _ww.log[i].lynched;
+            s += ",\"lynchedNick\":\"";
+            s += ha_json_escape(_ww.log[i].lynchedNick);
+            s += "\",\"lynchedRole\":";
+            s += _ww.log[i].lynchedRole;
             s += "}";
         }
         s += "]";
@@ -6989,6 +7425,12 @@ private:
         if(_ww.stage == WW_S_DAWN) {
             s += ",\"victim\":";
             s += _ww.victim;
+            if(_ww.logN) {
+                s += ",\"victimNick\":\"";
+                s += ha_json_escape(_ww.log[_ww.logN - 1].victimNick);
+                s += "\",\"victimRole\":";
+                s += _ww.log[_ww.logN - 1].victimRole;
+            }
             s += ",\"dawnkind\":\"";
             s += wwDawnName(_ww.dawnKind);
             s += "\"";
@@ -7026,6 +7468,12 @@ private:
         if(_ww.stage == WW_S_DUSK) {
             s += ",\"lynched\":";
             s += _ww.lynched;
+            if(_ww.logN) {
+                s += ",\"lynchedNick\":\"";
+                s += ha_json_escape(_ww.log[_ww.logN - 1].lynchedNick);
+                s += "\",\"lynchedRole\":";
+                s += _ww.log[_ww.logN - 1].lynchedRole;
+            }
         }
         s += ",\"deadline\":";
         s += pt.deadline;
@@ -7075,6 +7523,9 @@ private:
         _sf.outcome = 0;
         _sf.called = -1;
         _sf.blamed = 0;
+        _sf.blamedNick[0] = '\0';
+        _sf.revealSpy = 0;
+        _sf.revealSpyNick[0] = '\0';
         for(int i = 0; i <= HA_MAX_PLAYERS; i++) {
             _sf.vote[i] = -1;
             _sf.inRound[i] = false;
@@ -7084,6 +7535,9 @@ private:
             _sf.nominated[i] = false;
             _sf.agree[i] = -1;
             _sf.gained[i] = 0;
+            _sf.revealIn[i] = false;
+            _sf.revealRole[i] = -1;
+            _sf.revealNick[i][0] = '\0';
         }
     }
 
@@ -7125,7 +7579,7 @@ private:
         if(n <= 0) return 0;
         int want = _sf.spySeq % n, seen = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used) continue;
+            if(!playerOnline(i)) continue;
             if(seen == want) return i;
             seen++;
         }
@@ -7167,6 +7621,7 @@ private:
         _sf.outcome = 0;
         _sf.called = -1;
         _sf.blamed = 0;
+        _sf.blamedNick[0] = '\0';
         for(int i = 0; i <= HA_MAX_PLAYERS; i++) {
             _sf.inRound[i] = false;
             _sf.role[i] = -1;
@@ -7190,10 +7645,22 @@ private:
         }
         int next = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-            if(!_p[i].used) continue;
+            if(!playerOnline(i)) continue;
             _sf.inRound[i] = true;
             if(i == _sf.spy) continue; // the spy gets no role, and never will
             if(rc) _sf.role[i] = (int8_t)order[next++ % rc];
+        }
+        // Snapshot the dealt identities and roles now, before any grace expiry can
+        // free and immediately recycle a numeric pid. The public reveal must describe
+        // the table that actually played, including an expiry-triggered abort.
+        _sf.revealSpy = _sf.spy;
+        if(_sf.spy)
+            strlcpy(_sf.revealSpyNick, _p[_sf.spy].nick, sizeof(_sf.revealSpyNick));
+        for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
+            _sf.revealIn[i] = _sf.inRound[i];
+            if(!_sf.revealIn[i]) continue;
+            _sf.revealRole[i] = _sf.role[i];
+            strlcpy(_sf.revealNick[i], _p[i].nick, sizeof(_sf.revealNick[i]));
         }
         pt.deadline = now + (uint32_t)SPYFALL_CARD_SECS * 1000;
         pt.phase = 2;
@@ -7245,6 +7712,12 @@ private:
         if(_sf.missCount < HA_MAX_PLAYERS) {
             _sf.missBy[_sf.missCount] = pid;
             _sf.missOf[_sf.missCount] = (uint8_t)target;
+            strlcpy(
+                _sf.missByNick[_sf.missCount], _p[pid].nick,
+                sizeof(_sf.missByNick[_sf.missCount]));
+            strlcpy(
+                _sf.missOfNick[_sf.missCount], _p[target].nick,
+                sizeof(_sf.missOfNick[_sf.missCount]));
             _sf.missCount++;
         }
         haUartEvent(
@@ -7362,6 +7835,8 @@ private:
     // whole table's nominations. A round aborted by the spy leaving scores nobody.
     void spyfallReveal(uint32_t now, uint8_t outcome) {
         _sf.outcome = outcome;
+        if(_sf.blamed && _p[_sf.blamed].used)
+            strlcpy(_sf.blamedNick, _p[_sf.blamed].nick, sizeof(_sf.blamedNick));
         for(int i = 0; i <= HA_MAX_PLAYERS; i++) _sf.gained[i] = 0;
         int spyPts = 0, teamPts = 0;
         if(outcome == SPYFALL_OUT_CAUGHT)
@@ -7515,8 +7990,8 @@ private:
         String s = "[";
         for(uint8_t i = 0; i < _sf.missCount; i++) {
             if(i) s += ",";
-            s += "{\"by\":\"" + ha_json_escape(_p[_sf.missBy[i]].nick) + "\",\"of\":\"" +
-                 ha_json_escape(_p[_sf.missOf[i]].nick) + "\"}";
+            s += "{\"by\":\"" + ha_json_escape(_sf.missByNick[i]) + "\",\"of\":\"" +
+                 ha_json_escape(_sf.missOfNick[i]) + "\"}";
         }
         s += "]";
         return s;
@@ -7618,25 +8093,25 @@ private:
         }
         if(reveal) {
             s += ",\"outcome\":\"" + String(spyfallOutcomeName(_sf.outcome)) +
-                 "\",\"spyPid\":" + _sf.spy + ",\"spyNick\":\"" +
-                 ha_json_escape(_p[_sf.spy].nick) + "\"";
+                 "\",\"spyPid\":" + _sf.revealSpy + ",\"spyNick\":\"" +
+                 ha_json_escape(_sf.revealSpyNick) + "\"";
             if(_sf.called >= 0 && _sf.called < (int8_t)pk.count)
                 s += ",\"called\":\"" +
                      ha_json_escape(pk.locs[_sf.called].name.c_str()) + "\"";
-            if(_sf.blamed && _p[_sf.blamed].used)
-                s += ",\"blamedNick\":\"" + ha_json_escape(_p[_sf.blamed].nick) + "\"";
+            if(_sf.blamedNick[0])
+                s += ",\"blamedNick\":\"" + ha_json_escape(_sf.blamedNick) + "\"";
             s += ",\"misses\":" + spyfallMissesJson();
             s += ",\"roles\":[";
             bool first = true;
             for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
-                if(!_p[i].used || !_sf.inRound[i]) continue;
+                if(!_sf.revealIn[i]) continue;
                 if(!first) s += ",";
                 first = false;
                 s += "{\"pid\":" + String(i) + ",\"nick\":\"" +
-                     ha_json_escape(_p[i].nick) + "\",\"role\":\"";
-                if(i != _sf.spy && _sf.role[i] >= 0)
-                    s += ha_json_escape(pk.locs[_sf.loc].roles[_sf.role[i]].c_str());
-                s += "\",\"spy\":" + String(i == _sf.spy ? "true" : "false") + "}";
+                     ha_json_escape(_sf.revealNick[i]) + "\",\"role\":\"";
+                if(i != _sf.revealSpy && _sf.revealRole[i] >= 0)
+                    s += ha_json_escape(pk.locs[_sf.loc].roles[_sf.revealRole[i]].c_str());
+                s += "\",\"spy\":" + String(i == _sf.revealSpy ? "true" : "false") + "}";
             }
             s += "],\"mygain\":" + String(_sf.gained[pid]);
             s += ",\"deadline\":" + String(pt.revealUntil) + ",\"dur\":" +
@@ -7767,7 +8242,7 @@ private:
         if(!fdSheetsEnsure()) return;
         _fd.seats = 0;
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++)
-            if(_p[i].used && _fd.seats < HA_MAX_PLAYERS) _fd.seat[_fd.seats++] = i;
+            if(playerOnline(i) && _fd.seats < HA_MAX_PLAYERS) _fd.seat[_fd.seats++] = i;
         for(int i = 0; i < HA_MAX_PLAYERS; i++) _fdSheets[i] = FdSheet{};
         for(int i = 0; i <= HA_MAX_PLAYERS; i++) fdForgetPlayer((uint8_t)i);
         resetScoresAll();
@@ -7898,6 +8373,13 @@ private:
         if(_active != HA_GAME_FRANKENDRAW) return; // _fd is union memory; touch only while FD is live
         for(int k = 0; k < _fd.seats; k++)
             if(_fd.seat[k] == pid) _fd.seat[k] = 0;
+        // Keep the copied contributor name for the gallery, but detach scoring
+        // from the recycled numeric pid. Otherwise a newcomer could receive a
+        // departed artist's finale points.
+        if(_fdSheets)
+            for(int s = 0; s < HA_MAX_PLAYERS; s++)
+                for(int panel = 0; panel < FD_PANELS; panel++)
+                    if(_fdSheets[s].by[panel] == pid) _fdSheets[s].by[panel] = 0;
         fdForgetPlayer(pid);
     }
 

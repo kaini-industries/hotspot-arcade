@@ -6,6 +6,25 @@ All notable changes to Hotspot Arcade are documented here. The format is based o
 
 ## [Unreleased]
 
+### Added
+
+- **Browser protocol v2 and firmware v21 identity foundation.** Each browser now creates
+  a cryptographically random 128-bit resume credential and sends it in an explicit v2
+  `hello`. The engine keeps only a 128-bit identity derived with SHA-256, supports an
+  optional six-digit host admission code, returns typed `welcome`/`reject` messages, and
+  deterministically transfers a live identity to the newest socket.
+- A normal disconnect marks the player offline and reserves their pid, score, identity,
+  and in-memory game data for 120 seconds. Reconnecting within that window resumes the
+  seat; expiry performs the game's leave/forfeit path exactly once and scrubs every
+  game-specific pid role before that number can be reused. Lobby rosters expose `online`,
+  and offline players do not count toward quorum or accept challenges. Game clocks still
+  advance during this foundation release; host-pausable logical time lands in the next
+  Kaini integration slice.
+- Simulator coverage for protocol rejection, admission, identity hashing, token takeover,
+  the exact reconnect boundary, rollover-safe deadline helpers, and disconnect behavior in
+  role-critical and 1v1 games. The WebAssembly build explicitly uses the Emscripten C++
+  driver (`em++`) and is exercised under ASan/UBSan.
+
 ## [1.8.0] - 2026-08-11
 
 ### Added
