@@ -1112,6 +1112,13 @@ localStorage.setItem(storeKey("ha_avatar"), A.avatar);
 } catch (e) {}
 }
 break;
+case "config":
+if (A.setLang) A.setLang(m.lang);
+break;
+case "result":
+if (m.event === "game_change" && m.status === "policy_denied")
+toast(t("gamevote.host_only"));
+break;
 case "reject":
 A.authenticated = false;
 A.joined = false;
@@ -1633,6 +1640,7 @@ en: {
 "gamevote.cancel": "Cancel",
 "gamevote.waiting": "Waiting for votes…",
 "gamevote.tally": "{yes} yes · {no} no",
+"gamevote.host_only": "Game changes are controlled by the host.",
 "test.minlabel": "Testing: ignore player minimums",
 "test.off": "off",
 "test.on": "ON",
@@ -1993,6 +2001,7 @@ de: {
 "gamevote.cancel": "Abbrechen",
 "gamevote.waiting": "Warte auf Stimmen…",
 "gamevote.tally": "{yes} Ja · {no} Nein",
+"gamevote.host_only": "Spielwechsel werden vom Host gesteuert.",
 "test.minlabel": "Test: Mindestspielerzahl ignorieren",
 "test.off": "aus",
 "test.on": "AN",
@@ -2456,6 +2465,7 @@ de: {
 "gamevote.cancel": "Cancelar",
 "gamevote.waiting": "Aguardando os votos…",
 "gamevote.tally": "{yes} sim · {no} não",
+"gamevote.host_only": "As trocas de jogo são controladas pelo anfitrião.",
 "test.minlabel": "Teste: ignorar minimo de jogadores",
 "test.off": "off",
 "test.on": "ON",

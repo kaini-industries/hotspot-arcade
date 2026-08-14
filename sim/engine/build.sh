@@ -19,7 +19,7 @@ if [ -z "$EMXX" ]; then
     exit 1
 fi
 
-EXPORTS='["_ha_reset","_ha_reset_at","_ha_set_admission_full","_ha_tick","_ha_input","_ha_input_at","_ha_disconnect","_ha_time_reached","_ha_time_remaining","_ha_select_game","_ha_trivia_clear","_ha_trivia_add_topic","_ha_trivia_add_q","_ha_round_end","_ha_reset_scores","_ha_drain","_ha_content_clear","_ha_content_pack","_ha_content_item","_ha_set_lang","_ha_chess_load","_ha_chess_perft"]'
+EXPORTS='["_ha_reset","_ha_reset_at","_ha_set_admission_full","_ha_tick","_ha_input","_ha_input_at","_ha_disconnect","_ha_time_reached","_ha_time_remaining","_ha_select_game","_ha_round_end","_ha_reset_scores","_ha_drain","_ha_content_begin","_ha_content_pack","_ha_content_item","_ha_content_commit","_ha_content_abort","_ha_content_fail_after","_ha_content_bank_count","_ha_content_bank_max","_ha_content_active_game","_ha_content_active_lang","_ha_chess_load","_ha_chess_perft"]'
 
 FLAGS=(-std=c++17 -O2 -sALLOW_MEMORY_GROWTH=1)
 if [ "${1:-}" = "--asan" ]; then

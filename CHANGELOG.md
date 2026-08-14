@@ -24,6 +24,17 @@ All notable changes to Hotspot Arcade are documented here. The format is based o
   the exact reconnect boundary, rollover-safe deadline helpers, and disconnect behavior in
   role-critical and 1v1 games. The WebAssembly build explicitly uses the Emscripten C++
   driver (`em++`) and is exercised under ASan/UBSan.
+- Content is now loaded with an active-game-only transaction. The ESP holds one live typed
+  content bank plus at most one staged bank, validates exact pack/item counts and per-game
+  caps, and swaps game and locale only after the complete replacement is valid. A failed
+  load preserves the prior game, round, roster, identities, scores, and reconnect grace.
+  Same-game locale replacement starts a fresh lobby without clearing phone scores.
+- Session startup now waits for an exact game-correlated content acknowledgement before
+  starting the hotspot. Oversized, unreadable, malformed, or over-cap pack sets abort the
+  staged bank instead of silently publishing a valid-looking truncated prefix.
+- Phone-initiated game changes now return a typed host-policy result instead of opening a
+  vote that could switch into an unloaded content game. Host selection remains immediate
+  through `CONTENT_BEGIN`…`CONTENT_COMMIT`.
 
 ## [1.8.0] - 2026-08-11
 

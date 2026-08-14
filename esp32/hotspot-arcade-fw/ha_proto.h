@@ -27,15 +27,17 @@ enum {
     HA_MSG_START = 0x13,
     HA_MSG_STOP = 0x14,
     HA_MSG_RESET = 0x15,
-    HA_MSG_SELECT_GAME = 0x16,
+    HA_MSG_SELECT_GAME = 0x16, // deprecated in v21: use CONTENT_BEGIN..COMMIT
     HA_MSG_QUESTION = 0x17,
     HA_MSG_REVEAL = 0x18,
     HA_MSG_ROUND_END = 0x19,
     HA_MSG_CONFIG = 0x1A,
     HA_MSG_RESET_SCORES = 0x1B,
-    HA_MSG_CONTENT_CLEAR = 0x1C, // drop all packs, for every game
-    HA_MSG_CONTENT_PACK = 0x1D, // payload = game byte + pack name; begins a pack
+    HA_MSG_CONTENT_BEGIN = 0x1C, // payload = target game byte + locale ("" = English)
+    HA_MSG_CONTENT_PACK = 0x1D, // payload = target game byte + pack name
     HA_MSG_CONTENT_ITEM = 0x1E, // payload = JSON object of the file's own keys
+    HA_MSG_CONTENT_COMMIT = 0x1F, // payload = expected pack/item counts, uint16 LE each
+    HA_MSG_CONTENT_ABORT = 0x20, // discard staged bank; live game remains untouched
 };
 
 // ESP -> Flipper

@@ -17,19 +17,16 @@ e.join(1, "ALICE"); e.join(2, "BOB"); e.join(3, "CARA");
 // Routing: the host has a different game active first, then switches to Secrets. Every
 // connected player must receive the Secrets push on select (the engine side of "everyone
 // follows the host into the new game" — the client's route() in app.js does the view switch).
-e.selectGame(8); // Would You Rather
-const sel = e.selectGame(SEC);
+e.selectGame(2); // Connect Four (packless)
+const sel = e.loadContent(SEC, [{ name: "Test", items: [
+  { q: "Do you talk to animals?" },
+  { q: "Have you ever cried at a film?" },
+] }]);
 for (const pid of [1, 2, 3]) {
   const m = lastToWs(sel, pid, "secrets");
   assert.ok(m && m.msg.phase === "lobby",
     "player " + pid + " is pushed into Secrets even coming from another game");
 }
-
-// A pack is required (secretsCheckStart no-ops with packCount 0). Load one.
-e.contentClear();
-e.contentPack(SEC, "Test");
-e.contentItem(JSON.stringify({ q: "Do you talk to animals?" }));
-e.contentItem(JSON.stringify({ q: "Have you ever cried at a film?" }));
 
 // lobby -> all ready -> countdown -> answer (the answer stage comes FIRST)
 e.input(1, { t: "ready", ready: true });
